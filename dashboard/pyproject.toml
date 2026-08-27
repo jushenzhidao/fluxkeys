@@ -1,0 +1,114 @@
+[project]
+name = "fluxkeys-dashboard"
+version = "0.1.0"
+description = "FluxKeys 只读统计看板"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "asyncpg==0.30.0",
+    "redis==5.2.1",
+    "pydantic==2.10.5",
+    # 管理控制台转发层调网关用它。必须是运行时依赖 ——
+    # 只放进 [dev] 会让运行镜像缺包，首次转发才炸 ImportError。
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.2",
+    "pytest-cov==6.0.0",
+    # lint 与类型检查工具在此声明，CI 无需额外补装。
+    # 固定版本，避免工具升级引入新规则导致 CI 无故变红。
+    "ruff==0.16.4",
+    "mypy==1.14.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
+
+# ---------------------------------------------------------------- ruff
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle 错误
+    "W",    # pycodestyle 警告
+    "F",    # pyflakes
+    "I",    # isort，import 顺序
+    "UP",   # pyupgrade，用新语法
+    "B",    # bugbear，易错模式
+    "C4",   # comprehension 简化
+    "DTZ",  # 强制 datetime 带时区 —— 配额日全靠时区正确，这条最关键
+    "RUF",  # ruff 专有规则
+    "PIE",  # 冗余代码
+    "SIM",  # 可简化的写法
+]
+ignore = [
+    # FastAPI 的 Depends()/Query() 就是设计成放在参数默认值里的，
+    # 这是框架标准写法，不是 bug。
+    "B008",
+    # 看板需要容忍任何下游异常并降级为空数据，宽泛捕获是刻意的，
+    # 每处都已用 noqa 或注释说明理由。
+    "BLE001",
+    # RUF001-003 把中文全角标点（，：（））判定为「歧义字符」。
+    # 本项目要求注释与文档字符串使用中文，全角标点是正确写法，不是笔误。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里构造固定时刻用裸 datetime 更易读，且断言本身覆盖了时区语义。
+"tests/**" = ["DTZ001", "DTZ005", "S101"]
+
+# ---------------------------------------------------------------- mypy
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+exclude = ["\\.venv", "build"]
+
+[[tool.mypy.overrides]]
+# asyncpg 未发布 py.typed，没有类型存根。
+# Record 取值处已在运行期用 _num()/str() 做了防御。
+module = ["asyncpg"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------- coverage
+
+[tool.coverage.run]
+# CI 用 `pytest --cov=.`，这里把范围收敛到 app：
+# 统计测试自身或 .venv 的覆盖率没有意义，还会稀释真实数字。
+source = ["app"]
+omit = ["tests/*", ".venv/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    # 入口函数与 __main__ 分支只在真实启动时执行，不纳入统计。
+    "if __name__ == .__main__.:",
+    "def run\\(\\)",
+]
+show_missing = true

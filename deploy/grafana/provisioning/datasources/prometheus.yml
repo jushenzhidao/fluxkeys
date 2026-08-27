@@ -1,0 +1,29 @@
+# Grafana 数据源自动装载
+#
+# 放在 /etc/grafana/provisioning/datasources/ 下，Grafana 启动时自动读取，
+# 无需手工点界面添加。
+
+apiVersion: 1
+
+# 允许按 uid 删除旧数据源，便于改名时不留孤儿配置
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy          # 由 Grafana 后端代理请求，浏览器无需直连 Prometheus
+    # uid 固定：dashboard JSON 里通过这个 uid 引用数据源，
+    # 不固定的话每次重建 Grafana 都会生成随机 uid，dashboard 面板会全部变成 "No data"
+    uid: fluxkeys-prom
+    url: http://prometheus:9090
+    isDefault: true
+    # editable: false 防止有人在界面上改了地址却没同步回仓库，
+    # 造成「配置漂移」——下次重建容器又变回来，白排查半天
+    editable: false
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 一致，
+      # 让 Grafana 自动选择的步长不会细于实际采样粒度（否则图上全是锯齿空洞）
+      timeInterval: 15s
+      httpMethod: POST     # 长查询语句用 POST，避免 URL 长度限制

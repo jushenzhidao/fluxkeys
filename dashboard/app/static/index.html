@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FluxKeys 管理控制台</title>
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/admin.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<!-- 图标 sprite 必须在任何 <use href="#icon-*"> 被解析之前注入。
+     <use> 的解析发生在元素首次布局时：若 sprite 在 body 末尾注入，
+     浏览器解析到下方 header 的图标时目标 symbol 尚不存在，
+     结果是静默渲染空白且不抛任何错误 —— 语法检查与构建都查不出这类缺陷。
+     故此脚本必须保持在 body 的第一个位置，勿与末尾的业务脚本合并。 -->
+<script src="/admin-icons.js"></script>
+
+<header>
+  <h1>FluxKeys 管理控制台</h1>
+  <span class="meta" id="meta-quota-day">配额日 —</span>
+  <span class="meta" id="meta-updated">—</span>
+  <span class="spacer"></span>
+  <label class="meta">
+    趋势天数
+    <select id="sel-days">
+      <option value="7" selected>7 配额日</option>
+      <option value="14">14 配额日</option>
+      <option value="30">30 配额日</option>
+    </select>
+  </label>
+  <button class="refresh" id="btn-refresh">刷新</button>
+  <button type="button" class="icon-btn" id="btn-logout" title="退出登录" aria-label="退出登录">
+    <svg class="icon" aria-hidden="true"><use href="#icon-logout"></use></svg>
+  </button>
+</header>
+
+<main>
+  <div id="global-error" class="err-banner" style="display:none"></div>
+
+  <!-- 概览卡片 -->
+  <section>
+    <h2>今日概览</h2>
+    <p class="hint">
+      口径为<strong>配额日</strong>：火山额度每日 12:00 刷新，12:00 之前的用量计入前一日。
+    </p>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <!-- 图表 -->
+  <section>
+    <h2>趋势与分布</h2>
+    <div class="chart-grid">
+      <div class="chart-box">
+        <h3>用量趋势（按配额日）</h3>
+        <div class="canvas-wrap"><canvas id="chart-trend"></canvas></div>
+      </div>
+      <div class="chart-box">
+        <h3>错误率（近 24 小时，逐小时）</h3>
+        <div class="canvas-wrap"><canvas id="chart-errors"></canvas></div>
+      </div>
+      <div class="chart-box">
+        <h3>错误码分布（近 24 小时）</h3>
+        <div class="canvas-wrap"><canvas id="chart-error-code"></canvas></div>
+      </div>
+      <div class="chart-box">
+        <h3>池分布</h3>
+        <div class="canvas-wrap"><canvas id="chart-pool"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 配额健康告警 -->
+  <section>
+    <h2>配额健康告警</h2>
+    <p class="hint">
+      租约泄漏（prededuct 高于未过期租约求和）、接近硬水位、对账偏差。
+    </p>
+    <div class="alerts" id="quota-alerts"></div>
+  </section>
+
+  <!-- 刷新状态 -->
+  <section>
+    <h2>配额刷新状态</h2>
+    <p class="hint">
+      未确认刷新却仍在消耗的 Key 属高风险：系统无法确认火山侧是否已刷新，继续放量可能超刷。
+    </p>
+    <div class="row">
+      <div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>刷新状态</th><th class="num">Key 数</th></tr></thead>
+            <tbody id="tbody-refresh-states"></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>高风险 Key</th><th>池</th><th>刷新状态</th>
+                <th class="num">今日用量</th><th class="num">热态 used</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-refresh-risky"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 行为相似度 -->
+  <section>
+    <h2>行为相似度自检</h2>
+    <p class="hint">
+      基于请求时段分布（24 维）与模型偏好的余弦相似度。相似度超过阈值的 Key 对容易被风控聚成同一主体
+      —— 火山反馈的封禁根因正是「用户行为规律相似」。这是离线报表，不参与实时调度。
+    </p>
+    <div id="similarity-summary" class="alerts"></div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table>
+        <thead>
+          <tr>
+            <th>Key A</th><th>Key B</th><th class="num">综合相似度</th>
+            <th class="num">时段</th><th class="num">模型</th>
+            <th>出口 IP</th><th>级别</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-similarity"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 导入火山 Key -->
+  <section>
+    <h2>导入火山 Key</h2>
+    <p class="hint">
+      粘贴 Key 清单 JSON，单条为对象、多条为数组，每条必须含 <code>key_id</code>。
+      <code>secret</code> 留空表示保留库中已有密文，<code>egress_ip</code> 留空表示由出口池按哈希分配。
+      网关逐条 upsert，同 <code>key_id</code> 重复提交是更新而非报错。上限 8MB。
+    </p>
+    <div class="imp-box">
+      <label class="fld-label" for="imp-input">Key 清单 JSON</label>
+      <textarea id="imp-input" spellcheck="false" autocomplete="off"
+        placeholder='[{"key_id":"volc_001","secret":"...","pool":"hot","persona_id":"p_day"}]'></textarea>
+      <div class="imp-actions">
+        <button type="button" class="btn btn-primary" id="btn-import">
+          <svg class="icon" aria-hidden="true"><use href="#icon-import"></use></svg>
+          <span>导入</span>
+        </button>
+        <span class="hint" style="margin:0">
+          上千条清单最长可能等待 90 秒，导入期间按钮与输入框会锁定，请勿刷新页面。
+        </span>
+      </div>
+      <div class="imp-result" id="imp-result" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <!-- Key 水位表格 -->
+  <section>
+    <h2>Key 配额水位</h2>
+    <div class="toolbar">
+      <select id="sel-status">
+        <option value="">全部状态</option>
+        <option value="active">active</option>
+        <option value="cooldown">cooldown</option>
+        <option value="banned">banned</option>
+        <option value="invalid">invalid</option>
+      </select>
+      <select id="sel-pool">
+        <option value="">全部池</option>
+        <option value="hot">hot</option>
+        <option value="warm">warm</option>
+        <option value="cold">cold</option>
+      </select>
+      <select id="sel-limit">
+        <option value="50">每页 50</option>
+        <option value="100" selected>每页 100</option>
+        <option value="200">每页 200</option>
+      </select>
+      <span class="meta" id="keys-total">—</span>
+    </div>
+    <div class="table-wrap">
+      <table id="table-keys">
+        <thead>
+          <tr>
+            <th class="sortable" data-sort="key_id">Key ID</th>
+            <th class="sortable" data-sort="pool">池</th>
+            <th class="sortable" data-sort="status">状态</th>
+            <th class="sortable" data-sort="ratio">配额水位</th>
+            <th class="num sortable" data-sort="used">已用</th>
+            <th class="num">预扣</th>
+            <th class="num sortable" data-sort="remaining">剩余</th>
+            <th class="num sortable" data-sort="health">健康分</th>
+            <th>出口 IP</th>
+            <th>刷新状态</th>
+            <th class="num sortable" data-sort="today_tokens">今日落库</th>
+            <th class="num">今日错误</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-keys"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 出口 IP -->
+  <section>
+    <h2>出口 IP 状态</h2>
+    <p class="meta">
+      档位、状态、信誉、负载来自网关内存（实时）；用量与可用 Key 来自数据库。
+      网关不可达时前四列显示为「未知」并在下方标注 —— 不会退化成看起来正常的旧值。
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>绑定地址</th><th>公网 IP</th><th>档位</th><th>状态</th>
+            <th class="num">信誉</th><th>负载</th><th class="num">可用 Key</th>
+            <th class="num">今日用量</th><th class="num">请求</th><th class="num">错误率</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-egress"></tbody>
+      </table>
+    </div>
+    <p class="hint" id="egress-note"></p>
+  </section>
+
+  <!-- 按用户计费 -->
+  <section>
+    <h2>按用户用量（近 30 配额日）</h2>
+    <p class="hint">计费口径聚合。user_id 为空的流量归入「(未归属)」，对账需要看到全量。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>用户</th><th>邮箱</th><th>状态</th>
+            <th class="num">总 token</th><th class="num">输入</th><th class="num">输出</th>
+            <th class="num">请求</th><th class="num">错误率</th>
+            <th class="num">日限额</th><th class="num">活跃天数</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-users"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 错误 Top Key -->
+  <section>
+    <h2>错误集中的 Key（近 24 小时）</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Key ID</th><th>池</th><th>状态</th>
+            <th class="num">请求</th><th class="num">错误</th><th class="num">错误率</th>
+            <th>主要错误</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-error-keys"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="toast-root" aria-live="polite"></div>
+<div id="modal-root"></div>
+
+<!-- 加载顺序有依赖：admin-ui.js 与 admin*.js 复用 app.js 的 esc / statusTag /
+     fmtInt / loadKeys，app.js 的 renderKeys 又调用 FKAdmin.rowActions ——
+     均在 DOMContentLoaded 后执行，故同步脚本按此顺序声明即可，无需模块化。
+     图标 sprite 不在这里，它必须更早注入，见 body 开头。 -->
+<script src="/app.js"></script>
+<script src="/admin-ui.js"></script>
+<script src="/admin.js"></script>
+<script src="/admin-import.js"></script>
+</body>
+</html>

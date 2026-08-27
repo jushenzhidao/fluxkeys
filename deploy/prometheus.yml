@@ -1,0 +1,53 @@
+# Prometheus 抓取配置
+#
+# 单机单实例（架构 v4 P0-5），没有服务发现的必要，全部用静态目标。
+
+global:
+  # 15s 抓取间隔：配额是秒级变化的状态，但告警判定都带 for 时长，
+  # 15s 足够且不会给 gateway 带来可观察的负载。
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  # 规则求值间隔与抓取对齐，避免规则用到尚未刷新的样本
+  evaluation_interval: 15s
+  external_labels:
+    cluster: fluxkeys
+    env: local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# 告警发送目标。MVP 未部署 Alertmanager，先留空并注释掉配置 ——
+# 规则仍会在 Prometheus UI 的 Alerts 页面求值并展示 firing 状态，
+# 只是不外发通知。接入时取消注释并起一个 alertmanager 服务即可。
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # =========================================================================
+  # gateway 业务指标 —— 这是唯一真正重要的抓取目标
+  # =========================================================================
+  - job_name: fluxkeys-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:9090"]
+        labels:
+          service: gateway
+    # 生产形态下 gateway 走 host 网络（见 docker-compose.prod.yml），
+    # bridge 网络内的 Prometheus 无法解析服务名 gateway。
+    # 那时把上面的 targets 改为:
+    #   - targets: ["host.docker.internal:9090"]
+    # prod override 已配好 extra_hosts: host.docker.internal:host-gateway。
+
+  # =========================================================================
+  # Prometheus 自身 —— 用于确认抓取链路本身是活的
+  # =========================================================================
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+# 说明：没有配 redis_exporter / postgres_exporter。
+# MVP 阶段 Redis/Postgres 的健康由 compose healthcheck 兜底，
+# 配额正确性由 gateway 自己导出的 fluxkeys_* 指标反映（这才是业务真正关心的）。
+# 需要 DB 层细节指标时再加 exporter，不在首版铺开。

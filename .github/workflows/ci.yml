@@ -1,0 +1,560 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 允许手动触发，便于在不推 commit 的情况下验证工作流本身
+  workflow_dispatch:
+
+# 同一分支的新 push 取消旧的运行，省 runner 时间
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限原则：CI 只需要读代码
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.23.4"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # =========================================================================
+  # Go 静态检查
+  # =========================================================================
+  go-lint:
+    name: Go Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # setup-go 自带模块与构建缓存，无需再手写 actions/cache
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # gofmt 单独检查：golangci-lint 的 formatters 只在 `fmt` 子命令下生效，
+      # `run` 子命令不会因格式问题失败，所以这里显式检查一次。
+      - name: gofmt 检查
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请运行 gofmt -w ："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.1.6
+          # action 自带缓存，且会复用 setup-go 的构建缓存
+          args: --timeout=5m
+
+  # =========================================================================
+  # Go 单元测试（矩阵）
+  #
+  # 矩阵维度选 race on/off 而非多 Go 版本：项目锁定 Go 1.23（架构第 3 节），
+  # 测多版本没有意义。真正需要覆盖的是「竞态检测下是否仍正确」——
+  # 配额预扣是并发热路径，P0-1 的原子性保证必须在 -race 下验证。
+  # =========================================================================
+  go-test:
+    name: Go Test (race=${{ matrix.race }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 带 race：验证并发正确性，同时产出覆盖率
+          - race: true
+            flags: "-race"
+          # 不带 race：race 检测器会让某些时序敏感的测试变慢甚至超时，
+          # 保留一个普通模式确保基础功能在正常速度下也通过
+          - race: false
+            flags: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: 下载依赖
+        run: go mod download
+
+      - name: 单元测试
+        run: |
+          go test ${{ matrix.flags }} -covermode=atomic \
+            -coverprofile=coverage.out -coverpkg=./... \
+            ./... 2>&1 | tee test-output.txt
+
+      - name: 覆盖率汇总
+        if: matrix.race
+        run: |
+          go tool cover -func=coverage.out | tail -30
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          echo "总覆盖率: $total"
+          echo "### Go 覆盖率: $total" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传覆盖率产物
+        if: matrix.race
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: coverage.out
+          retention-days: 7
+
+  # =========================================================================
+  # Go 集成测试 —— 需要真实 Postgres + Redis
+  #
+  # 用 GitHub Actions 的 services 而非 docker-compose.test.yml：
+  # services 由 runner 托管，健康检查和网络都是内建的，比在 job 里再起
+  # 一层 compose 更稳。docker-compose.test.yml 的定位是**本地**跑集成测试，
+  # 两者环境变量保持一致，所以同一份测试代码两边都能跑。
+  # =========================================================================
+  go-integration:
+    name: Go 集成测试
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: fluxkeys
+          POSTGRES_PASSWORD: fluxkeys
+          POSTGRES_DB: fluxkeys
+        ports:
+          - 5432:5432
+        # services 的 healthcheck 必须写在这里，否则测试会在 DB 就绪前开跑
+        options: >-
+          --health-cmd "pg_isready -U fluxkeys -d fluxkeys"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7.4.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # services 起的 Postgres 是空库，需要手工灌 schema。
+      # 这一步同时验证了 schema.sql 本身是可执行的（语法错误会在此暴露）。
+      - name: 初始化数据库 schema
+        env:
+          PGPASSWORD: fluxkeys
+        run: |
+          psql -h 127.0.0.1 -U fluxkeys -d fluxkeys -v ON_ERROR_STOP=1 \
+            -f internal/store/schema.sql
+          echo "已建表："
+          psql -h 127.0.0.1 -U fluxkeys -d fluxkeys -c '\dt'
+
+      - name: 启动 mockark 假上游
+        run: |
+          # 后台跑 mockark，供适配层集成测试使用。
+          # nohup + 重定向，避免 job 结束时的信号影响，日志留档便于排查。
+          go build -o /tmp/mockark ./cmd/mockark
+          nohup /tmp/mockark > /tmp/mockark.log 2>&1 &
+          # 轮询等待就绪，而不是 sleep 固定秒数
+          for _ in $(seq 1 30); do
+            # mockark 只暴露 /api/v3/* 与 /_mock/*，没有 /healthz
+            if curl -fsS http://127.0.0.1:18080/_mock/stats > /dev/null 2>&1; then
+              echo "mockark 已就绪"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "mockark 启动超时，日志："
+          cat /tmp/mockark.log
+          exit 1
+
+      - name: 集成测试
+        env:
+          # 变量名与 internal/config/config.go 的 applyEnv 一致
+          REDIS_ADDR: 127.0.0.1:6379
+          REDIS_DB: "0"
+          POSTGRES_DSN: postgres://fluxkeys:fluxkeys@127.0.0.1:5432/fluxkeys?sslmode=disable
+          VOLC_BASE_URL: http://127.0.0.1:18080
+          EGRESS_MODE: direct
+          EGRESS_VERIFY_ON_START: "false"
+          ADMIN_API_KEY: ci-admin-key
+          REFRESH_ENABLED: "false"
+          # 测试专用加密主密钥，32 字节 hex。仅用于 CI，非生产密钥。
+          FLUXKEYS_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+        run: |
+          # -tags=integration 让需要外部依赖的测试与单测分离。
+          # 若代码里没有用这个 build tag，这条命令等价于跑全部测试，不会失败。
+          go test -race -tags=integration -count=1 ./... 2>&1 | tee integration.txt
+
+      - name: 失败时输出 mockark 日志
+        if: failure()
+        run: cat /tmp/mockark.log || true
+
+  # =========================================================================
+  # 出口 IP 绑定验证 —— 必须在 Linux 上跑，且需要 NET_ADMIN
+  #
+  # 为什么单独一个 job：这是 P1-6 的核心防线。macOS 开发机上无法验证
+  # （不能加环回别名），只有 Linux runner 能真实测出「绑定源地址是否生效」。
+  # 这个能力一旦静默失效，所有 Key 会共用主 IP，反作弊隔离整体崩塌。
+  # =========================================================================
+  egress-verify:
+    name: 出口绑定验证
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: 添加环回别名地址
+        run: |
+          # runner 上有 root 权限，可直接加别名，无需容器
+          sudo ip addr add 127.0.0.2/8 dev lo || true
+          sudo ip addr add 127.0.0.3/8 dev lo || true
+          ip addr show lo | grep "inet 127"
+
+      - name: 运行绑定验证测试
+        run: |
+          go test ./internal/egress/ -run 'TestLocalAddrBinding|TestVerify' -v -count=1
+
+  # =========================================================================
+  # Python 看板检查
+  # =========================================================================
+  python-check:
+    name: Python Lint & Test
+    runs-on: ubuntu-24.04
+
+    # 起真实 Postgres 与 Redis。
+    #
+    # 原先这个 job 没有 services，却设了 POSTGRES_DSN —— 结果 18 个集成测试
+    # 全部静默 skip，而 `pytest` 照常退 0，CI 一路绿。只有加 `-rs` 才能看出
+    # skip 数从 1 变成 18，没人会天天加这个参数。
+    #
+    # 现在 conftest 的 live_db/live_cache 改成「配了却连不上就 fail」，
+    # 所以这里必须真的把服务起起来，否则 CI 会红 —— 这正是想要的行为。
+    services:
+      postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: fluxkeys
+          POSTGRES_PASSWORD: fluxkeys
+          POSTGRES_DB: fluxkeys
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fluxkeys"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # 依赖文件变化才重建缓存
+          cache: pip
+
+      - name: 安装依赖
+        working-directory: dashboard
+        run: |
+          python -m pip install --upgrade pip
+          # 兼容两种依赖声明方式（与 dashboard agent 约定的是优先 pyproject）
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install -e .
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            [ -f requirements-dev.txt ] && pip install -r requirements-dev.txt
+          fi
+          # 保证工具本身存在，即使看板未声明它们
+          pip install ruff mypy pytest pytest-cov pytest-asyncio httpx
+
+      - name: ruff 检查
+        working-directory: dashboard
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: mypy 类型检查
+        working-directory: dashboard
+        run: mypy .
+
+      - name: 初始化数据库表结构
+        env:
+          PGPASSWORD: fluxkeys
+        run: |
+          psql -h 127.0.0.1 -U fluxkeys -d fluxkeys \
+            -f internal/store/schema.sql
+
+      - name: pytest
+        working-directory: dashboard
+        env:
+          # 变量名是 TEST_POSTGRES_DSN，不是 POSTGRES_TEST_DSN。
+          # 后者写错过一次，导致集成测试退化到默认 DSN 后静默 skip。
+          TEST_POSTGRES_DSN: postgres://fluxkeys:fluxkeys@127.0.0.1:5432/fluxkeys?sslmode=disable
+          TEST_REDIS_ADDR: 127.0.0.1:6379
+          TEST_REDIS_DB: "15"
+        run: |
+          pytest --cov=. --cov-report=term-missing --cov-report=xml -rs
+
+      - name: 门禁：集成测试必须真的执行过
+        working-directory: dashboard
+        env:
+          TEST_POSTGRES_DSN: postgres://fluxkeys:fluxkeys@127.0.0.1:5432/fluxkeys?sslmode=disable
+          TEST_REDIS_ADDR: 127.0.0.1:6379
+          TEST_REDIS_DB: "15"
+        run: |
+          # 只看「全绿」不足以说明集成测试跑了 —— 它们全 skip 时 pytest 也退 0。
+          # 这里显式统计 test_integration.py 的实际通过数，低于阈值即失败。
+          #
+          # 阈值取 15 而非精确值：允许后续增删个别用例，但挡住「整体退化为 skip」
+          # 这一类事故（曾经 21 条里 18 条静默跳过）。
+          #
+          # 注意不能加 -q：它会抑制 "N passed" 那行统计输出，导致这里恒抓到 0。
+          # 用 junit-xml 而非解析人类可读输出，格式稳定不随 pytest 版本变化。
+          pytest tests/test_integration.py --junit-xml=/tmp/integration.xml || true
+          passed=$(python -c "
+          import xml.etree.ElementTree as ET
+          r = ET.parse('/tmp/integration.xml').getroot()
+          s = r if r.tag == 'testsuite' else r.find('testsuite')
+          total = int(s.get('tests', 0))
+          bad = sum(int(s.get(k, 0)) for k in ('failures', 'errors', 'skipped'))
+          print(total - bad)
+          ")
+          echo "集成测试实际通过数: ${passed}"
+          if [ "${passed}" -lt 15 ]; then
+            echo "::error::集成测试实际通过数 ${passed} 低于阈值 15。"
+            echo "::error::多半是 Postgres/Redis 未就绪或环境变量名写错，导致测试静默 skip。"
+            exit 1
+          fi
+
+      - name: 上传覆盖率产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: dashboard/coverage.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # =========================================================================
+  # 部署配置校验 —— 这些文件出错的代价很高，但用工具校验很便宜
+  # =========================================================================
+  deploy-lint:
+    name: 部署配置校验
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 compose 文件
+        run: |
+          # 用占位值填充必填变量，只验证结构与插值，不启动任何服务
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=ci-placeholder
+          REDIS_PASSWORD=ci-placeholder
+          ADMIN_API_KEY=ci-placeholder
+          FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
+          EGRESS_MODE=multi_ip
+          EGRESS_IPS=172.16.0.11=203.0.113.11
+          VOLC_BASE_URL=https://ark.cn-beijing.volces.com
+          EOF
+          echo "--- 本地形态 ---"
+          docker compose -f docker-compose.yml config -q
+          echo "--- 生产形态 ---"
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
+          echo "--- 测试形态 ---"
+          docker compose -f docker-compose.test.yml config -q
+          rm -f .env
+
+      - name: 校验 Prometheus 配置与告警规则
+        run: |
+          docker run --rm -v "$PWD/deploy:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: 告警规则单元测试
+        run: |
+          # 语法正确 ≠ 逻辑正确。这些用例覆盖了跨 UTC 午夜的时间窗判定
+          # 和零流量除零场景 —— 都是实际写错过的地方。
+          docker run --rm -v "$PWD/deploy:/cfg:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            test rules /cfg/alerts_test.yml
+
+      - name: 校验 Grafana dashboard JSON
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          ok = True
+          for p in pathlib.Path("deploy/grafana/dashboards").glob("*.json"):
+              try:
+                  d = json.loads(p.read_text())
+              except Exception as e:
+                  print(f"::error file={p}::JSON 解析失败: {e}")
+                  ok = False
+                  continue
+              # dashboard 面板引用的数据源 uid 必须与 provisioning 里固定的一致，
+              # 不一致会导致所有面板显示 "No data" 而不报任何错 —— 静默失效
+              for panel in d.get("panels", []):
+                  if panel.get("type") == "row":
+                      continue
+                  uid = panel.get("datasource", {}).get("uid")
+                  if uid != "fluxkeys-prom":
+                      print(f"::error file={p}::面板 {panel.get('title')!r} 数据源 uid={uid!r}，应为 fluxkeys-prom")
+                      ok = False
+              print(f"{p.name}: {len(d.get('panels', []))} 个面板")
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # 部署脚本出错会直接影响生产网络配置，必须过静态检查。
+          # -S warning: 只拦截 warning 及以上。note/style 级别多为风格建议
+          # （例如 export VAR=${X:-y} 会被提示加引号，但 export 不做词分割，
+          # 实际无害），把它们设为阻塞会让 CI 变成噪音源。
+          shellcheck -S warning -x scripts/*.sh
+
+      - name: 检查 .env.example 未包含真实密钥
+        run: |
+          # 防止有人把本地 .env 的真实值粘进 .env.example 后提交
+          if grep -Ev '^\s*#|^\s*$' .env.example | grep -Eiq 'sk-[a-z0-9]{20,}|AKLT[A-Za-z0-9]{16,}'; then
+            echo "::error::.env.example 中疑似包含真实密钥"
+            exit 1
+          fi
+          echo ".env.example 检查通过"
+
+  # =========================================================================
+  # 镜像构建验证 —— 只 build 不 push，确认 Dockerfile 在 CI 环境可用
+  # =========================================================================
+  docker-build:
+    name: 镜像构建验证
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [gateway, mockark]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建 ${{ matrix.target }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          load: true
+          tags: fluxkeys/${{ matrix.target }}:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            GIT_COMMIT=${{ github.sha }}
+          # GitHub Actions 原生缓存，跨 job 复用编译层
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max
+
+      - name: 验证镜像基本属性
+        run: |
+          # 确认非 root 运行 —— 这是镜像安全的底线要求
+          user=$(docker inspect -f '{{.Config.User}}' fluxkeys/${{ matrix.target }}:ci)
+          echo "运行用户: $user"
+          if [ "$user" = "root" ] || [ "$user" = "0" ] || [ -z "$user" ]; then
+            echo "::error::镜像以 root 运行"
+            exit 1
+          fi
+          # 确认 HEALTHCHECK 存在
+          hc=$(docker inspect -f '{{if .Config.Healthcheck}}yes{{else}}no{{end}}' fluxkeys/${{ matrix.target }}:ci)
+          echo "HEALTHCHECK: $hc"
+          [ "$hc" = "yes" ] || { echo "::error::缺少 HEALTHCHECK"; exit 1; }
+          # 报告镜像体积
+          size=$(docker image inspect -f '{{.Size}}' fluxkeys/${{ matrix.target }}:ci)
+          echo "### ${{ matrix.target }} 镜像体积: $((size / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================
+  # 端到端冒烟 —— 用 compose 起全栈跑 smoke-test.sh
+  #
+  # 这是最接近"用户真实体验"的验证：如果这个 job 过了，说明
+  # `docker compose up` 确实能开箱跑通全链路。
+  # =========================================================================
+  smoke:
+    name: Compose 端到端冒烟
+    runs-on: ubuntu-24.04
+    # 依赖镜像构建，避免构建失败时白跑
+    needs: [docker-build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 准备 .env
+        run: |
+          # CI 专用占位密钥，与生产无关
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=ci-postgres-pass
+          REDIS_PASSWORD=ci-redis-pass
+          ADMIN_API_KEY=ci-admin-key
+          FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
+          EGRESS_MODE=direct
+          VOLC_BASE_URL=http://mockark:18080
+          REFRESH_ENABLED=false
+          COMPOSE_PROFILES=mock
+          EOF
+
+      - name: 启动全栈
+        run: |
+          # --wait 让 compose 等所有 healthcheck 通过再返回，
+          # 比自己写轮询更可靠
+          docker compose up -d --build --wait --wait-timeout 300
+
+      - name: 冒烟测试
+        run: bash scripts/smoke-test.sh
+
+      - name: 失败时收集日志
+        if: failure()
+        run: |
+          echo "===== 服务状态 ====="
+          docker compose ps -a
+          echo "===== gateway ====="
+          docker compose logs --tail=200 gateway
+          echo "===== mockark ====="
+          docker compose logs --tail=100 mockark
+          echo "===== dashboard ====="
+          docker compose logs --tail=100 dashboard
+          echo "===== postgres ====="
+          docker compose logs --tail=50 postgres
+          echo "===== redis ====="
+          docker compose logs --tail=50 redis
+
+      - name: 清理
+        if: always()
+        run: docker compose down -v --remove-orphans

@@ -1,0 +1,22 @@
+# Dashboard 自动装载配置
+#
+# 指向容器内 /var/lib/grafana/dashboards（由 compose 从
+# ./deploy/grafana/dashboards 只读挂载），Grafana 会扫描该目录下的 JSON。
+
+apiVersion: 1
+
+providers:
+  - name: fluxkeys
+    orgId: 1
+    folder: FluxKeys
+    type: file
+    # 禁止在界面上删除 —— dashboard 的事实来源是仓库里的 JSON 文件
+    disableDeletion: true
+    # 界面上的改动不会被写回文件，重启即丢失。
+    # 要持久化改动必须导出 JSON 覆盖仓库文件，这是刻意的约束。
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      # 让 JSON 里的 folder 字段生效，支持子目录分组
+      foldersFromFilesStructure: false

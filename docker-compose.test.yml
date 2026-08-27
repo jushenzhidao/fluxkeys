@@ -1,0 +1,97 @@
+# CI / 本地集成测试用的最小依赖栈 —— 只起 postgres + redis + mockark，
+# 不起 gateway/dashboard（被测代码由 go test 在宿主机进程内跑）。
+#
+# 用法:
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   go test ./... -race -tags=integration
+#   docker compose -f docker-compose.test.yml down -v
+#
+# 与主 compose 的差异，以及为什么要单独一个文件而不是 override:
+#   1. 独立 project name（fluxkeys-test），不与本地开发栈抢卷和容器名
+#   2. 端口映射到宿主机固定端口，供宿主机上的 go test 直连
+#   3. Postgres/Redis 全部内存化 / 关持久化 —— 测试要的是快和干净，
+#      不需要 AOF 与 fsync（这与生产刻意相反，主 compose 里 AOF 是必须的）
+#   4. 不设资源 limits，CI runner 上限制反而容易让容器被 OOM Kill
+
+name: fluxkeys-test
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: fluxkeys
+      POSTGRES_DB: fluxkeys
+      # 测试环境固定弱密码，仅监听本机，不涉及真实数据
+      POSTGRES_PASSWORD: fluxkeys
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    command:
+      - postgres
+      # fsync=off / full_page_writes=off: 牺牲崩溃安全换取建表与插入速度。
+      # 只允许在测试环境这么做 —— 生产开这个断电会直接损坏数据目录。
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - max_connections=200
+    volumes:
+      # 自动建表，让集成测试无需自己跑 migration
+      - ./internal/store/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    tmpfs:
+      # 数据目录放内存，测试结束即消失，避免残留脏数据影响下一轮
+      - /var/lib/postgresql/data
+    ports:
+      # 端口可覆盖：本机若已有 postgres 占着 5432，用
+      # TEST_POSTGRES_PORT=15432 docker compose -f docker-compose.test.yml up -d
+      # 避让，无需改文件。
+      - "127.0.0.1:${TEST_POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxkeys -d fluxkeys -h 127.0.0.1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7.4.1-alpine
+    command:
+      - redis-server
+      # 测试环境关持久化：--save "" 关 RDB，--appendonly no 关 AOF。
+      # 生产必须开 AOF everysec（见主 compose），这里刻意相反。
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      # 仍保留 noeviction：配额相关的测试断言依赖键不被淘汰
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:${TEST_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  mockark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mockark
+    image: fluxkeys/mockark:test
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:${TEST_MOCKARK_PORT:-18080}:18080"
+    healthcheck:
+      # mockark 没有 /healthz，用无副作用的 /_mock/stats 探活
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:18080/_mock/stats"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s

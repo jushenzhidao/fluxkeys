@@ -1,0 +1,86 @@
+# 生产形态 override —— 与 docker-compose.yml 叠加使用：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# 前置条件（缺一不可）:
+#   1. sudo bash scripts/setup-egress.sh   已配好辅助 IP + 策略路由，
+#      且脚本输出的逐 IP 出口公网地址已逐条核对为不同的 EIP。
+#   2. .env 里已按 docker-compose.yml 末尾的生产清单改好。
+#   3. FLUXKEYS_IMAGE_TAG 指向具体版本号（如 v1.0.0），不用 latest/dev。
+
+name: fluxkeys
+
+services:
+  # =========================================================================
+  # gateway 切 host 网络
+  #
+  # 这是生产 override 存在的核心原因。multi_ip 模式下网关要把 TCP 源地址
+  # 绑到宿主机网卡上的辅助 IP（net.Dialer.LocalAddr）。在默认 bridge 网络里，
+  # 容器网络命名空间内只有 172.x 的 veth 地址，看不见宿主机的辅助 IP，
+  # 绑定会 EADDRNOTAVAIL 失败；更糟的情况是被静默忽略而全部走主 IP
+  # —— 即 P1-6 描述的「静默失效」，请求照常成功但反作弊隔离完全失效。
+  #
+  # host 网络的代价：
+  #   - 端口直接占用宿主机 8080/9090，与其它服务冲突需改 FLUXKEYS_ADDR
+  #   - 失去 compose 的 DNS 服务发现，因此下面所有依赖地址改为 127.0.0.1
+  #   - 容器与宿主机网络栈不隔离，需依赖宿主机防火墙做访问控制
+  gateway:
+    network_mode: host
+    # 说明: compose 的列表合并语义是「追加」，override 文件无法清空基础文件里的
+    # ports。实测（compose v2.17）host 网络模式下 compose 会打印
+    # "Published ports are discarded when using host network mode" 并正常启动，
+    # 端口映射被忽略而非报错，所以这里不需要（也无法）清空 ports。
+    #
+    # compose v2.24+ 支持 `ports: !override []` 显式清空，可消除该警告。
+    # 保持兼容低版本，这里不使用该语法。
+    environment:
+      TZ: Asia/Shanghai
+      # host 网络下服务名解析不可用，全部改走宿主机映射端口。
+      # 因此生产必须放开 postgres/redis 的 127.0.0.1 端口映射
+      # （见下方 postgres/redis 的 ports 覆盖）。
+      REDIS_ADDR: 127.0.0.1:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?生产环境 Redis 必须设置密码}
+      REDIS_DB: "0"
+      POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:?}@127.0.0.1:5432/fluxkeys?sslmode=disable
+      FLUXKEYS_ADDR: ${FLUXKEYS_ADDR:-:8080}
+      FLUXKEYS_METRICS_ADDR: ${FLUXKEYS_METRICS_ADDR:-:9090}
+      # 真实火山地址
+      VOLC_BASE_URL: ${VOLC_BASE_URL:?生产必须指向真实火山地址，不能留 mockark}
+      EGRESS_MODE: ${EGRESS_MODE:?生产应设为 multi_ip}
+      EGRESS_IPS: ${EGRESS_IPS:?multi_ip 模式必须提供出口 IP 列表}
+      # 生产强制开启启动校验：宁可启动失败，也不要带着失效的出口绑定跑起来
+      EGRESS_VERIFY_ON_START: "true"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?}
+      # 生产必开。关闭的话 00:00-12:00 这 12 小时会按满额度调度实际已耗尽的
+      # Key（P0-3/P0-4），直接导致超刷封号。
+      REFRESH_ENABLED: "true"
+      QUOTA_TOKEN_LIMIT: ${QUOTA_TOKEN_LIMIT:-5000000}
+      FLUXKEYS_ENCRYPTION_KEY: ${FLUXKEYS_ENCRYPTION_KEY:?}
+
+  # =========================================================================
+  # 依赖服务放开回环端口映射，供 host 网络的 gateway 访问
+  # =========================================================================
+  redis:
+    ports:
+      # 只绑 127.0.0.1。绑 0.0.0.0 等于把配额状态开放给全网写入。
+      - "127.0.0.1:6379:6379"
+
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  # dashboard 保持 bridge 网络，它只读 DB，不需要出口 IP 控制。
+  # 但它也要能连到 postgres/redis —— 走 compose 内部 DNS 即可，无需改动。
+
+  # =========================================================================
+  # Prometheus 抓取目标变更提醒
+  #
+  # gateway 切到 host 网络后，Prometheus（仍在 bridge 网络）无法再用
+  # gateway:9090 解析。deploy/prometheus.yml 里已为此保留了
+  # host.docker.internal / 网关地址的备用 target 说明，生产部署时
+  # 按 deploy/README.md「生产切换清单」第 6 步调整。
+  # =========================================================================
+  prometheus:
+    # extra_hosts 让 bridge 网络内的容器能用 host-gateway 访问宿主机
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,45 @@
+# 构建上下文裁剪：越小越快，也避免把密钥误打进镜像层。
+#
+# 注意 .git 被排除了 —— 版本信息必须由 --build-arg GIT_COMMIT 传入，
+# 不能在 Dockerfile 里 git rev-parse。这是刻意的：把 .git 送进构建上下文
+# 会让上下文膨胀几十倍，且任何一次 commit 都会击穿所有构建缓存。
+.git
+.gitignore
+.github
+
+# 密钥与本地配置，绝不进镜像
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 文档与看板（Go 镜像不需要；dashboard 有自己的 Dockerfile，
+# 其 context 若为仓库根，需在 dashboard/.dockerignore 单独控制）
+docs
+deploy
+*.md
+
+# 本地构建产物与缓存
+bin
+dist
+out
+coverage.out
+coverage.html
+*.test
+*.prof
+
+# Python 侧缓存
+__pycache__
+*.py[cod]
+.venv
+venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# 编辑器 / OS
+.idea
+.vscode
+.DS_Store
+.workbuddy

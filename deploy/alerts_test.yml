@@ -1,0 +1,517 @@
+# 告警规则单元测试
+#
+# 用途：语法正确 ≠ 逻辑正确。这些用例验证告警「该响时响、不该响时不响」，
+# 重点覆盖三类最容易写错的地方：
+#   1. 空向量陷阱 —— count() 无匹配时返回空向量而非 0，会让最严重的情况反而不告警
+#   2. 零流量除零 —— 分母为 0 导致 NaN 或误报
+#   3. 跨 UTC 午夜的时间窗判定 —— hour() 按 UTC 求值，与北京时间差 8 小时
+#
+# 指标名已与 internal/metrics/metrics.go 核对。
+#
+# 运行:
+#   docker run --rm -v "$PWD/deploy:/cfg:ro" --entrypoint promtool \
+#     prom/prometheus:v2.54.1 test rules /cfg/alerts_test.yml
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # =========================================================================
+  # 配额水位
+  # =========================================================================
+  - interval: 1m
+    name: 配额超过硬水位持续10分钟应告警
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_001",kind="token"}'
+        values: "0.95+0x20"
+    alert_rule_test:
+      # 第 9 分钟未满 for: 10m，不该响
+      - eval_time: 9m
+        alertname: FluxKeysQuotaNearHardLimit
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: FluxKeysQuotaNearHardLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: quota
+              key_id: volc_001
+              kind: token
+            exp_annotations:
+              summary: "Key volc_001 配额接近硬水位（token）"
+              description: >-
+                Key volc_001 的 token 型配额已达硬水位的 95%，持续 10 分钟。该 Key 即将被调度器 拒绝（准入以 Redis Lua 返回值为准）。若大量 Key 同时到位，说明整池 接近耗尽，需检查是否有 Key 未参与轮转。
+              runbook: "deploy/README.md#配额接近水位"
+
+  - interval: 1m
+    name: 配额在水位以下不应告警
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_001",kind="token"}'
+        values: "0.5+0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FluxKeysQuotaNearHardLimit
+        exp_alerts: []
+
+  # 空向量陷阱：所有 Key 都到水位时，可用数为 0，必须告警。
+  # 用 count() 写法会返回空向量而漏报，这个用例就是为防止回退到那种写法。
+  - interval: 1m
+    name: 全部Key耗尽时池耗尽告警必须触发
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_001",kind="token"}'
+        values: "0.95+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_002",kind="token"}'
+        values: "0.95+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_003",kind="token"}'
+        values: "0.95+0x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FluxKeysUsablePoolExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: quota
+            exp_annotations:
+              summary: "可用 Key 池即将耗尽，仅剩 0 个未到硬水位"
+              description: >-
+                未达硬水位的 Key 不足 10 个，持续 5 分钟。继续下去请求会开始被拒绝。 检查：(1) 是否处于 12:00 刷新窗口前的额度谷底；(2) 是否有 Key 因 banned/invalid 退出轮转；(3) 是否存在租约泄漏虚占额度。
+              runbook: "deploy/README.md#可用池耗尽"
+
+  - interval: 1m
+    name: 可用Key充足时不应告警池耗尽
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="k01",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k02",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k03",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k04",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k05",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k06",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k07",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k08",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k09",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k10",kind="token"}'
+        values: "0.1+0x20"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k11",kind="token"}'
+        values: "0.1+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FluxKeysUsablePoolExhausted
+        exp_alerts: []
+
+  # 零流量：配额准入拒绝率的分母为 0，不该误报
+  - interval: 1m
+    name: 零流量时配额拒绝率不应误报
+    input_series:
+      - series: 'fluxkeys_quota_acquire_total{kind="token",result="ok"}'
+        values: "100+0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FluxKeysQuotaDenyRateHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: 配额拒绝率超20%应告警
+    input_series:
+      - series: 'fluxkeys_quota_acquire_total{kind="token",result="ok"}'
+        values: "0+10x30"
+      - series: 'fluxkeys_quota_acquire_total{kind="token",result="denied"}'
+        values: "0+5x30"
+    alert_rule_test:
+      # 5/15 = 33% > 20%
+      - eval_time: 20m
+        alertname: FluxKeysQuotaDenyRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: quota
+            exp_annotations:
+              summary: "配额准入拒绝率 33.33%"
+              description: >-
+                超过 20% 的预扣请求被 Redis Lua 拒绝，持续 10 分钟。 通常意味着可用额度不足，需结合 FluxKeysUsablePoolExhausted 一起看。
+              runbook: "deploy/README.md#可用池耗尽"
+
+  # =========================================================================
+  # Key 池与封禁
+  # =========================================================================
+  - interval: 1m
+    name: 封禁率超5%应告警
+    input_series:
+      - series: 'fluxkeys_keys_by_status{status="active"}'
+        values: "90+0x20"
+      - series: 'fluxkeys_keys_by_status{status="banned"}'
+        values: "10+0x20"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: FluxKeysBanRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: anti-abuse
+            exp_annotations:
+              summary: "Key 封禁率 10% 超过 5%"
+              description: >-
+                banned + invalid 占全池比例超过 5%。这通常不是偶发：优先检查 出口 IP 是否真的按 Key 隔离（跑 scripts/setup-egress.sh --verify-only， P1-6 的静默失效会让所有 Key 共用主 IP），以及是否有 Key 共享了 同一 TLS 指纹（P1-8 要求每 Key 独立 Transport）。
+              runbook: "deploy/README.md#封禁率上升"
+
+  - interval: 1m
+    name: 封禁率在阈值内不应告警
+    input_series:
+      - series: 'fluxkeys_keys_by_status{status="active"}'
+        values: "99+0x20"
+      - series: 'fluxkeys_keys_by_status{status="banned"}'
+        values: "1+0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FluxKeysBanRateHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: active的Key过少应告警
+    input_series:
+      - series: 'fluxkeys_keys_by_status{status="active"}'
+        values: "5+0x20"
+      - series: 'fluxkeys_keys_by_status{status="cooldown"}'
+        values: "95+0x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FluxKeysActiveKeysLow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: keys
+            exp_annotations:
+              summary: "active 状态的 Key 仅剩 5 个"
+              description: >-
+                可调度的 Key 数量过低。区分原因：若 banned/invalid 同步上升是反作弊 问题（见 FluxKeysBanRateHigh）；若是 cooldown 堆积则多为上游限流。
+              runbook: "deploy/README.md#可用池耗尽"
+
+  # =========================================================================
+  # 错误率：零流量场景是最容易误报的地方
+  # =========================================================================
+  - interval: 1m
+    name: 零流量时错误率不应误报
+    input_series:
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="200",stream="false"}'
+        values: "100+0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FluxKeysErrorRateHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: 5xx占比超5%应告警
+    input_series:
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="200",stream="false"}'
+        values: "0+10x30"
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="500",stream="false"}'
+        values: "0+2x30"
+    alert_rule_test:
+      # 2/12 ≈ 16.67% > 5%
+      - eval_time: 20m
+        alertname: FluxKeysErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: gateway
+            exp_annotations:
+              summary: "网关 5xx 错误率 16.67%"
+              description: >-
+                5 分钟窗口内 5xx 占比超过 5%。区分方向：若 fluxkeys_retries_total 同步上升则问题在上游；若上游正常则查网关自身（Redis 连接、 租约获取失败）。
+              runbook: "deploy/README.md#错误率上升"
+
+  # 4xx 是调用方问题，不该把运维叫起来
+  - interval: 1m
+    name: 大量4xx不应触发错误率告警
+    input_series:
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="200",stream="false"}'
+        values: "0+5x30"
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="401",stream="false"}'
+        values: "0+20x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FluxKeysErrorRateHigh
+        exp_alerts: []
+
+  # =========================================================================
+  # 租约泄漏
+  # =========================================================================
+  - interval: 1m
+    name: 无流量但有活跃租约应告警泄漏
+    input_series:
+      - series: "fluxkeys_leases_active"
+        values: "5+0x40"
+      # 请求 counter 不增长 = 无流量
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="200",stream="false"}'
+        values: "100+0x40"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: FluxKeysLeaseLeakSuspected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: quota
+            exp_annotations:
+              summary: "疑似租约泄漏：无流量但仍有 5 个活跃租约"
+              description: >-
+                20 分钟无请求，但仍有未释放的租约，已明显超过最长租约 TTL （stream_lease_ttl=600s），reaper 本应清空。 排查：(1) reaper 协程是否还活着（reap_interval 默认 30s）； (2) Redis ZSET volc:lease:{quota_day} 里的 score 是否为将来时间戳； (3) 配额日切换后旧 day 的 ZSET 是否没被扫到 —— 这是最常见的原因， 因为 quota_day 与自然日解耦（12:00 边界，P0-3）。
+              runbook: "deploy/README.md#租约泄漏"
+
+  - interval: 1m
+    name: 有流量时活跃租约属正常不应告警
+    input_series:
+      - series: "fluxkeys_leases_active"
+        values: "5+0x40"
+      - series: 'fluxkeys_requests_total{endpoint="/v1/chat/completions",model="deepseek-v3",status="200",stream="false"}'
+        values: "0+10x40"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: FluxKeysLeaseLeakSuspected
+        exp_alerts: []
+
+  - interval: 1m
+    name: 租约回收速率过高应告警
+    input_series:
+      # 每分钟回收 6 个 = 0.1/s > 0.05/s
+      - series: "fluxkeys_leases_reaped_total"
+        values: "0+6x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: FluxKeysLeaseReapRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: quota
+            exp_annotations:
+              summary: "租约超时回收速率偏高（0.100/s）"
+              description: >-
+                常见于 SSE 客户端断连未被感知，或 panic 跳过了 commit。 检查网关日志中 lease 相关的 warn，以及流式请求的 TTL 是否够 （stream_lease_ttl 默认 600s）。
+              runbook: "deploy/README.md#租约泄漏"
+
+  - interval: 1m
+    name: 无租约回收时不应告警
+    input_series:
+      - series: "fluxkeys_leases_reaped_total"
+        values: "0+0x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: FluxKeysLeaseReapRateHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: 对账偏差应告警
+    input_series:
+      - series: 'fluxkeys_quota_drift_total{kind="token"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FluxKeysQuotaDriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: quota
+              kind: token
+            exp_annotations:
+              summary: "配额对账检出偏差（token，2 小时内 10 次）"
+              description: >-
+                对账发现 prededuct 与 lease 求和不一致，已按 lease 求和强制修正。 偏差本身意味着有代码路径绕过了 Lua 原子写（违反 P0-1 的唯一写路径 约束），必须定位，否则「不超刷」这个首要不变量无法保证。 偏差量分布见 fluxkeys_quota_drift_amount，明细见 Postgres 表 quota_drift_logs。
+              runbook: "deploy/README.md#配额对账偏差"
+
+  - interval: 1m
+    name: 无对账偏差时不应告警
+    input_series:
+      - series: 'fluxkeys_quota_drift_total{kind="token"}'
+        values: "5+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FluxKeysQuotaDriftDetected
+        exp_alerts: []
+
+  # =========================================================================
+  # 基础设施
+  # =========================================================================
+  - interval: 1m
+    name: 网关指标端点不可达应告警
+    input_series:
+      - series: 'up{job="fluxkeys-gateway",instance="gateway:9090"}'
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FluxKeysTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: gateway
+              job: fluxkeys-gateway
+              instance: gateway:9090
+            exp_annotations:
+              summary: "网关指标端点不可达"
+              description: >-
+                Prometheus 抓不到 gateway:9090。注意：此时所有业务告警都会因为 没有样本而静默失效，这条告警是它们的前提。 生产形态下 gateway 走 host 网络，需确认 prometheus.yml 的 target 已按 deploy/README.md 改为 host.docker.internal:9090。
+              runbook: "deploy/README.md#指标抓不到"
+
+  - interval: 1m
+    name: Redis不可达应告警
+    input_series:
+      - series: 'fluxkeys_dependency_up{dependency="redis"}'
+        values: "0+0x10"
+      - series: 'fluxkeys_dependency_up{dependency="postgres"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FluxKeysDependencyDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: infra
+              dependency: redis
+            exp_annotations:
+              summary: "依赖 redis 不可达"
+              description: >-
+                redis 连续 2 分钟不可用，/readyz 应已返回 503。 Redis 不可用时配额无法预扣（P0-1 规定 Redis Lua 是唯一权威写路径）， 网关会降级为全局限流 50% + 拒绝新预扣。
+              runbook: "deploy/README.md#网关启动失败"
+
+  - interval: 1m
+    name: 依赖全部正常时不应告警
+    input_series:
+      - series: 'fluxkeys_dependency_up{dependency="redis"}'
+        values: "1+0x10"
+      - series: 'fluxkeys_dependency_up{dependency="postgres"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FluxKeysDependencyDown
+        exp_alerts: []
+
+  - interval: 1m
+    name: 出口IP非active应告警
+    input_series:
+      - series: 'fluxkeys_egress_ips_by_state{state="active"}'
+        values: "3+0x10"
+      - series: 'fluxkeys_egress_ips_by_state{state="down"}'
+        values: "2+0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: FluxKeysEgressIPDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: egress
+            exp_annotations:
+              summary: "有 2 个出口 IP 处于非 active 状态"
+              description: >-
+                绑定到这些 IP 的 Key 将无法正常出网。 在宿主机执行 `sudo bash scripts/setup-egress.sh --verify-only` 检查策略路由是否还在（重启网络服务或云厂商侧变更都可能清掉 ip rule）。
+              runbook: "deploy/README.md#出口-ip-不生效"
+
+  - interval: 1m
+    name: 全部出口IP正常时不应告警
+    input_series:
+      - series: 'fluxkeys_egress_ips_by_state{state="active"}'
+        values: "5+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FluxKeysEgressIPDown
+        exp_alerts: []
+
+  - interval: 1m
+    name: 出口IP信誉过低应告警
+    input_series:
+      - series: 'fluxkeys_egress_ip_reputation{addr="172.16.0.11"}'
+        values: "40+0x20"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: FluxKeysEgressReputationLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: egress
+              addr: 172.16.0.11
+            exp_annotations:
+              summary: "出口 IP 172.16.0.11 信誉降至 40"
+              description: >-
+                该 IP 的请求失败率偏高。若多个 IP 同时下降，优先怀疑出口隔离失效 （所有流量实际走了同一个 IP，见 P1-6）。
+              runbook: "deploy/README.md#封禁率上升"
+
+  # =========================================================================
+  # 刷新窗口 —— 验证跨时区的时间条件
+  #
+  # promtool 的 eval_time 是相对 Unix 0（1970-01-01T00:00Z）的偏移，
+  # 因此 eval_time: 300m 对应 UTC 05:00（= 北京 13:00，刷新窗口内），
+  #      eval_time: 420m 对应 UTC 07:00（= 北京 15:00，窗口已过）。
+  # =========================================================================
+  - interval: 1m
+    name: 北京13点刷新窗口内水位高不应告警
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_001",kind="token"}'
+        values: "0.95+0x500"
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_002",kind="token"}'
+        values: "0.95+0x500"
+    alert_rule_test:
+      # UTC 05:00 = 北京 13:00，正在探测窗口内，高水位是预期状态
+      - eval_time: 300m
+        alertname: FluxKeysRefreshLikelyFailed
+        exp_alerts: []
+
+  - interval: 1m
+    name: 北京15点水位仍未回落应告警
+    input_series:
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_001",kind="token"}'
+        values: "0.95+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="volc_002",kind="token"}'
+        values: "0.95+0x600"
+    alert_rule_test:
+      # UTC 07:00 = 北京 15:00，窗口已过且 for:30m 已满足
+      - eval_time: 420m
+        alertname: FluxKeysRefreshLikelyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: refresh
+            exp_annotations:
+              summary: "刷新窗口已过但配额水位未回落，疑似刷新未生效"
+              description: >-
+                北京时间 14:00-18:00 区间内，仍有大量 Key 处于高水位而低水位 Key 不足 10 个。正常情况下 12:00 刷新后水位应普遍回落。 这可能意味着：(1) 刷新探测器未运行（先查 REFRESH_ENABLED， 本地默认 false，上线忘记打开是最常见原因）；(2) 火山侧确实未刷新； (3) 租约泄漏虚占了额度。 ⚠️ 若是 (2)，绝不要手工清零本地配额 —— 那等于主动制造超刷。
+              runbook: "deploy/README.md#刷新未确认"
+
+  - interval: 1m
+    name: 刷新成功水位已回落不应告警
+    input_series:
+      # 12 个 Key 全部低水位，说明刷新确实生效了
+      - series: 'fluxkeys_quota_used_ratio{key_id="k01",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k02",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k03",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k04",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k05",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k06",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k07",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k08",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k09",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k10",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k11",kind="token"}'
+        values: "0.05+0x600"
+      - series: 'fluxkeys_quota_used_ratio{key_id="k12",kind="token"}'
+        values: "0.05+0x600"
+    alert_rule_test:
+      - eval_time: 420m
+        alertname: FluxKeysRefreshLikelyFailed
+        exp_alerts: []

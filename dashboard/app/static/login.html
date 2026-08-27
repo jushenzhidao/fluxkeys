@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>登录 · FluxKeys 管理控制台</title>
+  <!-- 样式与脚本全部内联：登录页不引用 /app.css 与 /app.js，
+       从而实现 Spec 1.6 的「零静态资源豁免」——未登录者读不到任何业务前端产物。 -->
+  <style>
+    :root {
+      --bg: #0f1216;
+      --panel: #171b21;
+      --panel-2: #1d2229;
+      --border: #262c35;
+      --text: #e6e9ee;
+      --text-dim: #939cab;
+      --text-faint: #6b7280;
+      --up: #f04d4d;
+      --up-soft: #3a1d1f;
+      --warn: #e8a33d;
+      --warn-soft: #33270f;
+      --accent: #7c8cf8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .box {
+      width: 100%;
+      max-width: 380px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 26px 24px;
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 17px;
+      letter-spacing: 0.5px;
+      padding-left: 9px;
+      border-left: 3px solid var(--accent);
+    }
+
+    .sub { margin: 0 0 20px; padding-left: 12px; color: var(--text-dim); font-size: 12px; }
+
+    label { display: block; color: var(--text-dim); font-size: 12px; margin-bottom: 6px; }
+
+    input[type="password"] {
+      width: 100%;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+
+    input[type="password"]:focus-visible,
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    button {
+      width: 100%;
+      min-height: 38px;
+      margin-top: 16px;
+      background: var(--panel-2);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+        color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    button:hover:not(:disabled) { background: var(--panel); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; color: var(--text-dim); border-color: var(--border); }
+
+    .msg {
+      display: none;
+      margin-top: 14px;
+      padding: 9px 12px;
+      border-radius: 6px;
+      border-left: 3px solid var(--up);
+      background: var(--up-soft);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .msg.show { display: block; }
+    .msg.locked { border-left-color: var(--warn); background: var(--warn-soft); }
+
+    .foot { margin: 18px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
+
+    @media (prefers-reduced-motion: reduce) { button { transition: none; } }
+  </style>
+</head>
+<body>
+<main class="box">
+  <h1>FluxKeys 管理控制台</h1>
+  <p class="sub">Key 池运维入口 · 需共享口令</p>
+
+  <form id="f" novalidate>
+    <label for="pw">访问口令</label>
+    <input type="password" id="pw" name="password" autocomplete="current-password"
+           autofocus required aria-describedby="msg">
+    <button type="submit" id="go">进入控制台</button>
+  </form>
+
+  <p class="msg" id="msg" role="alert"></p>
+
+  <p class="foot">
+    口令由部署方在 DASHBOARD_PASSWORD 中配置，全员共用，因此审计只能记录操作本身、
+    无法区分具体人员。会话有效期 8 小时。
+  </p>
+</main>
+
+<script>
+  'use strict';
+
+  (function () {
+    var form = document.getElementById('f');
+    var input = document.getElementById('pw');
+    var btn = document.getElementById('go');
+    var msg = document.getElementById('msg');
+
+    function show(text, locked) {
+      msg.textContent = text;
+      msg.className = 'msg show' + (locked ? ' locked' : '');
+    }
+
+    function clear() {
+      msg.textContent = '';
+      msg.className = 'msg';
+    }
+
+    form.addEventListener('submit', async function (ev) {
+      ev.preventDefault();
+      clear();
+      var pw = input.value;
+      if (!pw) {
+        show('请输入访问口令。');
+        input.focus();
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = '正在校验…';
+      try {
+        // 表单编码提交，与 /login 的 OpenAPI 契约一致。
+        // 口令只存在于这个局部变量与请求体中：会话凭据由服务端以 HttpOnly Cookie 下发，
+        // 前端既读不到也无需保存，因此不写入 localStorage / sessionStorage。
+        var resp = await fetch('/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Accept: 'application/json'
+          },
+          body: new URLSearchParams({ password: pw }).toString(),
+          credentials: 'same-origin',
+          cache: 'no-store'
+        });
+        pw = '';
+        if (resp.status === 204 || resp.status === 200) {
+          input.value = '';
+          window.location.replace('/');
+          return;
+        }
+        var detail = '';
+        try {
+          var body = await resp.json();
+          if (body && body.detail) detail = body.detail;
+        } catch (e) { /* 响应非 JSON，用下面的兜底文案 */ }
+        if (resp.status === 429) {
+          // 服务端刻意不透露剩余尝试次数，前端同样不猜测、不倒计时。
+          show(detail || '失败次数过多，该来源已被临时锁定，请稍后再试。', true);
+        } else if (resp.status === 401) {
+          show(detail || '口令不正确。连续失败会触发锁定，请确认后再提交。');
+          input.value = '';
+          input.focus();
+        } else {
+          show(detail || ('登录服务异常（HTTP ' + resp.status + '），请检查看板容器日志。'));
+        }
+      } catch (e) {
+        show('无法连接看板服务：' + (e && e.message ? e.message : '网络异常'));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '进入控制台';
+      }
+    });
+  })();
+</script>
+</body>
+</html>

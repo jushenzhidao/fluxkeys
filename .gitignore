@@ -1,0 +1,48 @@
+# ⚠️ 最重要的一条：.env 里有 POSTGRES_PASSWORD / ADMIN_API_KEY /
+# FLUXKEYS_ENCRYPTION_KEY，一旦提交等于密钥公开。.env.example 是模板，需要提交。
+.env
+.env.*
+!.env.example
+
+# 私钥与证书
+*.pem
+*.key
+*.crt
+!**/testdata/**
+
+# Go 构建产物
+/bin/
+/dist/
+/out/
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+*.prof
+
+# 本地配置覆盖（生产 YAML 可能含真实出口 IP 等环境信息）
+config.local.yaml
+config.local.yml
+docker-compose.override.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# 编辑器 / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Agent 工作目录
+.workbuddy/

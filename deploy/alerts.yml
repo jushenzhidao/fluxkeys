@@ -1,0 +1,525 @@
+# FluxKeys 告警规则
+#
+# ⚠️ 指标名已与 internal/metrics/metrics.go 的实际实现核对过（2026-08-23）。
+#    权威清单见 deploy/README.md「指标契约」。改网关指标名时必须同步改这里。
+#
+# ⚠️ 关于时间函数的时区：Prometheus 的 hour() / day_of_week() 一律按 **UTC**
+#    求值，不受容器 TZ 环境变量影响。本项目所有业务时刻是北京时间（UTC+8），
+#    因此规则里出现的 UTC 小时数都在注释里标注了对应的北京时间，改动时务必换算。
+#      北京 12:00 = UTC 04:00   （火山配额刷新起点，也是配额日边界 P0-3）
+#      北京 14:00 = UTC 06:00   （刷新探测窗口截止 P0-4）
+#
+# ⚠️ 尚缺的指标：网关当前**未导出 Key 刷新状态**（P0-4）。
+#    「配额刷新未确认」这条核心告警因此只能用间接信号近似（见 fluxkeys-refresh 组）。
+#    待 go-gateway 补上 refresh 状态 gauge 后，替换为注释中给出的直接表达式。
+
+groups:
+  # =========================================================================
+  # 1. 配额水位
+  # =========================================================================
+  - name: fluxkeys-quota
+    interval: 30s
+    rules:
+      # fluxkeys_quota_used_ratio{key_id,kind} = (used + prededuct) / hard_watermark
+      # 硬水位本身已是 limit 的 90%（留 50 万 token 缓冲），所以这个比值
+      # 到 0.90 意味着已消耗 limit 的 81%，缓冲快用完了。
+      #
+      # for: 10m 而非立即告警 —— 配额单调递增，短暂跨线没有意义，
+      # 需要的是「持续处于高位」这个信号。
+      - alert: FluxKeysQuotaNearHardLimit
+        expr: fluxkeys_quota_used_ratio > 0.90
+        for: 10m
+        labels:
+          severity: warning
+          component: quota
+        annotations:
+          summary: "Key {{ $labels.key_id }} 配额接近硬水位（{{ $labels.kind }}）"
+          description: >-
+            Key {{ $labels.key_id }} 的 {{ $labels.kind }} 型配额已达硬水位的
+            {{ $value | humanizePercentage }}，持续 10 分钟。该 Key 即将被调度器
+            拒绝（准入以 Redis Lua 返回值为准）。若大量 Key 同时到位，说明整池
+            接近耗尽，需检查是否有 Key 未参与轮转。
+          runbook: "deploy/README.md#配额接近水位"
+
+      # 整池视角：单 Key 到水位是正常轮转，可用 Key 数量塌陷才会导致服务不可用。
+      #
+      # 写法说明（promtool 单测抓到的坑）：不能写成
+      #   count(fluxkeys_quota_used_ratio < 0.90) < 10
+      # count() 在无序列满足条件时返回**空向量**而不是 0，于是「所有 Key 都耗尽」
+      # 这个最严重的情况反而不会告警 —— 完全反了。
+      # 用 `< bool` 让每个序列产出 0/1 再 sum，只要还有 Key 上报指标结果就恒为标量。
+      - alert: FluxKeysUsablePoolExhausted
+        expr: sum(fluxkeys_quota_used_ratio{kind="token"} < bool 0.90) < 10
+        for: 5m
+        labels:
+          severity: critical
+          component: quota
+        annotations:
+          summary: "可用 Key 池即将耗尽，仅剩 {{ $value }} 个未到硬水位"
+          description: >-
+            未达硬水位的 Key 不足 10 个，持续 5 分钟。继续下去请求会开始被拒绝。
+            检查：(1) 是否处于 12:00 刷新窗口前的额度谷底；(2) 是否有 Key 因
+            banned/invalid 退出轮转；(3) 是否存在租约泄漏虚占额度。
+          runbook: "deploy/README.md#可用池耗尽"
+
+      # 预扣估算偏差。>1 说明估算不足 —— 实际消耗超过预扣量，
+      # 意味着 used + prededuct <= hard_watermark 这个不变量的保护被削弱，
+      # 有真实超刷风险。这是比"配额到水位"更早的预警。
+      - alert: FluxKeysQuotaEstimateInsufficient
+        expr: |
+          histogram_quantile(
+            0.90,
+            sum(rate(fluxkeys_quota_estimate_error_ratio_bucket[30m])) by (le)
+          ) > 1
+        for: 15m
+        labels:
+          severity: warning
+          component: quota
+        annotations:
+          summary: "预扣估算不足（P90 误差比 {{ $value | printf \"%.2f\" }}）"
+          description: >-
+            实际 Token 消耗持续超过预扣量。预扣是「不超刷」的第一道防线，
+            估算不足会让水位判断失真。检查 quota.estimate_multiplier（默认 1.2）
+            与 default_max_tokens（默认 4096）是否偏低。
+          runbook: "deploy/README.md#配额接近水位"
+
+      # 配额准入被拒的比例。持续高位说明整池供给不足。
+      - alert: FluxKeysQuotaDenyRateHigh
+        expr: |
+          (
+            sum(rate(fluxkeys_quota_acquire_total{result!="ok"}[10m]))
+            /
+            clamp_min(sum(rate(fluxkeys_quota_acquire_total[10m])), 0.001)
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          component: quota
+        annotations:
+          summary: "配额准入拒绝率 {{ $value | humanizePercentage }}"
+          description: >-
+            超过 20% 的预扣请求被 Redis Lua 拒绝，持续 10 分钟。
+            通常意味着可用额度不足，需结合 FluxKeysUsablePoolExhausted 一起看。
+          runbook: "deploy/README.md#可用池耗尽"
+
+  # =========================================================================
+  # 2. Key 池健康与封禁
+  # =========================================================================
+  - name: fluxkeys-keys
+    interval: 30s
+    rules:
+      # 封禁率是反作弊策略失效最直接的信号。一旦上升，通常意味着出口 IP 复用、
+      # 行为特征雷同或某个 IP 段被整体标记，此时继续跑会连带烧掉更多 Key。
+      - alert: FluxKeysBanRateHigh
+        expr: |
+          (
+            sum(fluxkeys_keys_by_status{status=~"banned|invalid"})
+            /
+            clamp_min(sum(fluxkeys_keys_by_status), 1)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          component: anti-abuse
+        annotations:
+          summary: "Key 封禁率 {{ $value | humanizePercentage }} 超过 5%"
+          description: >-
+            banned + invalid 占全池比例超过 5%。这通常不是偶发：优先检查
+            出口 IP 是否真的按 Key 隔离（跑 scripts/setup-egress.sh --verify-only，
+            P1-6 的静默失效会让所有 Key 共用主 IP），以及是否有 Key 共享了
+            同一 TLS 指纹（P1-8 要求每 Key 独立 Transport）。
+          runbook: "deploy/README.md#封禁率上升"
+
+      # 封禁「速率」比「存量比例」更早暴露问题：存量比例被历史数据摊薄，
+      # 而增量能立刻反映策略刚刚失效。
+      #
+      # 注意这里用 increase() 作用于 gauge。网关未提供 banned 的 counter，
+      # 只有 keys_by_status 这个 gauge；对 gauge 用 increase 在数值单调上升时
+      # 结果是可信的，Key 一旦 banned 不会自行恢复，所以这个近似是成立的。
+      # 若将来补了 counter，改用 increase(fluxkeys_keys_banned_total[1h]) 更严谨。
+      - alert: FluxKeysBanRateSpike
+        expr: increase(fluxkeys_keys_by_status{status="banned"}[1h]) >= 3
+        for: 5m
+        labels:
+          severity: critical
+          component: anti-abuse
+        annotations:
+          summary: "1 小时内新增约 {{ $value | printf \"%.0f\" }} 个 Key 被封禁"
+          description: >-
+            短时间内连续封禁，几乎可以确定是系统性原因而非单 Key 问题。
+            建议立即降低整体速率并排查出口 IP 与请求特征。
+          runbook: "deploy/README.md#封禁率上升"
+
+      # 活跃池塌陷。ActivePoolSize 目标是 100（config 默认），
+      # 掉到 10 以下说明大部分 Key 已不可用。
+      - alert: FluxKeysActiveKeysLow
+        expr: sum(fluxkeys_keys_by_status{status="active"}) < 10
+        for: 5m
+        labels:
+          severity: critical
+          component: keys
+        annotations:
+          summary: "active 状态的 Key 仅剩 {{ $value }} 个"
+          description: >-
+            可调度的 Key 数量过低。区分原因：若 banned/invalid 同步上升是反作弊
+            问题（见 FluxKeysBanRateHigh）；若是 cooldown 堆积则多为上游限流。
+          runbook: "deploy/README.md#可用池耗尽"
+
+  # =========================================================================
+  # 3. 请求错误率与延迟
+  # =========================================================================
+  - name: fluxkeys-traffic
+    interval: 30s
+    rules:
+      # 分母加 clamp_min 防止零流量时出现 0/0 = NaN。
+      # 只统计 5xx：4xx 多半是调用方参数问题，不该把运维叫起来。
+      #
+      # 注意标签名是 status（不是 status_code），已与 metrics.go 核对。
+      - alert: FluxKeysErrorRateHigh
+        expr: |
+          (
+            sum(rate(fluxkeys_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(fluxkeys_requests_total[5m])), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "网关 5xx 错误率 {{ $value | humanizePercentage }}"
+          description: >-
+            5 分钟窗口内 5xx 占比超过 5%。区分方向：若 fluxkeys_retries_total
+            同步上升则问题在上游；若上游正常则查网关自身（Redis 连接、
+            租约获取失败）。
+          runbook: "deploy/README.md#错误率上升"
+
+      # 重试率高说明换 Key 频繁 —— 上游在拒绝请求。
+      # 网关没有独立的 upstream 成功/失败计数器，重试次数是最接近的代理指标。
+      # 注意重试会放大上游压力（max_retries=3），高位时应考虑降速。
+      - alert: FluxKeysRetryRateHigh
+        expr: |
+          histogram_quantile(
+            0.90,
+            sum(rate(fluxkeys_retries_per_request_bucket[10m])) by (le)
+          ) >= 2
+        for: 10m
+        labels:
+          severity: critical
+          component: upstream
+        annotations:
+          summary: "P90 重试次数达 {{ $value | printf \"%.1f\" }} 次/请求"
+          description: >-
+            大量请求需要重试换 Key 才能成功，说明上游在持续拒绝。
+            可能是上游故障、出口 IP 被限流，或大量 Key 已失效。
+            按 fluxkeys_retries_total 的 class 标签可区分具体原因。
+          runbook: "deploy/README.md#错误率上升"
+
+      # 用户级限流触发量。持续非零说明有调用方在打满配额，
+      # 或限流阈值设置偏低影响了正常业务。
+      - alert: FluxKeysRateLimitedHigh
+        expr: sum(rate(fluxkeys_rate_limited_total[10m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "用户限流触发速率 {{ $value | printf \"%.2f\" }}/s"
+          description: >-
+            持续有请求被用户级 RPM/TPM 限流拒绝（维度见 dimension 标签）。
+            确认是调用方超量，还是 users 表里的 rpm_limit/tpm_limit 设得过低。
+          runbook: "deploy/README.md#错误率上升"
+
+      # 大模型推理本身就慢，阈值定在 30s 只抓明显异常。
+      - alert: FluxKeysLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(fluxkeys_request_duration_seconds_bucket{stream="false"}[10m])) by (le)
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "非流式请求 P99 延迟 {{ $value | printf \"%.1f\" }}s"
+          description: >-
+            检查上游响应时间与每 Key Transport 的连接复用情况
+            （P1-8 禁用跨 Key 复用，连接建立开销比共享池高，
+            但不应导致这个量级的延迟）。
+          runbook: "deploy/README.md#错误率上升"
+
+      # 流式首字节时间。SSE 场景下 TTFB 过长说明网关缓冲了响应而非及时 flush，
+      # 客户端体验是「长时间无输出然后一次性吐完」。
+      - alert: FluxKeysStreamTTFBHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(fluxkeys_stream_ttfb_seconds_bucket[10m])) by (le)
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "流式首字节 P95 达 {{ $value | printf \"%.1f\" }}s"
+          description: >-
+            SSE 首帧延迟过高。若上游正常，检查网关是否在转发前缓冲了响应体
+            （必须逐 chunk flush，不能等完整响应）。
+          runbook: "deploy/README.md#错误率上升"
+
+  # =========================================================================
+  # 4. 租约与配额对账（P0-2）
+  # =========================================================================
+  - name: fluxkeys-lease
+    interval: 30s
+    rules:
+      # 泄漏的危害是「静默占额」：prededuct 只增不减时，Key 的可用额度被虚假
+      # 占用，调度器以为额度耗尽而跳过它，最终整池可用量凭空缩水。
+      #
+      # 超时回收本是兜底路径，正常情况下绝大多数租约应通过 quota_commit 正常
+      # 释放。持续回收说明请求在 commit 前就中断了。
+      - alert: FluxKeysLeaseReapRateHigh
+        expr: rate(fluxkeys_leases_reaped_total[15m]) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: quota
+        annotations:
+          summary: "租约超时回收速率偏高（{{ $value | printf \"%.3f\" }}/s）"
+          description: >-
+            常见于 SSE 客户端断连未被感知，或 panic 跳过了 commit。
+            检查网关日志中 lease 相关的 warn，以及流式请求的 TTL 是否够
+            （stream_lease_ttl 默认 600s）。
+          runbook: "deploy/README.md#租约泄漏"
+
+      # 有活跃租约但已经没有流量 —— 租约本该在 TTL 内被清掉。
+      # 判定窗口取 20m，明显长于 stream_lease_ttl(600s=10m)，
+      # 所以到这个点还存在的租约一定是不正常的。
+      - alert: FluxKeysLeaseLeakSuspected
+        expr: |
+          fluxkeys_leases_active > 0
+          and
+          sum(rate(fluxkeys_requests_total[20m])) < 0.001
+        for: 20m
+        labels:
+          severity: critical
+          component: quota
+        annotations:
+          summary: "疑似租约泄漏：无流量但仍有 {{ $value }} 个活跃租约"
+          description: >-
+            20 分钟无请求，但仍有未释放的租约，已明显超过最长租约 TTL
+            （stream_lease_ttl=600s），reaper 本应清空。
+            排查：(1) reaper 协程是否还活着（reap_interval 默认 30s）；
+            (2) Redis ZSET volc:lease:{quota_day} 里的 score 是否为将来时间戳；
+            (3) 配额日切换后旧 day 的 ZSET 是否没被扫到 —— 这是最常见的原因，
+            因为 quota_day 与自然日解耦（12:00 边界，P0-3）。
+          runbook: "deploy/README.md#租约泄漏"
+
+      # 对账偏差是最权威的信号：网关每小时校验
+      # prededuct == Σ 未过期 lease.amount，不等就说明状态已经不自洽。
+      - alert: FluxKeysQuotaDriftDetected
+        expr: increase(fluxkeys_quota_drift_total[2h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: quota
+        annotations:
+          summary: "配额对账检出偏差（{{ $labels.kind }}，2 小时内 {{ $value | printf \"%.0f\" }} 次）"
+          description: >-
+            对账发现 prededuct 与 lease 求和不一致，已按 lease 求和强制修正。
+            偏差本身意味着有代码路径绕过了 Lua 原子写（违反 P0-1 的唯一写路径
+            约束），必须定位，否则「不超刷」这个首要不变量无法保证。
+            偏差量分布见 fluxkeys_quota_drift_amount，明细见 Postgres 表
+            quota_drift_logs。
+          runbook: "deploy/README.md#配额对账偏差"
+
+      # 请求处理完了但 in_flight 不归零 —— goroutine 泄漏，
+      # 同时也意味着优雅关闭会一直等待（shutdown 逻辑需 in_flight 归零）。
+      - alert: FluxKeysRequestsStuck
+        expr: |
+          sum(fluxkeys_requests_in_flight) > 0
+          and
+          sum(rate(fluxkeys_requests_total[15m])) < 0.001
+        for: 15m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "无新流量但仍有 {{ $value }} 个请求在处理中"
+          description: >-
+            请求处理未收尾。可能是上游连接挂起（检查 egress.request_timeout，
+            默认 300s），或 goroutine 泄漏。这会阻塞优雅关闭。
+          runbook: "deploy/README.md#租约泄漏"
+
+  # =========================================================================
+  # 5. 配额刷新（P0-3 / P0-4）—— 超刷风险的最强信号
+  #
+  # ⚠️ 网关目前未导出 Key 刷新状态指标，所以这里只能用**间接信号**近似。
+  #    待 go-gateway 补上后（约定名 fluxkeys_keys_refresh_state{state}），
+  #    用下面注释里的直接表达式替换，那才是真正可靠的判定。
+  # =========================================================================
+  - name: fluxkeys-refresh
+    interval: 30s
+    rules:
+      # 间接信号：配额日边界（北京 12:00 = UTC 04:00）之后，若配额使用率
+      # 没有出现明显回落，说明刷新没有真正发生 —— 或者更糟：本地配额被清零了
+      # 但火山侧其实没刷新，此时系统会按满额度调度已耗尽的 Key，即超刷。
+      #
+      # 判定窗口：北京 14:00-18:00（UTC 06:00-10:00）。此时探测窗口已结束，
+      # 正常情况下大部分 Key 应处于低水位。
+      - alert: FluxKeysRefreshLikelyFailed
+        expr: |
+          (
+            sum(fluxkeys_quota_used_ratio{kind="token"} > bool 0.80) > 0
+            and
+            sum(fluxkeys_quota_used_ratio{kind="token"} < bool 0.80) < 10
+          )
+          and on()
+          (
+            hour() >= 6 and hour() < 10
+          )
+        for: 30m
+        labels:
+          severity: critical
+          component: refresh
+        annotations:
+          summary: "刷新窗口已过但配额水位未回落，疑似刷新未生效"
+          description: >-
+            北京时间 14:00-18:00 区间内，仍有大量 Key 处于高水位而低水位 Key
+            不足 10 个。正常情况下 12:00 刷新后水位应普遍回落。
+            这可能意味着：(1) 刷新探测器未运行（先查 REFRESH_ENABLED，
+            本地默认 false，上线忘记打开是最常见原因）；(2) 火山侧确实未刷新；
+            (3) 租约泄漏虚占了额度。
+            ⚠️ 若是 (2)，绝不要手工清零本地配额 —— 那等于主动制造超刷。
+          runbook: "deploy/README.md#刷新未确认"
+
+      # 待网关补上刷新状态指标后，用下面这条替换上面的间接判定：
+      #
+      # - alert: FluxKeysRefreshUnconfirmed
+      #   expr: |
+      #     sum(fluxkeys_keys_refresh_state{state=~"probing|failed"}) > 0
+      #     and on() (hour() >= 6 or hour() < 4)
+      #   for: 15m
+      #   labels: {severity: critical, component: refresh}
+      #   annotations:
+      #     summary: "刷新窗口已过，仍有 Key 未确认配额刷新"
+      #
+      # 时间条件解释：北京 14:00（UTC 06:00）起到次日北京 12:00（UTC 04:00）
+      # 为止，这个区间跨越 UTC 午夜，故写成 `hour() >= 6 or hour() < 4`。
+
+      # 配额日边界后完全没有配额消耗 —— 说明刷新后系统没有恢复调度。
+      # 这与「刷新失败」是两种不同的故障：这条抓的是「探测确认了但调度没恢复」。
+      - alert: FluxKeysNoTrafficAfterRefresh
+        expr: |
+          (
+            sum(rate(fluxkeys_quota_acquire_total{result="ok"}[30m])) < 0.001
+          )
+          and on()
+          (
+            hour() >= 6 and hour() < 10
+          )
+        for: 30m
+        labels:
+          severity: warning
+          component: refresh
+        annotations:
+          summary: "刷新窗口结束后无任何配额预扣成功"
+          description: >-
+            北京 14:00-18:00 区间内没有成功的配额预扣。若此时确实有用户流量，
+            说明所有 Key 都无法通过准入 —— 检查 Key 状态分布与刷新后的
+            限速逻辑（post_refresh_ramp_minutes 默认 30 分钟内限速 50%）。
+            若本身就没有流量，可忽略。
+          runbook: "deploy/README.md#刷新未确认"
+
+  # =========================================================================
+  # 6. 基础设施与出口
+  #
+  # 这些不属于核心业务告警，但缺了会让上面所有告警失效
+  # （抓不到指标时 PromQL 返回空向量，不触发告警，是典型的静默盲区）
+  # =========================================================================
+  - name: fluxkeys-infra
+    interval: 30s
+    rules:
+      - alert: FluxKeysTargetDown
+        expr: up{job="fluxkeys-gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "网关指标端点不可达"
+          description: >-
+            Prometheus 抓不到 gateway:9090。注意：此时所有业务告警都会因为
+            没有样本而静默失效，这条告警是它们的前提。
+            生产形态下 gateway 走 host 网络，需确认 prometheus.yml 的 target
+            已按 deploy/README.md 改为 host.docker.internal:9090。
+          runbook: "deploy/README.md#指标抓不到"
+
+      # Redis 挂了配额就无法预扣（P0-1 唯一写路径），Postgres 挂了用量无法落库。
+      - alert: FluxKeysDependencyDown
+        expr: fluxkeys_dependency_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: infra
+        annotations:
+          summary: "依赖 {{ $labels.dependency }} 不可达"
+          description: >-
+            {{ $labels.dependency }} 连续 2 分钟不可用，/readyz 应已返回 503。
+            Redis 不可用时配额无法预扣（P0-1 规定 Redis Lua 是唯一权威写路径），
+            网关会降级为全局限流 50% + 拒绝新预扣。
+          runbook: "deploy/README.md#网关启动失败"
+
+      # multi_ip 模式下 IP 掉线会让绑定该 IP 的 Key 全部无法出网，
+      # 或更糟：静默退回主 IP（P1-6）。
+      #
+      # 注意：这个指标抓不到「静默退回主 IP」——那种情况下探测是成功的。
+      # 唯一可靠的检测手段是 scripts/setup-egress.sh 的逐 IP 公网地址比对。
+      - alert: FluxKeysEgressIPDown
+        expr: sum(fluxkeys_egress_ips_by_state{state!="active"}) > 0
+        for: 3m
+        labels:
+          severity: critical
+          component: egress
+        annotations:
+          summary: "有 {{ $value }} 个出口 IP 处于非 active 状态"
+          description: >-
+            绑定到这些 IP 的 Key 将无法正常出网。
+            在宿主机执行 `sudo bash scripts/setup-egress.sh --verify-only`
+            检查策略路由是否还在（重启网络服务或云厂商侧变更都可能清掉 ip rule）。
+          runbook: "deploy/README.md#出口-ip-不生效"
+
+      # 出口 IP 信誉下降是被限流/封禁的前兆
+      - alert: FluxKeysEgressReputationLow
+        expr: fluxkeys_egress_ip_reputation < 60
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "出口 IP {{ $labels.addr }} 信誉降至 {{ $value }}"
+          description: >-
+            该 IP 的请求失败率偏高。若多个 IP 同时下降，优先怀疑出口隔离失效
+            （所有流量实际走了同一个 IP，见 P1-6）。
+          runbook: "deploy/README.md#封禁率上升"
+
+      # 调度耗时。100 个 Key 朴素遍历应在微秒级（P1-7），
+      # 到毫秒级说明实现偏离了设计（比如在热路径里做了 IO）。
+      - alert: FluxKeysSchedulerSlow
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(fluxkeys_scheduler_select_duration_seconds_bucket[10m])) by (le)
+          ) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          component: scheduler
+        annotations:
+          summary: "调度选 Key P99 耗时 {{ $value | humanizeDuration }}"
+          description: >-
+            架构设计中 100 个 Key 朴素遍历打分是微秒级（P1-7）。
+            超过 10ms 说明热路径上出现了不该有的开销 —— 检查是否在打分时
+            做了 Redis/DB 查询（应该只读内存快照）。
+          runbook: "deploy/README.md#错误率上升"

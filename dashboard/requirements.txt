@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+asyncpg==0.30.0
+redis==5.2.1
+pydantic==2.10.5
+# 管理控制台的转发层用它调网关。
+#
+# 必须在运行时依赖里，不能只留在 requirements-dev.txt: Dockerfile 构建阶段
+# 只执行 pip install -r requirements.txt，漏了这条镜像内就没有 httpx，
+# 而 ImportError 要等到容器启动后第一次转发才炸 —— 编译、单测、健康检查
+# 全都查不出来。
+httpx==0.28.1

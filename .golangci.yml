@@ -1,0 +1,97 @@
+# golangci-lint 配置
+#
+# 取舍原则：只开能抓到**真实缺陷**的 linter，不开风格洁癖类的。
+# 理由很实际 —— 噪音大的 lint 配置最终会被 // nolint 铺满，等于没有。
+# 这个项目最怕的是配额算错和资源泄漏，所以重点在 errcheck / bodyclose /
+# rowserrcheck 这类能抓漏检查、漏关闭的检查器上。
+
+version: "2"
+
+run:
+  timeout: 5m
+  # 单机部署，只跑 Linux 版本的代码路径
+  build-tags:
+    - netgo
+
+linters:
+  default: none
+  enable:
+    # ---- 正确性相关，必开 ----
+    - errcheck      # 未处理的 error。配额扣减忽略 error 就是超刷的直接来源
+    - govet         # 官方静态检查，含 copylocks / loopclosure
+    - staticcheck   # 最有价值的一组检查，含 SA 系列真实 bug 检测
+    - ineffassign   # 无效赋值，常见于 err 被覆盖导致错误被吞
+    - unused        # 未使用的代码
+    - bodyclose     # HTTP 响应体未关闭 —— 每 Key 独立 Transport 下泄漏会累积
+    - rowserrcheck  # sql.Rows.Err() 未检查，会静默丢失查询错误
+    - sqlclosecheck # sql.Rows / Stmt 未关闭
+    - noctx         # 发起 HTTP 请求未带 context，导致超时不可控
+    - errorlint     # error 比较应用 errors.Is / As 而非 ==
+    - durationcheck # time.Duration 相乘的常见错误（如 x * time.Second 写成 x * y）
+    - nilerr        # 返回 nil 却在 err != nil 分支里 —— 典型的错误吞掉
+    - makezero      # make([]T, n) 后又 append，通常是笔误
+    - contextcheck  # 传错 context，可能导致取消信号丢失
+
+    # ---- 可读性 / 一致性，成本低收益明确 ----
+    - misspell      # 英文拼写
+    - unconvert     # 多余的类型转换
+    - wastedassign
+
+  settings:
+    errcheck:
+      # 这些函数的返回值忽略是常规做法，不必强制处理
+      exclude-functions:
+        - (io.Closer).Close
+        - (*database/sql.Rows).Close
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (net/http.ResponseWriter).Write
+
+    staticcheck:
+      checks:
+        - all
+        # ST1000: 要求每个包都有包注释，风格类，不强制
+        - -ST1000
+        # ST1003: 命名风格（如 Id vs ID），噪音较大
+        - -ST1003
+
+    govet:
+      enable:
+        - shadow    # 变量遮蔽，err 被内层作用域遮蔽是很隐蔽的 bug 来源
+
+    misspell:
+      locale: US
+
+  exclusions:
+    # 测试代码放宽：测试里大量 err 断言由框架承担，errcheck 会误报
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+          - noctx
+          - contextcheck
+          # 测试里 `if err := ...; err != nil` 连续出现是标准写法，
+          # shadow 在这种场景下全是噪音（实测 10 处告警里 8 处在测试文件）。
+          # 生产代码仍然检查 —— 那里 err 被遮蔽是真实 bug 来源。
+          - govet
+      # 生成的代码不检查
+      - path: \.pb\.go
+        linters:
+          - all
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/fluxkeys/fluxkeys
+
+issues:
+  # 默认只报新增问题会导致存量问题永远看不到，这里报全部
+  new: false
+  # 不限制同类问题的报告数量，避免"只修了前 3 个"的假通过
+  max-issues-per-linter: 0
+  max-same-issues: 0

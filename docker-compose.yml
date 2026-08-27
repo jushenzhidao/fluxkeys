@@ -1,0 +1,453 @@
+# FluxKeys 单机部署编排（架构 v4 P0-5：单进程单实例）
+#
+# 快速开始（离线全链路，无需任何真实火山 Key）:
+#   cp .env.example .env && 按注释填三个密钥
+#   docker compose up -d --build
+#   bash scripts/smoke-test.sh
+#
+# 默认形态 = 本地/演示形态：EGRESS_MODE=direct + VOLC_BASE_URL 指向 mockark。
+# 生产形态见文件末尾说明与 docker-compose.prod.yml。
+#
+# Profile 说明:
+#   mock       - mockark 假上游。本地必开，生产关闭。
+#   monitoring - prometheus + grafana。按需开启。
+#   默认由 .env 里的 COMPOSE_PROFILES=mock,monitoring 控制。
+
+name: fluxkeys
+
+# ---------------------------------------------------------------------------
+# 公共日志配置：不限制日志会把磁盘写满，单机部署没人轮转，必须在 driver 层限死
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  # =========================================================================
+  # Redis —— 配额、租约、限流、Key 热状态
+  #
+  # 这是全系统唯一的配额权威写路径（P0-1），数据丢失等于配额状态丢失，
+  # 直接导致超刷。因此持久化配置比性能更重要。
+  # =========================================================================
+  redis:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      # AOF 开启 + everysec 落盘：最坏情况只丢 1 秒写入。
+      # 不用 appendfsync always（每次写都 fsync，吞吐掉一个数量级），
+      # 也不用 no（交给 OS 刷盘，宕机可能丢 30 秒配额扣减 → 超刷）。
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # AOF 重写阈值：默认 64mb 起、增长 100% 触发。配额数据量很小
+      # （1000 Key × 几个字段），这里保持默认即可。
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - "64mb"
+      # 同时保留 RDB 快照作为第二道保险（AOF 文件损坏时还能回到最近快照）
+      - --save
+      - "900 1 300 10 60 10000"
+      # maxmemory 留在容器内存限制之下，避免 OOM Kill 打断 AOF 写入
+      - --maxmemory
+      - "768mb"
+      # 关键: noeviction。配额键绝不能被 LRU 淘汰 ——
+      # 淘汰一个 used 计数器就等于把已消耗的额度清零，会直接造成超刷。
+      # 内存满时宁可让写入报错（错误会被网关捕获并降级为拒绝新预扣，
+      # 这是 P2 里定的 Redis 故障降级策略），也不能静默丢数据。
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - "${REDIS_PASSWORD:-}"
+    environment:
+      # 供 healthcheck 内的 shell 判断是否需要带 -a 参数
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          if [ -n "$$REDIS_PASSWORD" ]; then
+            redis-cli --no-auth-warning -a "$$REDIS_PASSWORD" ping | grep -q PONG;
+          else
+            redis-cli ping | grep -q PONG;
+          fi
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # 不映射到宿主机：Redis 无 TLS，暴露到公网等于把配额状态和所有热数据开放写入。
+    # 需要 redis-cli 调试时用: docker compose exec redis redis-cli
+    # ports:
+    #   - "127.0.0.1:6379:6379"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # =========================================================================
+  # Postgres —— 用户、Key 元数据、用量流水、审计（P1-9）
+  # =========================================================================
+  postgres:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fluxkeys
+      POSTGRES_DB: fluxkeys
+      # 从 .env 读取；缺失时 compose 直接报错退出，不允许空密码启动
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置，请先 cp .env.example .env 并填写}
+      # scram-sha-256 而非默认 md5
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      # 配额日/刷新窗口按东八区算，DB 时区与应用保持一致，避免 quota_day 边界错位
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    command:
+      - postgres
+      # 单机 4C8G，给 DB 分 1.5G 容器内存，shared_buffers 取其 1/4
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - max_connections=100
+      # 记录超过 500ms 的慢查询，便于排查看板聚合查询拖慢网关写入
+      - -c
+      - log_min_duration_statement=500
+      # 注意参数名是 log_line_prefix（单数 line）。写成 log_lines_prefix
+      # 会让 Postgres 直接 FATAL 退出，而 `compose config` 检查不出来
+      # —— 只有真正启动过才会暴露。
+      - -c
+      - log_line_prefix=%m [%p] %u@%d
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # schema 以 init 脚本形式挂载：首次启动（数据卷为空）时自动建表。
+      # 与网关的 AutoMigrate 并存不冲突 —— schema.sql 全部是 IF NOT EXISTS。
+      # 只读挂载，避免容器内进程改动仓库文件。
+      - ./internal/store/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      # pg_isready 指定 -U/-d，否则默认用 root 用户探测会一直失败
+      test: ["CMD-SHELL", "pg_isready -U fluxkeys -d fluxkeys -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # initdb + 建表需要时间，给足 30s 再开始判失败
+      start_period: 30s
+    # 同 Redis，默认不对外暴露。调试用: docker compose exec postgres psql -U fluxkeys
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1536M
+        reservations:
+          memory: 512M
+
+  # =========================================================================
+  # mockark —— 火山 Ark 的假上游，让全链路可离线跑通
+  #
+  # profile=mock：生产环境把 COMPOSE_PROFILES 里的 mock 去掉即可不启动。
+  # 注意 gateway 刻意没有 depends_on mockark —— 上游只在处理请求时才被访问，
+  # 不是启动依赖；这样生产关掉 mock profile 时 gateway 也不会启动失败。
+  # =========================================================================
+  mockark:
+    profiles: ["mock"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mockark
+      args:
+        VERSION: ${FLUXKEYS_IMAGE_TAG:-dev}
+    image: fluxkeys/mockark:${FLUXKEYS_IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    # mockark 通过 flag 配置，不读环境变量。默认 -addr :18080。
+    # stream-delay 给一点延迟，让流式响应更接近真实上游的分片节奏，
+    # 便于验证 SSE 转发是否及时 flush（不缓冲整个响应）。
+    command:
+      - -addr
+      - ":18080"
+      - -stream-delay
+      - 20ms
+    healthcheck:
+      # mockark 没有 /healthz，用无副作用的 /_mock/stats 探活
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:18080/_mock/stats"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  # =========================================================================
+  # gateway —— Go 网关主体
+  # =========================================================================
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: gateway
+      args:
+        VERSION: ${FLUXKEYS_IMAGE_TAG:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: fluxkeys/gateway:${FLUXKEYS_IMAGE_TAG:-dev}
+    restart: unless-stopped
+    # 必须等 Redis / Postgres 真正 healthy 再启动。
+    # 只写 depends_on 不带 condition 的话，容器一起来就连库，
+    # Postgres 还在 initdb，网关连接失败退出 → 反复重启刷日志。
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      # ---- 以下变量名严格对齐 internal/config/config.go 的 applyEnv ----
+      FLUXKEYS_ADDR: ${FLUXKEYS_ADDR:-:8080}
+      FLUXKEYS_METRICS_ADDR: ${FLUXKEYS_METRICS_ADDR:-:9090}
+      # 注意是 host:port，不带 redis:// 前缀（go-redis 的 Addr 语义）
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@postgres:5432/fluxkeys?sslmode=disable
+      # 默认指向 mockark，这是「up 即可离线跑通」的关键开关
+      VOLC_BASE_URL: ${VOLC_BASE_URL:-http://mockark:18080}
+      EGRESS_MODE: ${EGRESS_MODE:-direct}
+      EGRESS_IPS: ${EGRESS_IPS:-}
+      EGRESS_VERIFY_ON_START: ${EGRESS_VERIFY_ON_START:-false}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY 未设置，管理接口需要它}
+      REFRESH_ENABLED: ${REFRESH_ENABLED:-false}
+      QUOTA_TOKEN_LIMIT: ${QUOTA_TOKEN_LIMIT:-5000000}
+      # 火山 Key 密文的加密主密钥（internal/store/crypto.go 强制要求，缺失即启动失败）
+      FLUXKEYS_ENCRYPTION_KEY: ${FLUXKEYS_ENCRYPTION_KEY:?FLUXKEYS_ENCRYPTION_KEY 未设置，需 32 字节 hex}
+    ports:
+      # 业务端口。注意：这里绑定 0.0.0.0，对外可达。
+      # 网关自身依赖用户 API Key 鉴权（user_api_keys 表），
+      # 若尚未创建任何用户 Key 就暴露到公网，等于开放代理 —— 生产务必
+      # 先建用户 Key 并在前面加一层 TLS 终止（Nginx/Caddy），见 deploy/README.md。
+      - "${GATEWAY_HOST_PORT:-8080}:8080"
+      # 指标端口只绑回环，不对外。Prometheus 走容器网络访问 gateway:9090，
+      # 不需要宿主机映射；这里映射仅为方便本地 curl 调试。
+      - "127.0.0.1:${GATEWAY_METRICS_HOST_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 40s  # 略大于 config 默认 shutdown_timeout=30s，给流式请求收尾
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          # 真实流量约 20 QPS（P1-7），2 核是宽裕的上限而非需求
+          cpus: "2.00"
+          memory: 2G
+        reservations:
+          memory: 256M
+
+  # =========================================================================
+  # dashboard —— Python 只读统计看板
+  # =========================================================================
+  dashboard:
+    build:
+      # context 是 dashboard/ 而非仓库根 —— dashboard/Dockerfile 里写的是
+      # `COPY requirements.txt .` 和 `COPY app ./app`，都是相对该目录的路径。
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: fluxkeys/dashboard:${FLUXKEYS_IMAGE_TAG:-dev}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      # 变量名对齐 dashboard/app/config.py 的 get_settings()
+      POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@postgres:5432/fluxkeys?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: "0"
+      DASHBOARD_PORT: "8081"
+      # 看板自己用 DASHBOARD_TZ 决定聚合口径的时区，与 TZ 保持一致
+      DASHBOARD_TZ: Asia/Shanghai
+      # 水位默认值需与网关侧一致，否则看板显示的「接近水位」判断会和实际调度不符。
+      # 网关是 token_limit × hard_ratio(0.90)，这里给出计算后的绝对值。
+      QUOTA_TOKEN_HARD: "4500000"
+      QUOTA_COUNT_HARD: "90"
+      # ---- 管理控制台 ----
+      # 用 :? 语法与 POSTGRES_PASSWORD 保持一致，让 compose 在启动前就报错，
+      # 而不是等容器起来后才由应用抛配置错误。
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD 未设置}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?DASHBOARD_SESSION_SECRET 未设置}
+      # 复用根级 ADMIN_API_KEY：网关与看板必须用同一个值。
+      # 拆成两个独立变量必然出现两边不一致，而症状是看板转发一律 401 ——
+      # 那会被看板转成 500，运维只能看到无法解释的服务端错误。
+      GATEWAY_ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY 未设置}
+      GATEWAY_BASE_URL: http://gateway:8080
+      # 多副本部署时所有副本必须共享同一个 SESSION_SECRET，
+      # 否则用户在副本间跳转会反复掉登录，且现象随负载均衡落点随机出现。
+      DASHBOARD_SESSION_TTL: "28800"
+      # 当前经 SSH 隧道以 HTTP 访问，置 true 会导致 Cookie 不回传而无法登录。
+      # 将来若在前面挂了 HTTPS 反向代理，这里要改成 true。
+      DASHBOARD_COOKIE_SECURE: "false"
+      # 逐条 upsert，1000 个 Key 需 20-50 秒，留足余量。
+      GATEWAY_TIMEOUT_IMPORT: "90"
+      # 自动文档默认关闭，是鉴权之外的纵深防御。
+      DASHBOARD_DOCS_ENABLED: "false"
+    ports:
+      # 看板含用量与 Key 信息，属内部运维面，只绑回环。
+      # 远程访问走 SSH 隧道: ssh -L 8000:127.0.0.1:8081 user@host
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-8000}:8081"
+    healthcheck:
+      # dashboard 镜像基于 python:3.12-slim，没有 wget/curl，用 python 自带 urllib
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=3).status==200 else 1)\""]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+
+  # =========================================================================
+  # Prometheus
+  # =========================================================================
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    user: "65534:65534"  # nobody，避免以 root 写数据卷
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 单机场景保留 15 天足够回溯，同时限制磁盘占用上限
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=4GB
+      - --web.enable-lifecycle          # 支持 POST /-/reload 热加载规则
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9091}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=3 http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 768M
+
+  # =========================================================================
+  # Grafana
+  # =========================================================================
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:11.2.2
+    restart: unless-stopped
+    user: "472:472"  # grafana 官方镜像内置 uid
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 关闭匿名访问与注册，运维面不对外开放
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 关闭外部遥测上报，避免运行环境信息外发
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_INSTALL_PLUGINS: ""
+      TZ: Asia/Shanghai
+    volumes:
+      # provisioning 目录下的数据源与 dashboard 会在启动时自动加载，无需手工点界面
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=3 http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 384M
+
+# ---------------------------------------------------------------------------
+# 卷：全部命名卷，docker compose down 不会删（需 -v 才删），避免误清配额与流水
+# ---------------------------------------------------------------------------
+volumes:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+
+# ---------------------------------------------------------------------------
+# 网络：刻意使用 compose 自动创建的 default bridge 网络，不声明自定义网络。
+#
+# 原因：只要服务上写了 `networks:`，compose 就会拒绝 override 文件里的
+# `network_mode: host`（两者互斥，且列表字段无法被 override 清空）。
+# 生产形态必须让 gateway 走 host 网络才能绑定宿主机辅助 IP（见 prod override），
+# 所以这里保持不写。default 网络同样提供服务名 DNS 解析，功能上无差别。
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# 切换到生产形态
+# ===========================================================================
+#
+# 生产与本地的差异不止环境变量，还有网络模式，因此单独提供 override 文件：
+#
+#   1. 宿主机先配好多 EIP 的策略路由（必做，否则源 IP 绑定静默失效）:
+#        sudo bash scripts/setup-egress.sh
+#      脚本会用 curl --interface 逐 IP 打印真实出口公网地址，必须逐条核对。
+#
+#   2. 编辑 .env:
+#        COMPOSE_PROFILES=monitoring          # 去掉 mock，不启动假上游
+#        EGRESS_MODE=multi_ip
+#        EGRESS_IPS=172.16.0.11=203.0.113.11,172.16.0.12=203.0.113.12
+#        EGRESS_VERIFY_ON_START=true
+#        VOLC_BASE_URL=https://ark.cn-beijing.volces.com
+#        REFRESH_ENABLED=true                 # 生产必开，否则 00:00-12:00 会超刷
+#        FLUXKEYS_IMAGE_TAG=v1.0.0            # 用具体 tag，不用 latest
+#
+#   3. 带 override 启动:
+#        docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# 为什么生产必须用 override：multi_ip 模式要把 TCP 源地址绑到宿主机网卡上的
+# 辅助 IP。bridge 网络里容器只有 172.x 的内部地址，看不到宿主机的辅助 IP，
+# 绑定会直接失败或退回主 IP。docker-compose.prod.yml 里 gateway 改为
+# network_mode: host 正是为此。

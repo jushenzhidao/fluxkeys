@@ -1,0 +1,288 @@
+/* FluxKeys 看板样式
+ *
+ * 配色遵循中国金融/额度类界面习惯：
+ *   红色 = 消耗上升 / 水位告警（涨、危险）
+ *   绿色 = 余量充足 / 状态正常
+ * 与欧美「红跌绿涨」相反，这里刻意采用中国用户的直觉。
+ */
+
+:root {
+  --bg: #0f1216;
+  --panel: #171b21;
+  --panel-2: #1d2229;
+  --border: #262c35;
+  --text: #e6e9ee;
+  --text-dim: #939cab;
+  --text-faint: #6b7280;
+
+  /* 语义色：红=消耗高/告警，绿=余量足/正常 */
+  --up: #f04d4d;        /* 消耗上升、水位高 */
+  --up-soft: #3a1d1f;
+  --ok: #23b26d;        /* 余量充足、正常 */
+  --ok-soft: #14301f;
+  --warn: #e8a33d;
+  --warn-soft: #33270f;
+  --info: #4b91f1;
+  --accent: #7c8cf8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a { color: var(--info); text-decoration: none; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  flex-wrap: wrap;
+}
+
+header h1 {
+  font-size: 17px;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+
+header .meta { color: var(--text-dim); font-size: 12px; }
+header .spacer { flex: 1; }
+
+button.refresh {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button.refresh:hover { border-color: var(--accent); }
+
+main { padding: 20px 24px 48px; max-width: 1600px; margin: 0 auto; }
+
+section { margin-bottom: 28px; }
+
+section > h2 {
+  font-size: 15px;
+  margin: 0 0 12px;
+  padding-left: 9px;
+  border-left: 3px solid var(--accent);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------- 概览卡片 */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.card .label { color: var(--text-dim); font-size: 12px; }
+
+.card .value {
+  font-size: 25px;
+  font-weight: 600;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.card .sub { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+
+.card.up .value { color: var(--up); }
+.card.ok .value { color: var(--ok); }
+.card.warn .value { color: var(--warn); }
+
+/* ---------------------------------------------------------- 图表 */
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  gap: 16px;
+}
+
+.chart-box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.chart-box h3 {
+  font-size: 13px;
+  margin: 0 0 10px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.chart-box .canvas-wrap { height: 260px; position: relative; }
+
+/* ---------------------------------------------------------- 表格 */
+
+.table-wrap {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: auto;
+  max-height: 560px;
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+th, td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th.sortable .arrow { color: var(--accent); margin-left: 3px; }
+
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+tbody tr:hover { background: var(--panel-2); }
+
+.empty {
+  padding: 28px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------------- 水位条 */
+
+.gauge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 150px;
+}
+
+.gauge .bar {
+  flex: 1;
+  height: 7px;
+  background: #2a3037;
+  border-radius: 4px;
+  overflow: hidden;
+  min-width: 70px;
+}
+
+.gauge .bar > i { display: block; height: 100%; border-radius: 4px; }
+.gauge .pct { font-size: 12px; font-variant-numeric: tabular-nums; min-width: 44px; }
+
+/* 消耗越高越红，余量足则绿 —— 中国用户直觉 */
+.lv-ok > i { background: var(--ok); }
+.lv-mid > i { background: var(--warn); }
+.lv-high > i { background: var(--up); }
+.lv-ok .pct { color: var(--ok); }
+.lv-mid .pct { color: var(--warn); }
+.lv-high .pct { color: var(--up); }
+
+/* ---------------------------------------------------------- 标签 */
+
+.tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid transparent;
+}
+
+.tag-ok { background: var(--ok-soft); color: var(--ok); border-color: #1f5c3c; }
+.tag-up { background: var(--up-soft); color: var(--up); border-color: #6d2b2e; }
+.tag-warn { background: var(--warn-soft); color: var(--warn); border-color: #6a5220; }
+.tag-dim { background: var(--panel-2); color: var(--text-dim); border-color: var(--border); }
+
+/* ---------------------------------------------------------- 告警 */
+
+.alerts { display: flex; flex-direction: column; gap: 8px; }
+
+.alert {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border-left: 3px solid var(--warn);
+  background: var(--panel);
+}
+
+.alert.critical { border-left-color: var(--up); background: #1c1417; }
+.alert .who { color: var(--text-dim); font-size: 12px; min-width: 110px; }
+.alert .msg { flex: 1; }
+
+.ok-banner {
+  padding: 12px 16px;
+  border-radius: 8px;
+  border-left: 3px solid var(--ok);
+  background: var(--panel);
+  color: var(--ok);
+}
+
+/* ---------------------------------------------------------- 其他 */
+
+.row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+.row > * { flex: 1; min-width: 340px; }
+
+.hint { color: var(--text-dim); font-size: 12px; margin: 0 0 10px; }
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.toolbar select,
+.toolbar input {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 9px;
+  font-size: 13px;
+}
+
+.err-banner {
+  background: var(--up-soft);
+  border: 1px solid #6d2b2e;
+  color: #ffb4b4;
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}

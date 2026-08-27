@@ -1,0 +1,392 @@
+openapi: 3.0.3
+info:
+  title: FluxKeys 管理控制台增量接口
+  version: 1.0.0
+  description: >
+    本文件只覆盖本次增量：网关侧新增的 PATCH /admin/keys/{key_id}，
+    以及看板侧新增的登录与三个转发端点。既有的 14 个看板只读端点与
+    网关既有管理端点不在此重复定义。
+
+    两个服务的鉴权模型不同：网关用 Bearer ADMIN_API_KEY，
+    看板用 HttpOnly 会话 Cookie。ADMIN_API_KEY 绝不出现在浏览器侧。
+
+servers:
+  - url: http://gateway:8080
+    description: 网关（容器内）
+  - url: http://127.0.0.1:8000
+    description: 看板（宿主机，经 compose 端口映射）
+
+tags:
+  - name: gateway-admin
+    description: 网关管理接口，凭 ADMIN_API_KEY 调用
+  - name: dashboard-auth
+    description: 看板会话鉴权
+  - name: dashboard-proxy
+    description: 看板转发端点，凭会话 Cookie 调用，服务端注入 ADMIN_API_KEY
+
+paths:
+  /admin/keys/{key_id}:
+    patch:
+      tags: [gateway-admin]
+      summary: 局部更新 Key 的状态、池与画像
+      description: >
+        字段缺席表示不改动该字段，故服务端必须用指针类型区分「未提供」与「空值」。
+        egress_ip 不在本端点内，出口 IP 变更走 PUT /admin/keys/{key_id}/ip，
+        因为后者需要 Rebind 丢弃旧连接这一副作用。
+        health_score 不开放，它是运行时观测值，人工改写会被下次请求覆盖。
+      security:
+        - AdminBearer: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+        - name: X-Admin-Actor
+          in: header
+          required: false
+          description: 操作者自报标识。共享密钥无法区分人员，未提供时审计记为 admin。
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchKeyRequest' }
+            examples:
+              封禁:
+                value: { status: banned, expected_status: active, reason: "火山侧提示异常，先隔离观察" }
+              强制复活终态Key:
+                value: { status: active, force: true, reason: "已确认鉴权问题已修复" }
+              仅改池子:
+                value: { pool: cold }
+      responses:
+        '200':
+          description: 更新成功。回显新旧值以便调用方确认改动如预期。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatchKeyResponse' }
+        '400':
+          description: 请求体非法、无可变更字段、或枚举值非法
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GatewayError' }
+        '401':
+          description: 管理密钥无效
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GatewayError' }
+        '404':
+          description: key_id 不存在
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GatewayError' }
+        '409':
+          description: >
+            expected_status 与当前状态不匹配，或从 banned/invalid 转 active 未带 force。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GatewayError' }
+        '500':
+          description: 数据库错误
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GatewayError' }
+
+  /login:
+    get:
+      tags: [dashboard-auth]
+      summary: 登录页
+      description: 豁免鉴权。样式内联，不依赖 /app.css，实现零静态资源豁免。
+      responses:
+        '200':
+          description: HTML 登录页
+          content:
+            text/html: { schema: { type: string } }
+    post:
+      tags: [dashboard-auth]
+      summary: 提交口令并签发会话 Cookie
+      description: >
+        口令比对使用 hmac.compare_digest 常量时间比较。
+        失败按客户端 IP 限流：5 分钟内连续失败 5 次锁定 15 分钟。
+        锁定期间不透露剩余尝试次数。
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, format: password }
+      responses:
+        '204':
+          description: 登录成功，会话 Cookie 已下发
+          headers:
+            Set-Cookie:
+              description: >
+                fk_session=<token>; HttpOnly; SameSite=Strict; Path=/; Max-Age=7200
+                Secure 由 DASHBOARD_COOKIE_SECURE 控制，默认关闭以兼容
+                SSH 隧道下的 HTTP 本地访问。
+              schema: { type: string }
+        '401':
+          description: 口令错误。文案不区分「口令错」与「账号不存在」。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardError' }
+        '429':
+          description: 失败次数过多，该 IP 已被临时锁定
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardError' }
+
+  /logout:
+    post:
+      tags: [dashboard-auth]
+      summary: 清除会话 Cookie
+      security:
+        - SessionCookie: []
+      responses:
+        '204':
+          description: 已登出
+          headers:
+            Set-Cookie:
+              description: fk_session 置空且 Max-Age=0
+              schema: { type: string }
+
+  /api/admin/keys/import:
+    post:
+      tags: [dashboard-proxy]
+      summary: 导入 Key（转发至网关 POST /admin/keys）
+      description: >
+        请求体流式透传，不在看板侧反序列化再重新序列化——后者会让 8MB 数据
+        在内存中翻倍，且可能改变数值表示。上限 8MB，与网关侧 MaxBytesReader 对齐。
+        read 超时 90 秒：网关是逐条 upsert，1000 个 Key 需 20-50 秒。
+      security:
+        - SessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/NewVolcKey'
+                - type: array
+                  items: { $ref: '#/components/schemas/NewVolcKey' }
+      responses:
+        '200':
+          description: 至少一个 Key 导入成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportResult' }
+        '400':
+          description: 全部失败。网关在此情形返回 400 而非 200，便于脚本判断。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportResult' }
+        '413':
+          description: 请求体超过 8MB 上限
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardError' }
+        '502':
+          description: 网关不可达或返回 5xx
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProxyError' }
+        '504':
+          description: >
+            转发超时。操作可能已部分生效，文案须引导先刷新确认而非直接重试。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProxyError' }
+
+  /api/admin/keys/{key_id}/ip:
+    put:
+      tags: [dashboard-proxy]
+      summary: 变更出口 IP（转发至网关 PUT /admin/keys/{key_id}/ip）
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                egress_ip: { type: string, description: 期望的出口 IP，仅作审计记录 }
+                mode: { type: string }
+      responses:
+        '200':
+          description: 已重新绑定并丢弃旧连接
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key_id: { type: string }
+                  old_ip: { type: string }
+                  new_ip: { type: string }
+                  switch_status: { type: string, example: completed }
+        '502': { description: 网关不可达, content: { application/json: { schema: { $ref: '#/components/schemas/ProxyError' } } } }
+        '503': { description: 出口池无可用 IP, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardError' } } } }
+        '504': { description: 转发超时, content: { application/json: { schema: { $ref: '#/components/schemas/ProxyError' } } } }
+
+  /api/admin/keys/{key_id}:
+    patch:
+      tags: [dashboard-proxy]
+      summary: 调整 Key 状态或池（转发至网关 PATCH /admin/keys/{key_id}）
+      description: >
+        看板注入 Authorization 与 X-Admin-Actor 两个头。
+        网关返回 401 时看板对外转成 500——401 意味着看板持有的 ADMIN_API_KEY 配错了，
+        透传会让前端误判为会话过期并跳登录页，导致运维陷入反复登录仍失败的死循环。
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatchKeyRequest' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatchKeyResponse' }
+        '400': { description: 请求非法, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardError' } } } }
+        '404': { description: key_id 不存在, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardError' } } } }
+        '409': { description: 状态冲突或需要 force, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardError' } } } }
+        '502': { description: 网关不可达, content: { application/json: { schema: { $ref: '#/components/schemas/ProxyError' } } } }
+        '504': { description: 转发超时, content: { application/json: { schema: { $ref: '#/components/schemas/ProxyError' } } } }
+
+components:
+  securitySchemes:
+    AdminBearer:
+      type: http
+      scheme: bearer
+      description: >
+        值为 ADMIN_API_KEY。仅供服务端之间使用，绝不下发到浏览器。
+        网关侧用常量时间比较校验。
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: fk_session
+      description: HMAC-SHA256 签名的自包含令牌，HttpOnly，无服务端状态。
+
+  schemas:
+    PatchKeyRequest:
+      type: object
+      minProperties: 1
+      description: >
+        status / pool / persona_id 至少提供一个，否则返回 400。
+        字段缺席表示不改动，服务端必须用指针类型区分未提供与空值。
+      properties:
+        status:
+          type: string
+          enum: [active, cooldown, banned, invalid]
+        pool:
+          type: string
+          enum: [hot, warm, cold]
+          description: 当前 pool 未参与调度打分，是纯标签。
+        persona_id:
+          type: string
+        expected_status:
+          type: string
+          enum: [active, cooldown, banned, invalid]
+          description: 乐观并发控制。与当前状态不符时返回 409。
+        force:
+          type: boolean
+          default: false
+          description: >
+            从 banned/invalid 转 active 时必须为 true。
+            这两个状态在调度器中是终态，直接放回流量会立即再次失败
+            并向上游多贡献一次异常请求。
+        reason:
+          type: string
+          maxLength: 500
+          description: 变更原因，只进审计，不进业务表。
+
+    FieldChange:
+      type: object
+      properties:
+        from: { type: string }
+        to: { type: string }
+
+    PatchKeyResponse:
+      type: object
+      required: [key_id, changed]
+      properties:
+        key_id: { type: string }
+        changed:
+          type: array
+          items: { type: string }
+          description: 实际发生变更的字段名
+        status: { $ref: '#/components/schemas/FieldChange' }
+        pool: { $ref: '#/components/schemas/FieldChange' }
+        persona_id: { $ref: '#/components/schemas/FieldChange' }
+
+    NewVolcKey:
+      type: object
+      required: [key_id]
+      properties:
+        key_id: { type: string, minLength: 1 }
+        secret:
+          type: string
+          description: 明文密钥，由存储层 AES-GCM 加密后落库。留空则保留库中已有密文。
+        pool: { type: string, enum: [hot, warm, cold] }
+        status: { type: string, enum: [active, cooldown, banned, invalid] }
+        persona_id: { type: string }
+        egress_ip:
+          type: string
+          description: 留空表示由出口池按哈希自动分配。
+
+    ImportResult:
+      type: object
+      properties:
+        imported_count: { type: integer }
+        created_count: { type: integer }
+        updated_count: { type: integer }
+        imported:
+          type: array
+          items: { type: string }
+        failed_count: { type: integer }
+        failures:
+          type: array
+          items:
+            type: object
+            properties:
+              key_id: { type: string }
+              reason: { type: string }
+
+    GatewayError:
+      type: object
+      description: 网关的 OpenAI 风格错误结构。
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type: { type: string }
+            code: { type: string }
+
+    DashboardError:
+      type: object
+      description: 看板错误结构。前端 fetchJSON 统一按 detail 取文案。
+      properties:
+        detail: { type: string }
+
+    ProxyError:
+      type: object
+      description: 转发失败。保留网关原始 code 供排障，不参与前端展示决策。
+      properties:
+        detail: { type: string }
+        gateway_code: { type: string }
+        gateway_status: { type: integer }

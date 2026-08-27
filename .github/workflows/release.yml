@@ -1,0 +1,255 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # 只匹配 v 开头的语义化版本 tag，如 v1.0.0 / v1.0.0-rc1
+      - "v*"
+  # 手动触发用于演练发布流程（不会真正推带版本号的镜像，见下方 tags 规则）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的版本号（如 v1.0.0）"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false  # 发布不中断，避免推出半成品镜像
+
+permissions:
+  contents: read
+  packages: write      # 推 ghcr.io 需要
+  id-token: write      # 供未来接入 sigstore 镜像签名
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # =========================================================================
+  # 发布前门禁：tag 上的代码必须能过测试
+  #
+  # 不复用 ci.yml 是刻意的：tag 可能打在任意 commit 上（包括未跑过 CI 的），
+  # 直接构建镜像会把没验证过的代码推成正式版本。
+  # =========================================================================
+  verify:
+    name: 发布前验证
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.4"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test -race -count=1 ./...
+
+  # =========================================================================
+  # 多架构镜像构建与推送
+  #
+  # 为什么需要 arm64：国内云厂商的 ARM 实例（如阿里云 g8y、华为 Kunpeng）
+  # 性价比明显更好，而这个网关是 IO 密集型，ARM 上跑没有劣势。
+  # =========================================================================
+  build-push:
+    name: 构建推送 ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    needs: [verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: gateway
+            image: fluxkeys-gateway
+          - target: mockark
+            image: fluxkeys-mockark
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 拉全部历史，让 git describe 能读到 tag 信息
+          fetch-depth: 0
+
+      # QEMU 提供跨架构模拟，让 amd64 runner 能构建 arm64 镜像。
+      # 代价是 arm64 那一路会慢几倍 —— 但因为 Go 是交叉编译（CGO_ENABLED=0，
+      # Dockerfile 里用 GOARCH=$TARGETARCH），实际编译仍在 amd64 原生跑，
+      # QEMU 只用于最终镜像层的少量指令，开销可接受。
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN 已由 permissions.packages: write 授权，无需额外 PAT
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 准备版本信息
+        id: meta
+        run: |
+          set -euo pipefail
+          # tag 推送时用 ref 名；手动触发时用输入值
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.tag }}"
+          else
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+          # 仓库所有者转小写：ghcr.io 不接受大写路径，而 GitHub 用户名可能含大写
+          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          {
+            echo "version=$version"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "owner=$owner"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 生成镜像标签与元数据
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.meta.outputs.owner }}/${{ matrix.image }}
+          tags: |
+            # 完整版本号，如 v1.2.3 -> 1.2.3
+            type=semver,pattern={{version}}
+            # 主次版本，如 1.2 —— 便于跟随补丁更新
+            type=semver,pattern={{major}}.{{minor}}
+            # 仅正式版本更新 latest；预发布（-rc1 等）不会污染 latest
+            type=raw,value=latest,enable=${{ !contains(steps.meta.outputs.version, '-') }}
+          labels: |
+            org.opencontainers.image.title=FluxKeys ${{ matrix.target }}
+            org.opencontainers.image.description=OpenAI 兼容 API 网关（${{ matrix.target }}）
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.build_time }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
+          cache-from: type=gha,scope=release-${{ matrix.target }}
+          cache-to: type=gha,scope=release-${{ matrix.target }},mode=max
+          # 生成 SBOM 与 provenance，供供应链审计
+          sbom: true
+          provenance: mode=max
+
+      - name: 验证多架构 manifest
+        run: |
+          set -euo pipefail
+          # 取第一个 tag 做检查
+          tag=$(echo "${{ steps.docker_meta.outputs.tags }}" | head -1)
+          echo "检查 $tag 的架构列表："
+          docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
+            | python3 -c "
+          import json,sys
+          m = json.load(sys.stdin)
+          arches = sorted(
+              f\"{d['platform']['os']}/{d['platform']['architecture']}\"
+              for d in m.get('manifests', [])
+              if d.get('platform', {}).get('architecture') not in (None, 'unknown')
+          )
+          print('实际包含:', arches)
+          need = {'linux/amd64', 'linux/arm64'}
+          missing = need - set(arches)
+          if missing:
+              print('::error::缺少架构:', missing)
+              sys.exit(1)
+          print('多架构 manifest 校验通过')
+          "
+
+      - name: 输出摘要
+        run: |
+          {
+            echo "### ${{ matrix.target }} 镜像已推送"
+            echo ""
+            echo "版本: \`${{ steps.meta.outputs.version }}\`"
+            echo ""
+            echo "镜像 digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "标签："
+            echo '```'
+            echo "${{ steps.docker_meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================
+  # 创建 GitHub Release
+  # =========================================================================
+  release:
+    name: 创建 Release
+    runs-on: ubuntu-24.04
+    needs: [build-push]
+    # 手动触发时不建 Release（那是演练，不该产生正式发布记录）
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write   # 创建 Release 需要写权限
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 准备发布说明
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF#refs/tags/}"
+          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          {
+            echo "## 镜像"
+            echo ""
+            echo '```bash'
+            echo "docker pull ghcr.io/$owner/fluxkeys-gateway:${version#v}"
+            echo "docker pull ghcr.io/$owner/fluxkeys-mockark:${version#v}"
+            echo '```'
+            echo ""
+            echo "支持架构：\`linux/amd64\`、\`linux/arm64\`"
+            echo ""
+            echo "## 部署"
+            echo ""
+            echo "在 \`.env\` 中设置 \`FLUXKEYS_IMAGE_TAG=${version#v}\` 后："
+            echo ""
+            echo '```bash'
+            echo "docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d"
+            echo '```'
+            echo ""
+            echo "> 生产环境必须先执行 \`sudo bash scripts/setup-egress.sh\` 配置出口策略路由，"
+            echo "> 否则按 Key 绑定出口 IP 会静默失效。详见 \`deploy/README.md\`。"
+            echo ""
+            echo "## 变更"
+            echo ""
+            # 从上一个 tag 到当前 tag 的提交列表
+            prev=$(git describe --tags --abbrev=0 "$version^" 2>/dev/null || true)
+            if [ -n "$prev" ]; then
+              echo "对比 \`$prev\`：" 
+              echo ""
+              git log --pretty=format:'- %s (%h)' "$prev..$version"
+            else
+              echo "首个版本。"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          # 含 - 的版本（如 v1.0.0-rc1）标记为预发布
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: false

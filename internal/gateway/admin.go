@@ -1,0 +1,468 @@
+package gateway
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+// 管理接口。
+//
+// 两条硬性规则:
+//
+//  1. cfg.Admin.APIKey 为空时路由完全不注册（见 server.go routes）。管理接口
+//     能改 Key 绑定、建用户、发密钥，裸奔的后果等同于系统被接管。
+//
+//  2. 所有写操作都写审计日志。审计的目的不是事后追责，而是当 Key 出现异常
+//     封禁时能回答「这个 Key 的出口 IP 是什么时候被谁改的」—— 没有这条
+//     记录，多 IP 环境下的封禁根因几乎无法定位。
+
+// adminActor 从请求中提取操作者标识。
+//
+// 管理密钥是共享的，无法区分具体人员，故支持通过 X-Admin-Actor 头自报身份。
+// 未提供时记为 admin，至少保留「经由管理接口」这个事实。
+func adminActor(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Admin-Actor")); v != "" {
+		return v
+	}
+	return "admin"
+}
+
+// audit 写审计日志。失败只告警不阻断 —— 操作已经完成，此时返回错误会让
+// 调用方误以为操作失败而重试。
+func (s *Server) audit(r *http.Request, action, target string, detail map[string]any) {
+	if err := s.store.Audit(r.Context(), adminActor(r), action, target, detail); err != nil {
+		s.log.ErrorContext(r.Context(), "写入审计日志失败",
+			"request_id", RequestIDFromContext(r.Context()),
+			"action", action, "target", target, "err", err)
+	}
+}
+
+// handleAdminKeys 处理 GET /admin/keys 与 POST /admin/keys。
+func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// 继续往下走，列出 Key 状态
+	case http.MethodPost:
+		s.handleImportKeys(w, r)
+		return
+	default:
+		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request",
+			"该端点只接受 GET 与 POST")
+		return
+	}
+
+	states, err := s.sched.KeyStates(r.Context())
+	if err != nil {
+		s.log.ErrorContext(r.Context(), "读取 Key 状态失败", "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "读取 Key 状态失败")
+		return
+	}
+
+	byStatus := make(map[string]int, 6)
+	byPool := make(map[string]int, 3)
+	items := make([]map[string]any, 0, len(states))
+	for _, st := range states {
+		byStatus[st.Status]++
+		byPool[st.Pool]++
+
+		item := map[string]any{
+			"key_id":            st.KeyID,
+			"status":            st.Status,
+			"pool":              st.Pool,
+			"quota_token_used":  st.TokenUsed,
+			"quota_token_limit": st.TokenLimit,
+			"quota_token_ratio": st.TokenRatio(),
+			"quota_count_used":  st.CountUsed,
+			"quota_count_limit": st.CountLimit,
+			"health_score":      st.HealthScore,
+			"egress_ip":         st.EgressIP,
+			"persona_id":        st.PersonaID,
+		}
+		if !st.LastUsedAt.IsZero() {
+			item["last_used"] = st.LastUsedAt
+		}
+		items = append(items, item)
+	}
+
+	// 顺带把分布同步到指标，省掉一个专门的后台采集任务
+	s.metrics.SetKeyDistribution(byStatus, byPool)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":     len(states),
+		"active":    byStatus["active"],
+		"cooldown":  byStatus["cooldown"],
+		"banned":    byStatus["banned"],
+		"invalid":   byStatus["invalid"],
+		"by_status": byStatus,
+		"by_pool":   byPool,
+		"keys":      items,
+	})
+}
+
+// handleAdminIPs 处理 GET /admin/ips。
+func (s *Server) handleAdminIPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 GET")
+		return
+	}
+
+	st := s.egress.Stats()
+
+	// 同步出口指标
+	byState := make(map[string]int, 4)
+	reputation := make(map[string]int, len(st.PerIP))
+	bound := make(map[string]int, len(st.PerIP))
+	for _, ip := range st.PerIP {
+		byState[string(ip.State)]++
+		reputation[ip.Addr] = ip.Reputation
+		bound[ip.Addr] = ip.BoundKeys
+	}
+	s.metrics.SetEgressStats(byState, reputation, bound)
+
+	writeJSON(w, http.StatusOK, st)
+}
+
+// handleAdminKeyByID 处理 /admin/keys/ 子树下除 PATCH 单段路径以外的请求。
+//
+// 目前该子树有两种合法形态:
+//
+//	PUT   /admin/keys/{key_id}/ip  —— 本 handler 处理
+//	PATCH /admin/keys/{key_id}     —— 由 handleAdminKeyPatch 处理（更具体的
+//	                                  模式优先命中，不会走到这里）
+//
+// 单段路径落到这里只有两种情况: 方法不是 PATCH（如 GET /admin/keys/volc_001），
+// 或路径是 /admin/keys/（尾斜杠，单段通配匹配不到）。两者都给出把两种形态
+// 都写清的文案 —— 只提 /ip 会让用错方法的调用方以为 PATCH 端点不存在。
+func (s *Server) handleAdminKeyByID(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/admin/keys/")
+	// 只裁尾部斜杠，不裁头部。
+	//
+	// 用 strings.Trim 同时裁两端会把 /admin/keys//ip（key_id 为空）压成单段
+	// 的 "ip"，与 /admin/keys/volc_001 无法区分，于是空 key_id 会被误判成
+	// 「路径合法只是方法不对」而回 405。裁尾保留了首段为空这个信号。
+	rest = strings.TrimSuffix(rest, "/")
+	parts := strings.Split(rest, "/")
+
+	if len(parts) != 2 || parts[0] == "" || parts[1] != "ip" {
+		// 文案同时列出两种合法形态。
+		//
+		// 只提 /ip 会误导用错方法的调用方 —— 比如 PUT /admin/keys/volc_001
+		// 会落到这里，此时提示里若没有 PATCH 那一行，调用方会以为改状态的
+		// 端点不存在，而实际上只是方法用错了。
+		//
+		// 这里保持 404 而不改成 405: 单段路径能落到本 handler 说明方法不是
+		// PATCH，看似该回 405，但 /admin/keys/ 是子树模式，它对任意方法、
+		// 任意深度的路径都匹配，本 handler 无法可靠区分「路径存在但方法不对」
+		// 与「路径本就不存在」。在信息不足的情况下回 405 是在猜。
+		s.writeError(w, r, http.StatusNotFound, "invalid_request",
+			"路径格式应为 PUT /admin/keys/{key_id}/ip 或 PATCH /admin/keys/{key_id}")
+		return
+	}
+	keyID := parts[0]
+
+	if r.Method != http.MethodPut {
+		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 PUT")
+		return
+	}
+
+	var req struct {
+		EgressIP string `json:"egress_ip"`
+		Mode     string `json:"mode"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		return
+	}
+
+	oldIP := s.egress.BoundIP(keyID)
+
+	// Rebind 会丢弃该 Key 的旧连接。这是必须的: 保留旧连接意味着后续请求
+	// 仍从旧 IP 发出，绑定变更形同虚设。
+	newIP, err := s.egress.Rebind(keyID)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "service_busy",
+			"重新绑定失败: "+err.Error())
+		return
+	}
+
+	// 落库，否则重启时 restoreBindings 会读到旧出口并把 Key 换回去 ——
+	// 本次换出口白做，还多制造一次「老账号换 IP」。
+	// 失败只降级告警: 内存中的变更已生效，本次运行是正确的。
+	var persistErr string
+	if newIP != "" {
+		if err := s.store.SetVolcKeyEgressIP(r.Context(), keyID, newIP); err != nil {
+			persistErr = err.Error()
+			s.log.WarnContext(r.Context(), "出口变更已生效但落库失败，重启后可能回退",
+				"key_id", keyID, "new_ip", newIP, "err", err)
+		}
+	}
+
+	detail := map[string]any{
+		"old_ip":       oldIP,
+		"new_ip":       newIP,
+		"requested_ip": req.EgressIP,
+		"mode":         req.Mode,
+		"request_id":   RequestIDFromContext(r.Context()),
+	}
+	if persistErr != "" {
+		detail["persist_error"] = persistErr
+	}
+	s.audit(r, "rebind_key_ip", keyID, detail)
+
+	s.log.InfoContext(r.Context(), "Key 出口 IP 已变更",
+		"key_id", keyID, "old_ip", oldIP, "new_ip", newIP, "actor", adminActor(r))
+
+	resp := map[string]any{
+		"key_id":        keyID,
+		"old_ip":        oldIP,
+		"new_ip":        newIP,
+		"switch_status": "completed",
+	}
+	if persistErr != "" {
+		// 内存已切换，故仍是 completed，但要让调用方知道重启后可能回退。
+		resp["persist_error"] = persistErr
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleImportKeys 处理 POST /admin/keys，导入或更新火山 Key。
+//
+// 支持单个对象与数组两种请求体，方便运维用一份清单一次导入上千个 Key。
+//
+// 语义是 upsert: 重复导入同一份清单是安全的幂等操作。secret 留空时保留库中
+// 已有密文，因此可以用同一份清单只更新 pool 等元数据而不接触密钥。
+func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
+	// 1000 个 Key 的清单约几百 KB，给到 8MB 足够且仍能挡住异常请求。
+	body := http.MaxBytesReader(w, r.Body, 8<<20)
+
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "读取请求体失败: "+err.Error())
+		return
+	}
+
+	var items []NewVolcKey
+	trimmed := strings.TrimSpace(string(raw))
+	switch {
+	case strings.HasPrefix(trimmed, "["):
+		if err := json.Unmarshal(raw, &items); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+			return
+		}
+	case strings.HasPrefix(trimmed, "{"):
+		var one NewVolcKey
+		if err := json.Unmarshal(raw, &one); err != nil {
+			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+			return
+		}
+		items = []NewVolcKey{one}
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+			"请求体应为 JSON 对象或数组")
+		return
+	}
+
+	if len(items) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "没有待导入的 Key")
+		return
+	}
+
+	type failure struct {
+		KeyID  string `json:"key_id"`
+		Reason string `json:"reason"`
+	}
+
+	imported := make([]string, 0, len(items))
+	failures := make([]failure, 0)
+	seen := make(map[string]bool, len(items))
+	var createdCount int
+
+	for _, it := range items {
+		it.KeyID = strings.TrimSpace(it.KeyID)
+		if it.KeyID == "" {
+			failures = append(failures, failure{Reason: "key_id 不能为空"})
+			continue
+		}
+		// 同一批内重复的 key_id 直接报错而非静默后写覆盖前写: 清单里出现
+		// 重复 ID 通常意味着生成脚本有问题，静默接受会让运维以为导入了
+		// N 个 Key 而实际只有 N-1 个。
+		if seen[it.KeyID] {
+			failures = append(failures, failure{KeyID: it.KeyID, Reason: "同一批内重复出现"})
+			continue
+		}
+		seen[it.KeyID] = true
+
+		created, err := s.store.UpsertVolcKey(r.Context(), it)
+		if err != nil {
+			// 单个失败不中断整批: 导入 1000 个 Key 时因第 3 个格式错误而
+			// 全部回滚，运维只能反复试错。逐条报告让一次调用就能修完。
+			s.log.ErrorContext(r.Context(), "导入 Key 失败", "key_id", it.KeyID, "err", err)
+			failures = append(failures, failure{KeyID: it.KeyID, Reason: err.Error()})
+			continue
+		}
+		if created {
+			createdCount++
+		}
+
+		// 立刻建立出口绑定，避免等到首个请求到达时才惰性绑定 ——
+		// 惰性绑定的顺序取决于请求到达顺序，重启后同一 Key 可能落到不同 IP。
+		if _, err := s.egress.Bind(it.KeyID); err != nil {
+			s.log.WarnContext(r.Context(), "Key 出口绑定失败",
+				"key_id", it.KeyID, "err", err)
+		}
+
+		imported = append(imported, it.KeyID)
+	}
+
+	// 立即重载调度器的 Key 池。
+	//
+	// 不重载的话，新部署导入完 Key 仍会在长达一轮 key_reload 周期（5 分钟）
+	// 内对所有请求返回 503 —— 运维只能看到「导入成功但服务不可用」，
+	// 会合理地怀疑导入没生效。
+	//
+	// 失败只告警不影响响应: Key 已经落库，后台 key_reload 最终会捡起来，
+	// 此时报错会让调用方误以为导入失败而重试。
+	if len(imported) > 0 {
+		if err := s.sched.Reload(r.Context()); err != nil {
+			s.log.WarnContext(r.Context(), "导入后重载 Key 池失败，将等待后台重载",
+				"err", err)
+		}
+	}
+
+	// 审计只记 key_id 与元数据，绝不记 secret。
+	s.audit(r, "import_volc_keys", strconv.Itoa(len(imported)), map[string]any{
+		"imported":   imported,
+		"created":    createdCount,
+		"updated":    len(imported) - createdCount,
+		"failed":     len(failures),
+		"request_id": RequestIDFromContext(r.Context()),
+	})
+
+	s.log.InfoContext(r.Context(), "火山 Key 导入完成",
+		"imported", len(imported), "created", createdCount,
+		"updated", len(imported)-createdCount,
+		"failed", len(failures), "actor", adminActor(r))
+
+	status := http.StatusOK
+	if len(imported) == 0 {
+		// 全部失败时不能返回 200: 调用方（含 CI 脚本）需要据此判断是否成功。
+		status = http.StatusBadRequest
+	}
+
+	writeJSON(w, status, map[string]any{
+		"imported_count": len(imported),
+		"created_count":  createdCount,
+		"updated_count":  len(imported) - createdCount,
+		"imported":       imported,
+		"failed_count":   len(failures),
+		"failures":       failures,
+	})
+}
+
+// handleAdminUsers 处理 POST /admin/users。
+func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 POST")
+		return
+	}
+
+	var req struct {
+		Name            string `json:"name"`
+		Email           string `json:"email"`
+		RPMLimit        int    `json:"rpm_limit"`
+		TPMLimit        int64  `json:"tpm_limit"`
+		DailyTokenLimit int64  `json:"daily_token_limit"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "name 不能为空")
+		return
+	}
+
+	uc, err := s.store.CreateUser(r.Context(), NewUser{
+		Name:            req.Name,
+		Email:           req.Email,
+		RPMLimit:        req.RPMLimit,
+		TPMLimit:        req.TPMLimit,
+		DailyTokenLimit: req.DailyTokenLimit,
+	})
+	if err != nil {
+		s.log.ErrorContext(r.Context(), "创建用户失败", "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "创建用户失败: "+err.Error())
+		return
+	}
+
+	// 审计与响应都用存储层回填后的值: 用户没传限额时存储层会填默认值，
+	// 回显请求值会让调用方以为「不限」而实际上有默认上限。
+	s.audit(r, "create_user", strconv.FormatInt(uc.UserID, 10), map[string]any{
+		"name": uc.Name, "email": req.Email,
+		"rpm_limit": uc.RPMLimit, "tpm_limit": uc.TPMLimit,
+		"daily_token_limit": uc.DailyTokenLimit,
+		"request_id":        RequestIDFromContext(r.Context()),
+	})
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": uc.UserID, "name": uc.Name, "email": req.Email,
+		"rpm_limit": uc.RPMLimit, "tpm_limit": uc.TPMLimit,
+		"daily_token_limit": uc.DailyTokenLimit,
+	})
+}
+
+// handleAdminUserByID 处理 POST /admin/users/{id}/keys。
+func (s *Server) handleAdminUserByID(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/admin/users/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) != 2 || parts[1] != "keys" {
+		s.writeError(w, r, http.StatusNotFound, "invalid_request",
+			"路径格式应为 /admin/users/{id}/keys")
+		return
+	}
+	userID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || userID <= 0 {
+		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "用户 ID 非法")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 POST")
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	// 请求体可省略
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+
+	plaintext, issued, err := s.store.CreateUserAPIKey(r.Context(), userID, req.Name)
+	if err != nil {
+		s.log.ErrorContext(r.Context(), "签发用户 API Key 失败", "user_id", userID, "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "签发失败: "+err.Error())
+		return
+	}
+
+	// 审计只记前缀，绝不记明文 —— 审计表被读取的门槛远低于密钥表
+	s.audit(r, "create_user_api_key", strconv.FormatInt(userID, 10), map[string]any{
+		"api_key_id": issued.ID, "key_prefix": issued.Prefix, "name": req.Name,
+		"request_id": RequestIDFromContext(r.Context()),
+	})
+
+	s.log.InfoContext(r.Context(), "已签发用户 API Key",
+		"user_id", userID, "api_key_id", issued.ID, "prefix", issued.Prefix, "actor", adminActor(r))
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":      issued.ID,
+		"user_id": userID,
+		"name":    req.Name,
+		"prefix":  issued.Prefix,
+		// 明文仅此一次返回，服务端只存哈希
+		"api_key": plaintext,
+		"warning": "请立即保存，该明文不会再次返回",
+	})
+}
