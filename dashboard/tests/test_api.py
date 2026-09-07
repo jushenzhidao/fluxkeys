@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Iterator
 from datetime import date, datetime
@@ -25,6 +26,20 @@ from app.security import COOKIE_NAME, LoginRateLimiter, PasswordChecker, Session
 from app.service import ReportService
 
 SH = ZoneInfo("Asia/Shanghai")
+
+# 种子数据全部落在 2026-08-23 这个配额日（20:00 > 12:00，无边界歧义）。
+# SeededDatabase 返回的行硬编码此日期，服务层的时间窗口却按 now() 计算 ——
+# 两者必须钉在同一时刻，否则窗口滑出 08-23 后（现实中就是 8 月 26 日起）
+# 所有依赖日期对齐的断言都会失败，且在 00:00-12:00 之间还会再偏移一天。
+SEED_NOW = datetime(2026, 8, 23, 20, 0, tzinfo=SH)
+
+
+class FixedClockSettings(Settings):
+    """now() 固定在种子数据的配额日窗口内，让日期断言与真实时钟解耦。"""
+
+    def now(self) -> datetime:  # type: ignore[override]
+        return SEED_NOW
+
 
 # 所有 GET 报表接口，用于批量验证「空数据不 500」。
 REPORT_ENDPOINTS = [
@@ -377,7 +392,11 @@ def seeded_cache(settings: Settings) -> FakeCache:
 
 @pytest.fixture
 def seeded_client(settings: Settings, seeded_cache: FakeCache) -> Iterator[TestClient]:
-    client = make_client(SeededDatabase(settings), seeded_cache, settings)
+    # 种子数据的日期是硬编码的 2026-08-23，服务层时间窗口必须钉在同一
+    # 时刻。直接用真实时钟的话，窗口滑出该日期后断言全挂，且在
+    # 00:00-12:00 之间跑还会因配额日回退再偏一天。
+    fixed = FixedClockSettings(**dataclasses.asdict(settings))
+    client = make_client(SeededDatabase(fixed), seeded_cache, fixed)
     yield client
     app.dependency_overrides.clear()
 

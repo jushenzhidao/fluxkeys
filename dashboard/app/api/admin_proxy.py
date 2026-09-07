@@ -76,3 +76,51 @@ async def rebind_key_ip(key_id: str, request: Request) -> Response:
     body = await _read_body(request)
     result = await _client(request).rebind_key_ip(key_id, body, _actor(request))
     return JSONResponse(status_code=result.status, content=result.payload)
+
+
+@router.patch("/config/default-provider", summary="切换默认 provider（转发至网关 PATCH）")
+async def set_default_provider(request: Request) -> Response:
+    """挂在 /api/admin/config 下，不在 /api/admin/providers 下。
+
+    与网关的 ``PATCH /admin/config/default-provider`` 对齐（文档 §4.1.2）。
+    ``default_provider`` 是整份配置的一个字段而非某个 provider 的属性 ——
+    文档 §4.1.2 明确它存 ``provider_config_state`` 表而不是 provider 行上。
+    挂进 providers 前缀会让路径读起来像「某个 provider 的 default 属性」，
+    而运维照这个理解去猜时会发现无从指定是哪个。
+
+    请求体 ``{expected_version, name, reason}`` 原样透传。看板**不检查**目标
+    provider 是否存在、是否 enabled、版本号是否过期 —— 全在网关判（§4.1.2
+    规则 1-2）。这条尤其不能在看板补：`enabled` 状态取自网关那一刻的配置
+    快照，看板另发一次请求读到的是另一个时点的结果，两者不一致时看板的判断
+    只会拦掉本该放过的提交。
+    """
+    body = await _read_body(request)
+    result = await _client(request).set_default_provider(body, _actor(request))
+    return JSONResponse(status_code=result.status, content=result.payload)
+
+
+@router.post("/reload-config", summary="重载 provider 配置（转发至网关 POST）")
+async def reload_config(request: Request) -> Response:
+    """挂在 /api/admin 而非 /api/admin/providers 下。
+
+    对应网关的 ``POST /admin/reload-config`` —— 它重载的是整份配置快照，不是
+    某个 provider 的操作。放进 providers 前缀会让路径暗示一个不存在的从属关系，
+    而运维照着路径去猜「重载哪个 provider」时会发现无从指定。
+    """
+    body = await _read_body(request)
+    result = await _client(request).reload_provider_config(body, _actor(request))
+    return JSONResponse(status_code=result.status, content=result.payload)
+
+
+# provider 配置那组转发端点在 api/provider_proxy.py。
+#
+# 曾有一版按 docs/provider-config-hotreload.md §4.1 的清单写在本文件里
+# （PATCH /providers/{name}、/enable、/disable、/config/versions、
+# /providers/validate）。那一版**已移除**：网关侧
+# 实测没有这些路由（internal/gateway/admin_provider.go:40-51 用 PUT 全量替换、
+# 用 DELETE 软删代替 disable、版本历史按 provider 分组），照文档转发会得到
+# 一组 404 —— 而 404 出现在第二跳，前端只会显示「目标不存在，列表已过期」，
+# 完全指不到「路由压根没注册」这个真实原因。
+#
+# 差异清单已报 team-lead 与 be-api，以网关实际路由为准的理由是：那是唯一
+# 能被验证的一侧，文档与前端都还能改。

@@ -102,7 +102,20 @@ func QuotaDay(t time.Time) string {
 | P1-9 用户模型 | 完全缺失 | 补 Postgres: `users` / `user_api_keys` / `usage_records` / `volc_keys` / `egress_ips`，用户级 RPM/TPM 限流走 Redis 令牌桶 |
 | P1-10 fallback | 无预算护栏 | **MVP 默认关闭**付费渠道 fallback。开启需显式配置日预算上限，触顶即熔断 |
 
-其余 P2：预扣估算改为 `prompt_tokens_est + max_tokens`（V3 漏算 prompt）；Redis 故障降级为全局限流 50% + 拒绝新预扣；行为相似度只做每日离线自检，移出热路径。
+其余 P2：预扣估算改为 `(prompt_tokens_est + max_tokens) * multiplier`（V3 漏算 prompt）；Redis 故障降级为全局限流 50% + 拒绝新预扣；行为相似度只做每日离线自检，移出热路径。
+
+推理模型另需单独修正。`max_tokens` 对思维链**不构成约束** —— 实测 `deepseek-v4-flash` 在 `max_tokens=64` 时 `completion_tokens` 达 121（1.89 倍），`max_tokens=16` 时达 141（8.8 倍），因为思维链长度由问题复杂度决定，与用户声明的上限无关。仅靠 `estimate_multiplier`（1.2）会让预扣被系统性击穿：真实用量越过硬水位后要等 Commit 才发现，额度已经超刷。
+
+修正机制是「按比例放大 + 绝对下限」两段，命中 `upstream.reasoning_models`（默认按 `deepseek` / `thinking` / `-r1` 等子串匹配）时对**输出部分**生效，且在乘 `n` 之前完成（每份候选各产生一条独立思维链）：
+
+| 参数 | 默认值 | 作用 |
+|---|---|---|
+| `quota.reasoning_output_multiplier` | 3.0 | 覆盖实测 1.89 倍并留余量。不取更大值是因为预扣过高会压低单 Key 并发 |
+| `quota.reasoning_floor_tokens` | 1024 | 托底极小 `max_tokens`（16 × 3 = 48 仍远不够实测的 141），仅在**显式**传入 `max_tokens` 时套用 |
+
+未显式指定 `max_tokens` 时不套下限：此时输出已按 `default_max_tokens`（4096）计，本身高于任何观测到的思维链长度，再放大只是白占额度。两项均支持环境变量覆盖，便于不重建镜像调优。
+
+`completion_tokens` 已包含 `reasoning_tokens`（实测 88 + 141 = 229 ✓），Commit 侧不存在重复计费；适配层额外解析 `completion_tokens_details.reasoning_tokens` 并落库，用于定位「预扣为何不够」。
 
 ---
 

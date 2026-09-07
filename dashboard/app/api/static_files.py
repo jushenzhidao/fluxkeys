@@ -34,12 +34,16 @@ _ASSETS: Final[dict[str, tuple[str, str]]] = {
     # 基础看板
     "/app.js": ("app.js", _JS),
     "/app.css": ("app.css", _CSS),
-    # 管理控制台。这 5 个是 index.html 显式引用的，缺任何一个界面都不完整。
+    # 管理控制台。这 8 个是 index.html 显式引用的，缺任何一个界面都不完整。
     "/admin.css": ("admin.css", _CSS),
     "/admin-icons.js": ("admin-icons.js", _JS),
     "/admin-ui.js": ("admin-ui.js", _JS),
     "/admin.js": ("admin.js", _JS),
     "/admin-import.js": ("admin-import.js", _JS),
+    # provider 配置管理
+    "/admin-provider.js": ("admin-provider.js", _JS),
+    "/admin-provider-form.js": ("admin-provider-form.js", _JS),
+    "/admin-provider-act.js": ("admin-provider-act.js", _JS),
 }
 
 

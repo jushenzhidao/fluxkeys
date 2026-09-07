@@ -1,0 +1,76 @@
+# FluxKeys 测试配置 - 商汤 SenseNova
+# 用途：真实环境测试，验证多 provider 架构
+
+server:
+  addr: "0.0.0.0:8080"
+  
+postgres:
+  dsn: "host=localhost port=5432 user=fluxkeys password=fluxkeys dbname=fluxkeys sslmode=disable"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+# 多 Provider 配置示例
+providers:
+  sensenova:
+    base_url: "https://api.sensenova.cn/v1"
+    quota_kind: "token"
+    quota_limit: 1000000  # 100万 tokens
+    quota_window: 24h
+    refresh_hour: null  # 商汤无固定刷新点
+    model_mapping:
+      # 将常见模型名映射到商汤模型
+      "gpt-4": "SenseChat-5"
+      "gpt-4-turbo": "SenseChat-5"
+      "gpt-3.5-turbo": "SenseChat-Turbo"
+      "claude-3-5-sonnet": "SenseChat-5"
+    count_models: []
+    reasoning_models: []
+
+# 跨渠道通用配置
+upstream:
+  max_retries: 3
+  retry_base_delay: 500ms
+  retry_jitter: 200ms
+
+# 调度器配置
+scheduler:
+  weight_quota: 0.35
+  weight_history: 0.25
+  weight_persona: 0.20
+  weight_health: 0.20
+  soft_penalty: 0.3
+  active_pool_size: 10
+  enable_persona: false
+  min_request_interval: 5s
+  expected_peak_qps: 2.0
+  pool_shares: {}  # 单档位，不做分层
+
+# 刷新窗口配置（商汤无固定刷新点，禁用）
+refresh:
+  enabled: false
+  pre_refresh_start: "11:30"
+  window_start: "12:00"
+  window_end: "14:00"
+  probe_interval: 30s
+  probe_model: "SenseChat-Turbo"
+  post_refresh_ramp_minutes: 15
+
+# 出口 IP 配置
+egress:
+  default_max_keys: 5
+  ban_detect_window: 5m
+  ban_cooldown: 1h
+  ban_cooldown_max: 24h
+  health_check_interval: 1m
+  ips:
+    - addr: "154.40.45.34"
+      public_ip: "154.40.45.34"
+      max_keys: 5
+      pool: ""
+    - addr: "154.40.45.130"
+      public_ip: "154.40.45.130"
+      max_keys: 5
+      pool: ""

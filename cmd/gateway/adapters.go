@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/gateway"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
 	"github.com/fluxkeys/fluxkeys/internal/scheduler"
@@ -34,17 +35,46 @@ type schedulerAdapter struct {
 	cfg   quotaLimits
 }
 
-// quotaLimits 是构造 KeyState 时需要的水位，避免适配器再依赖整个 config。
+// quotaLimits 按 provider 提供构造 KeyState 时需要的水位。
+//
+// 按 provider 取值而非两个标量: 水位本身是 provider 维度的，
+// 单一标量必然让 GET /admin/keys 对所有上游报同一个上限 —— 运维会据此
+// 得出错误的余量结论（额度小的上游看起来还剩很多，实际已接近耗尽）。
+//
+// 持有 Holder 而非 *config.Config: 这是进程级长生命周期对象，直接抓一份
+// config 指针等于把启动时的水位钉死。热切后管理页面会继续按旧上限算余量，
+// 而这个接口正是运维判断「要不要加 Key」的依据。
 type quotaLimits struct {
-	TokenHard int64
-	CountHard int64
+	snaps *confsnap.Holder
+}
+
+// current 取一次快照，供一次逻辑操作全程使用。
+func (q quotaLimits) current() *confsnap.Snapshot {
+	if q.snaps == nil {
+		return nil
+	}
+	return q.snaps.Current()
+}
+
+// hardFor 返回该 provider 在该配额类型下的硬水位。
+//
+// 显式收 snap 而不在内部取: KeyStates 要为上千个 Key 报水位，逐 Key 取快照
+// 会让同一张表里前后两行按不同配置计算 —— 运维看到的是一份自相矛盾的报表，
+// 却没有任何迹象表明发生过配置切换。
+func (q quotaLimits) hardFor(snap *confsnap.Snapshot, provider string, kindCount bool) int64 {
+	if snap == nil {
+		return 0
+	}
+	hard, _ := snap.Cfg.LimitsFor(provider, kindCount)
+	return hard
 }
 
 func (a *schedulerAdapter) Select(ctx context.Context, req gateway.SelectRequest) (*gateway.Candidate, error) {
 	cand, err := a.sched.Select(ctx, scheduler.Request{
-		Model:   req.Model,
-		Kind:    req.Kind,
-		Exclude: req.Exclude,
+		Provider: req.Provider,
+		Model:    req.Model,
+		Kind:     req.Kind,
+		Exclude:  req.Exclude,
 	})
 	if err != nil {
 		// 把 scheduler.ErrNoCandidate 翻译为 gateway.ErrNoCandidate。
@@ -113,22 +143,39 @@ func mapFailureKind(k gateway.FailureKind) scheduler.FailureKind {
 func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, error) {
 	// WithSecret 明确为 false: 管理接口只展示状态，没有任何理由把 1000 个
 	// Key 的明文密钥解密进内存。
-	keys, err := a.st.ListVolcKeys(ctx, store.VolcKeyFilter{})
+	keys, err := a.st.ListUpstreamKeys(ctx, store.UpstreamKeyFilter{})
 	if err != nil {
 		return nil, fmt.Errorf("读取 Key 列表: %w", err)
 	}
 
 	health := a.sched.HealthAll()
 
-	ids := make([]string, 0, len(keys))
+	// 整张表共用一份快照，理由见 quotaLimits.hardFor。
+	snap := a.cfg.current()
+
+	// 按 provider 分组 key IDs
+	keysByProvider := make(map[string][]string)
 	for _, k := range keys {
-		ids = append(ids, k.KeyID)
+		keysByProvider[k.Provider] = append(keysByProvider[k.Provider], k.KeyID)
 	}
 
 	// 配额读取失败不阻断整个接口: 状态与健康分仍有诊断价值，
 	// 水位显示为 0 好过整个管理接口不可用。
-	tokenSnaps, terr := a.qm.GetMany(ctx, ids, quota.KindToken)
-	countSnaps, cerr := a.qm.GetMany(ctx, ids, quota.KindCount)
+	tokenSnaps := make(map[string]quota.Snapshot)
+	countSnaps := make(map[string]quota.Snapshot)
+	
+	for provider, ids := range keysByProvider {
+		if ts, err := a.qm.GetMany(ctx, provider, ids, quota.KindToken); err == nil {
+			for k, v := range ts {
+				tokenSnaps[k] = v
+			}
+		}
+		if cs, err := a.qm.GetMany(ctx, provider, ids, quota.KindCount); err == nil {
+			for k, v := range cs {
+				countSnaps[k] = v
+			}
+		}
+	}
 
 	out := make([]gateway.KeyState, 0, len(keys))
 	for _, k := range keys {
@@ -138,8 +185,8 @@ func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, e
 			Pool:       k.Pool,
 			EgressIP:   k.EgressIP,
 			PersonaID:  k.PersonaID,
-			TokenLimit: a.cfg.TokenHard,
-			CountLimit: a.cfg.CountHard,
+			TokenLimit: a.cfg.hardFor(snap, k.Provider, false),
+			CountLimit: a.cfg.hardFor(snap, k.Provider, true),
 		}
 		// 健康分优先取调度器内存值: Postgres 里的 health_score 是周期落盘的，
 		// 落后于内存状态，而排障时最需要的恰恰是「此刻」的健康分。
@@ -153,20 +200,16 @@ func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, e
 		if k.LastUsedAt != nil && st.LastUsedAt.IsZero() {
 			st.LastUsedAt = *k.LastUsedAt
 		}
-		if terr == nil {
-			if s, ok := tokenSnaps[k.KeyID]; ok {
-				st.TokenUsed = s.Used + s.Prededuct
-				if s.Hard > 0 {
-					st.TokenLimit = s.Hard
-				}
+		if s, ok := tokenSnaps[k.KeyID]; ok {
+			st.TokenUsed = s.Used + s.Prededuct
+			if s.Hard > 0 {
+				st.TokenLimit = s.Hard
 			}
 		}
-		if cerr == nil {
-			if s, ok := countSnaps[k.KeyID]; ok {
-				st.CountUsed = s.Used + s.Prededuct
-				if s.Hard > 0 {
-					st.CountLimit = s.Hard
-				}
+		if s, ok := countSnaps[k.KeyID]; ok {
+			st.CountUsed = s.Used + s.Prededuct
+			if s.Hard > 0 {
+				st.CountLimit = s.Hard
 			}
 		}
 		out = append(out, st)
@@ -207,7 +250,7 @@ func (a *storeAdapter) RecordUsage(ctx context.Context, r gateway.UsageRecord) e
 		RequestID:        r.RequestID,
 		UserID:           r.UserID,
 		UserAPIKeyID:     r.UserAPIKeyID,
-		VolcKeyID:        r.VolcKeyID,
+		UpstreamKeyID:        r.UpstreamKeyID,
 		EgressIP:         r.EgressIP,
 		Provider:         r.Provider,
 		Model:            r.Model,
@@ -215,6 +258,7 @@ func (a *storeAdapter) RecordUsage(ctx context.Context, r gateway.UsageRecord) e
 		QuotaDay:         r.QuotaDay,
 		PromptTokens:     r.PromptTokens,
 		CompletionTokens: r.CompletionTokens,
+		ReasoningTokens:  r.ReasoningTokens,
 		TotalTokens:      r.TotalTokens,
 		CountUnits:       int(r.CountUnits),
 		EstimatedTokens:  r.EstimatedTokens,
@@ -224,6 +268,14 @@ func (a *storeAdapter) RecordUsage(ctx context.Context, r gateway.UsageRecord) e
 		RetryCount:       r.RetryCount,
 		LatencyMS:        r.LatencyMS,
 	})
+}
+
+// TouchUserAPIKey 满足 gateway 的 keyToucher 可选接口。
+//
+// 网关只在鉴权缓存回源（miss）时调用，写频率被钳到每 Key 每 TTL 一次，
+// last_used_at 由此从「恒为 NULL」变成可用的活跃度信号。
+func (a *storeAdapter) TouchUserAPIKey(ctx context.Context, keyID int64) error {
+	return a.st.TouchUserAPIKey(ctx, keyID)
 }
 
 func (a *storeAdapter) Audit(ctx context.Context, actor, action, target string, detail map[string]any) error {
@@ -260,7 +312,23 @@ func (a *storeAdapter) CreateUserAPIKey(ctx context.Context, userID int64, name 
 	return plaintext, gateway.IssuedKey{ID: rec.ID, Prefix: rec.KeyPrefix}, nil
 }
 
-// UpsertVolcKey 导入或更新一个火山 Key。
+// RevokeUserAPIKey 吊销用户 API Key，store.ErrNotFound 翻译为 gateway.ErrKeyNotFound。
+func (a *storeAdapter) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error {
+	if err := a.st.RevokeUserAPIKey(ctx, userID, keyID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%w: %v", gateway.ErrKeyNotFound, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// AssignShard 批量指派 Key 的机器归属，签名一致直接透传。
+func (a *storeAdapter) AssignShard(ctx context.Context, shard string, keyIDs []string) (int64, error) {
+	return a.st.AssignShard(ctx, shard, keyIDs)
+}
+
+// UpsertUpstreamKey 导入或更新一个上游 Key。
 //
 // created 的判定用 CreatedAt.Equal(UpdatedAt): schema 里两列的 DEFAULT 都是
 // now()，而 PostgreSQL 的 now() 在同一事务内返回同一时刻，所以新插入的行
@@ -270,8 +338,9 @@ func (a *storeAdapter) CreateUserAPIKey(ctx context.Context, userID int64, name 
 // 这比「先 SELECT 再判断」可靠: 后者在并发导入下有 TOCTOU 窗口，两个请求
 // 会同时报告 created。也比让 store 层加 RETURNING xmax = 0 更克制 —— 那是
 // 依赖 PostgreSQL 内部事务 ID 的技巧，换存储引擎即失效。
-func (a *storeAdapter) UpsertVolcKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
-	k, err := a.st.UpsertVolcKey(ctx, &store.VolcKey{
+func (a *storeAdapter) UpsertUpstreamKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
+	k, err := a.st.UpsertUpstreamKey(ctx, &store.UpstreamKey{
+		Provider:  in.Provider,
 		KeyID:     in.KeyID,
 		Secret:    in.Secret,
 		Pool:      in.Pool,
@@ -285,13 +354,13 @@ func (a *storeAdapter) UpsertVolcKey(ctx context.Context, in gateway.NewVolcKey)
 	return k.CreatedAt.Equal(k.UpdatedAt), nil
 }
 
-// PatchVolcKeyState 局部更新 Key 元数据。
+// PatchUpstreamKeyState 局部更新 Key 元数据。
 //
 // 这层只做类型转换与错误哨兵翻译，条件判定全在 store 的单条 SQL 里完成 ——
 // 在适配层「先查再改」会留下 TOCTOU 窗口，让 expected_status 这类乐观并发
 // 控制在并发下失效。
-func (a *storeAdapter) PatchVolcKeyState(ctx context.Context, keyID string, p gateway.KeyPatch) (*gateway.KeyPatchResult, error) {
-	res, err := a.st.PatchVolcKeyState(ctx, keyID, store.VolcKeyPatch{
+func (a *storeAdapter) PatchUpstreamKeyState(ctx context.Context, keyID string, p gateway.KeyPatch) (*gateway.KeyPatchResult, error) {
+	res, err := a.st.PatchUpstreamKeyState(ctx, keyID, store.UpstreamKeyPatch{
 		Status:           p.Status,
 		Pool:             p.Pool,
 		PersonaID:        p.PersonaID,
@@ -322,11 +391,11 @@ func (a *storeAdapter) PatchVolcKeyState(ctx context.Context, keyID string, p ga
 
 // SetVolcKeyEgressIP 记录 Key 当前绑定的出口 IP。
 //
-// 走 UpdateVolcKeyState 的单列更新而非 PatchVolcKeyState:
+// 走 UpdateUpstreamKeyState 的单列更新而非 PatchUpstreamKeyState:
 // 后者带状态机守卫与乐观并发控制，而出口绑定的落库是对既成事实的存档
 // —— 内存里已经换过去了，此处若因状态冲突被拒，只会造成库与内存不一致。
 func (a *storeAdapter) SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP string) error {
-	return a.st.UpdateVolcKeyState(ctx, keyID, store.VolcKeyState{EgressIP: &egressIP})
+	return a.st.UpdateUpstreamKeyState(ctx, keyID, store.UpstreamKeyState{EgressIP: &egressIP})
 }
 
 // Ping 检查 Postgres 可达性。
@@ -345,25 +414,34 @@ func (a *storeAdapter) Ping(ctx context.Context) error {
 // 具体实现，只认接口。
 type quotaReader struct{ qm *quota.Manager }
 
-func (q quotaReader) GetMany(ctx context.Context, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
-	return q.qm.GetMany(ctx, keyIDs, kind)
+func (q quotaReader) GetMany(ctx context.Context, provider string, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
+	return q.qm.GetMany(ctx, provider, keyIDs, kind)
 }
 
-// ===== 刷新探测所需的 Key 列举 =====
+// ===== 调度器所需的分片作用域存储 =====
 
-// keyLister 返回参与刷新探测的 Key 列表。
-func keyLister(st *store.Store) quota.KeyLister {
-	return func(ctx context.Context) ([]string, error) {
-		keys, err := st.ListVolcKeys(ctx, store.VolcKeyFilter{Status: store.VolcStatusActive})
-		if err != nil {
-			return nil, err
-		}
-		ids := make([]string, 0, len(keys))
-		for _, k := range keys {
-			ids = append(ids, k.KeyID)
-		}
-		return ids, nil
+// shardScopedStore 把本机分片过滤注入 Key 列表查询，实现 scheduler.Store。
+//
+// 包装在装配层而非改 scheduler: 调度器不应该知道「多机分片」这个部署概念，
+// 它只管「给我一批 Key 我来调度」。分片是装配期决定的装载范围，与打分逻辑
+// 正交 —— 混进调度器意味着每个消费 Store 接口的测试都要多一个分片维度。
+//
+// 只在 filter.Shard 为空时注入: 显式指定分片的调用（如运维工具查别的分片）
+// 不被覆盖。shard 为空时本包装是恒等透传，单机部署行为不变。
+type shardScopedStore struct {
+	st    *store.Store
+	shard string
+}
+
+func (s shardScopedStore) ListUpstreamKeys(ctx context.Context, f store.UpstreamKeyFilter) ([]store.UpstreamKey, error) {
+	if f.Shard == "" {
+		f.Shard = s.shard
 	}
+	return s.st.ListUpstreamKeys(ctx, f)
+}
+
+func (s shardScopedStore) GetKeyHistory(ctx context.Context, keyIDs []string, quotaDay time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error) {
+	return s.st.GetKeyHistory(ctx, keyIDs, quotaDay)
 }
 
 // parseClock 解析 "HH:MM" 为自零点起的偏移量。
@@ -376,4 +454,12 @@ func parseClock(s string, def time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute
+}
+
+// clockStr 是 parseClock 的逆，把偏移量还原成 "HH:MM" 供日志阅读。
+//
+// 日志里打原始 Duration（如 12h0m0s）会让读日志的人自己去和配置文件里的
+// "12:00" 对应，分叉告警的价值就在于一眼看出两个窗口不一样。
+func clockStr(d time.Duration) string {
+	return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60)
 }

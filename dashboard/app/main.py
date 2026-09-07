@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .api import admin_proxy, auth, reports, static_files
+from .api import admin_proxy, auth, provider_proxy, reports, static_files
 from .cache import Cache
 from .config import _env_bool, get_settings
 from .db import Database, StoreUnavailable
@@ -135,6 +135,7 @@ app.add_middleware(SessionAuthMiddleware)
 # 因此下面新增任何 router 都自动受保护，无需在此处额外挂依赖。
 app.include_router(auth.router)
 app.include_router(admin_proxy.router)
+app.include_router(provider_proxy.router)
 app.include_router(reports.router)
 app.include_router(static_files.router)
 

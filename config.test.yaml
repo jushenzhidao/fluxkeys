@@ -1,0 +1,83 @@
+# FluxKeys 测试配置 - 包含 SenseNova 支持
+
+server:
+  addr: ":8080"
+  metrics_addr: ":9090"
+  shutdown_timeout: 30s
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+postgres:
+  dsn: "postgres://fluxkeys:fluxkeys@localhost:5432/fluxkeys?sslmode=disable"
+
+# 多上游配置
+providers:
+  volc:
+    base_url: "https://ark.cn-beijing.volces.com"
+    model_mapping:
+      deepseek-v3: "deepseek-v3-241226"
+    count_models:
+      - "seedream"
+      - "seedream-3.0"
+    reasoning_models:
+      - "deepseek"
+      - "doubao-1-5-thinking"
+      - "thinking"
+      - "-r1"
+    quota_kind: "token"
+    quota_limit: 5000000
+    quota_window: 24h
+    refresh_hour: 12
+
+  sensenova:
+    base_url: "https://api.sensenova.cn"
+    model_mapping:
+      deepseek-r1: "SenseChat-5o"
+    count_models: []
+    reasoning_models:
+      - "SenseChat-5o"
+    quota_kind: "count"
+    quota_limit: 3000
+    quota_window: 5h
+    # SenseNova 无固定刷新点，使用滑动窗口
+
+quota:
+  token_limit: 5000000
+  token_hard_ratio: 0.95
+  token_soft_ratio: 0.70
+  count_limit: 3000
+  count_hard_ratio: 0.95
+  count_soft_ratio: 0.70
+  reasoning_output_multiplier: 3.0
+  reasoning_floor_tokens: 1024
+  snapshot_interval: 3s
+
+egress:
+  mode: "direct"
+  request_timeout: 180s
+  verify_on_start: false
+
+upstream:
+  max_retries: 3
+  retry_base_delay: 200ms
+  retry_jitter: 500ms
+
+scheduler:
+  weight_quota: 35
+  weight_history: 25
+  weight_persona: 20
+  weight_health: 15
+  soft_penalty: 20
+  active_pool_size: 100
+  enable_persona: false  # 测试环境关闭画像
+  min_request_interval: 5s
+  max_qps: 0  # 0 表示不限制
+
+refresh:
+  enabled: false
+
+admin:
+  api_key: "test-admin-key"

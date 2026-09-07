@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/gateway"
@@ -15,6 +16,19 @@ import (
 	"github.com/fluxkeys/fluxkeys/internal/scheduler"
 	"github.com/fluxkeys/fluxkeys/internal/store"
 )
+
+// mustHolder 用给定配置建一个快照 Holder。
+//
+// provider 名必须是 confsnap 认识的（volc / sensenova），否则 Build 会因为
+// 没有对应 adapter 而失败 —— 这正是它该有的行为，测试里直接 Fatal。
+func mustHolder(t *testing.T, cfg *config.Config) *confsnap.Holder {
+	t.Helper()
+	h, err := confsnap.NewHolderFromConfig(cfg, 0)
+	if err != nil {
+		t.Fatalf("建配置快照: %v", err)
+	}
+	return h
+}
 
 // 装配层最容易出错的不是转换字段，而是**错误翻译**与**枚举映射**:
 // 前者错了会让容量问题上报成 500、鉴权失败上报成 500；后者错了会让
@@ -108,31 +122,55 @@ func TestParseClock(t *testing.T) {
 	}
 }
 
-func TestQuotaLimits_传递硬水位(t *testing.T) {
+func TestQuotaLimits_按_provider_取硬水位(t *testing.T) {
 	// KeyStates 在 Redis 没有该 Key 记录时用配置水位兜底，
-	// 否则管理接口会把所有未使用的 Key 显示为「限额 0」，看起来全部耗尽
-	a := &schedulerAdapter{cfg: quotaLimits{TokenHard: 4_750_000, CountHard: 95}}
-	if a.cfg.TokenHard != 4_750_000 || a.cfg.CountHard != 95 {
-		t.Errorf("水位未正确传递: %+v", a.cfg)
+	// 否则管理接口会把所有未使用的 Key 显示为「限额 0」，看起来全部耗尽。
+	//
+	// 关键是水位必须按 Key 所属 provider 取: 各家上游额度差一个数量级，
+	// 报同一个上限会让运维对额度小的上游误判余量。
+	cfg := &config.Config{
+		Quota: config.Quota{
+			TokenLimit: 5_000_000, TokenHardRatio: 0.95,
+			CountLimit: 100, CountHardRatio: 0.95,
+		},
+		Providers: map[string]config.Provider{
+			// 显式覆盖: 该上游按次计费且额度远小于全局默认
+			"sensenova": {QuotaKind: "count", QuotaLimit: 1400},
+			// 未配 quota_limit: 应回退到全局值
+			"volc": {QuotaKind: "token"},
+		},
+	}
+	a := &schedulerAdapter{cfg: quotaLimits{snaps: mustHolder(t, cfg)}}
+	snap := a.cfg.snaps.Current()
+
+	if got := a.cfg.hardFor(snap, "sensenova", true); got != 1330 {
+		t.Errorf("sensenova 次数硬水位 = %d, 期望 1330（1400*0.95，provider 覆盖生效）", got)
+	}
+	if got := a.cfg.hardFor(snap, "volc", false); got != 4_750_000 {
+		t.Errorf("volc token 硬水位 = %d, 期望 4750000（未配 quota_limit，回退全局）", got)
+	}
+	// 未知 provider 不应 panic，回退全局值
+	if got := a.cfg.hardFor(snap, "unknown", true); got != 95 {
+		t.Errorf("未知 provider 次数硬水位 = %d, 期望 95（回退全局）", got)
 	}
 }
 
 // ---------- 候选字段透传 ----------
 
 // 只实现 scheduler 需要的两个方法，避免把整个 store 拖进单元测试。
-type schedStoreStub struct{ keys []store.VolcKey }
+type schedStoreStub struct{ keys []store.UpstreamKey }
 
-func (s schedStoreStub) ListVolcKeys(ctx context.Context, f store.VolcKeyFilter) ([]store.VolcKey, error) {
+func (s schedStoreStub) ListUpstreamKeys(ctx context.Context, f store.UpstreamKeyFilter) ([]store.UpstreamKey, error) {
 	return s.keys, nil
 }
 
-func (s schedStoreStub) GetKeyHistory(ctx context.Context, ids []string, day time.Time) (map[string]store.KeyDailyHistory, error) {
-	return map[string]store.KeyDailyHistory{}, nil
+func (s schedStoreStub) GetKeyHistory(ctx context.Context, ids []string, day time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error) {
+	return map[store.HistoryKey]store.KeyDailyHistory{}, nil
 }
 
 type quotaReaderStub struct{}
 
-func (quotaReaderStub) GetMany(ctx context.Context, ids []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
+func (quotaReaderStub) GetMany(ctx context.Context, provider string, ids []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
 	out := map[string]quota.Snapshot{}
 	for _, id := range ids {
 		// 给足额度，让候选不因水位被淘汰
@@ -156,16 +194,16 @@ func TestSchedulerAdapter_Select透传Pool(t *testing.T) {
 	// 单 Key 样本会因作息不匹配而无候选，与本用例要验的透传无关。
 	cfg.Scheduler.EnablePersona = false
 
-	st := schedStoreStub{keys: []store.VolcKey{{
+	st := schedStoreStub{keys: []store.UpstreamKey{{
 		KeyID:     "volc_hot_001",
-		Status:    store.VolcStatusActive,
+		Status:    store.KeyStatusActive,
 		Pool:      "hot",
 		EgressIP:  "172.16.0.11",
 		SecretEnc: "sk-plain-001",
 		PersonaID: "p_01",
 	}}}
 
-	sched := scheduler.New(cfg.Scheduler, cfg.Quota, st, quotaReaderStub{})
+	sched := scheduler.New(scheduler.StaticConfig{Cfg: cfg}, st, quotaReaderStub{})
 	if err := sched.Reload(context.Background()); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
@@ -217,13 +255,14 @@ func newBannedPool(t *testing.T) (*egress.Pool, *egress.IP) {
 	return pool, ip
 }
 
-// bgFor 构造只依赖 cfg / pool / log 的后台任务实例。
+// bgFor 构造只依赖配置 / pool / log 的后台任务实例。
 // checkEgress 不触碰 store 与 quota，故其余依赖留零值。
-func bgFor(cfg *config.Config, pool *egress.Pool) *background {
+func bgFor(t *testing.T, cfg *config.Config, pool *egress.Pool) *background {
+	t.Helper()
 	return newBackground(bgDeps{
-		cfg:  cfg,
-		pool: pool,
-		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		snaps: mustHolder(t, cfg),
+		pool:  pool,
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 }
 
@@ -254,7 +293,7 @@ func egressCfg(cooldown time.Duration) *config.Config {
 // 加测试后门。
 func TestCheckEgress_先解封再探测(t *testing.T) {
 	pool, ip := newBannedPool(t)
-	if err := bgFor(egressCfg(time.Nanosecond), pool).
+	if err := bgFor(t, egressCfg(time.Nanosecond), pool).
 		checkEgress(context.Background()); err != nil {
 		t.Fatalf("checkEgress: %v", err)
 	}
@@ -267,7 +306,7 @@ func TestCheckEgress_先解封再探测(t *testing.T) {
 // 冷却期未届满时不得解封。
 func TestCheckEgress_冷却期内保持banned(t *testing.T) {
 	pool, ip := newBannedPool(t)
-	if err := bgFor(egressCfg(2*time.Hour), pool).
+	if err := bgFor(t, egressCfg(2*time.Hour), pool).
 		checkEgress(context.Background()); err != nil {
 		t.Fatalf("checkEgress: %v", err)
 	}
@@ -279,7 +318,7 @@ func TestCheckEgress_冷却期内保持banned(t *testing.T) {
 // BanCooldown=0 表示未启用自动恢复，保持原有的永久 banned 行为。
 func TestCheckEgress_未启用恢复时保持banned(t *testing.T) {
 	pool, ip := newBannedPool(t)
-	if err := bgFor(egressCfg(0), pool).
+	if err := bgFor(t, egressCfg(0), pool).
 		checkEgress(context.Background()); err != nil {
 		t.Fatalf("checkEgress: %v", err)
 	}

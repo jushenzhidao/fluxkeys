@@ -80,7 +80,9 @@
 .icon-btn:focus-visible,
 .imp-box textarea:focus-visible,
 .modal input:focus-visible,
-.modal select:focus-visible {
+.modal select:focus-visible,
+.prov-form input:focus-visible,
+.prov-form select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -294,5 +296,120 @@ td.ops { white-space: nowrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .btn, .icon-btn { transition: none; }
+  .btn, .icon-btn, .prov-form input, .prov-form select { transition: none; }
+}
+
+/* ---------------------------------------------------------- provider 配置 */
+
+/* provider 名用等宽栈：它是 Redis key 前缀，视觉上就该像标识符而非散文。 */
+.prov-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.prov-name code {
+  font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+/* 停用行整体降级，但不低到读不清 —— 停用的配置仍然要能被核对。 */
+tr.prov-off { opacity: 0.62; }
+
+.ellip {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 参考信息与告警文案，比正文低一级。 */
+.limit-ref { color: var(--text-faint); font-size: 12px; }
+
+.prov-form { margin-bottom: 10px; }
+
+.prov-form .modal-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px 16px;
+}
+
+.prov-form input[type="text"],
+.prov-form input[type="number"],
+.prov-form select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  transition: border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* readonly 而非 disabled：禁改字段最需要被读屏读到并解释清楚，
+   disabled 元素不进 tab 序也读不到，等于把最重要的说明藏起来。 */
+.prov-form input[readonly],
+.prov-form select[readonly] {
+  color: var(--text-dim);
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.prov-form .fld-label .icon {
+  width: 12px;
+  height: 12px;
+  margin-right: 4px;
+  vertical-align: -1px;
+  color: var(--text-faint);
+}
+
+.prov-form input[aria-invalid="true"],
+.prov-form select[aria-invalid="true"] { border-color: var(--up); }
+
+.map-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+
+.map-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.map-row input { flex: 1; min-width: 0; }
+.map-row .icon { width: 14px; height: 14px; color: var(--text-faint); flex: none; }
+
+.modal-wide { max-width: 760px; }
+
+/* 快照标题不用 .modal-title 的 --up：只读查看不是危险操作。 */
+.modal-title-plain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.modal-title-plain .icon { color: var(--text-dim); }
+
+.snap-body {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  max-height: 52vh;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+@media (max-width: 640px) {
+  .prov-form .modal-fields { grid-template-columns: 1fr; }
+  .map-row { flex-wrap: wrap; }
+  .ellip { max-width: 140px; }
 }

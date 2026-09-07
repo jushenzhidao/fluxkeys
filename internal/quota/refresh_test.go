@@ -31,7 +31,7 @@ func at(h, m int) time.Time {
 }
 
 func TestInWindow(t *testing.T) {
-	r := NewRefresher(testRefresherConfig(), nil, nil, nil, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), nil, nil, nil, quietLogger())
 
 	cases := []struct {
 		at   time.Time
@@ -66,11 +66,11 @@ func TestTick_DoesNotResumeBeforeProbeConfirms(t *testing.T) {
 	}
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_1"}, nil }
 
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	// 先制造已消耗的配额
 	lim := Limits{Hard: 10_000, Soft: 8_000}
-	_, lease, _ := m.Acquire(ctx, "key_1", KindToken, 5_000, lim, time.Minute)
+	_, lease, _ := m.Acquire(ctx, "volc", "key_1", KindToken, 5_000, lim, time.Minute)
 	_ = m.Commit(ctx, lease, 5_000)
 
 	// 推进到窗口末尾附近，确保已越过错峰偏移
@@ -94,7 +94,7 @@ func TestTick_DoesNotResumeBeforeProbeConfirms(t *testing.T) {
 	}
 
 	// 关键断言: 配额不得被清零
-	snap, _ := m.Get(ctx, "key_1", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_1", KindToken)
 	if snap.Used != 5_000 {
 		t.Errorf("未确认刷新前不得清零配额, used = %d, 期望 5000", snap.Used)
 	}
@@ -107,10 +107,10 @@ func TestTick_ConfirmsAndResetsAfterSuccessfulProbe(t *testing.T) {
 	probe := func(ctx context.Context, keyID string) (bool, error) { return true, nil }
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_1"}, nil }
 
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	lim := Limits{Hard: 10_000, Soft: 8_000}
-	_, lease, _ := m.Acquire(ctx, "key_1", KindToken, 5_000, lim, time.Minute)
+	_, lease, _ := m.Acquire(ctx, "volc", "key_1", KindToken, 5_000, lim, time.Minute)
 	_ = m.Commit(ctx, lease, 5_000)
 
 	r.SetClock(func() time.Time { return at(13, 30) })
@@ -127,7 +127,7 @@ func TestTick_ConfirmsAndResetsAfterSuccessfulProbe(t *testing.T) {
 		t.Error("确认刷新后应可调度")
 	}
 
-	snap, _ := m.Get(ctx, "key_1", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_1", KindToken)
 	if snap.Used != 0 || snap.Prededuct != 0 {
 		t.Errorf("确认后应清零, got used=%d prededuct=%d", snap.Used, snap.Prededuct)
 	}
@@ -142,7 +142,7 @@ func TestRateLimitFactor_RampsAfterRefresh(t *testing.T) {
 
 	probe := func(ctx context.Context, keyID string) (bool, error) { return true, nil }
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_1"}, nil }
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	now := at(13, 0)
 	r.SetClock(func() time.Time { return now })
@@ -168,7 +168,7 @@ func TestTick_MarksFailedWhenWindowEnds(t *testing.T) {
 
 	probe := func(ctx context.Context, keyID string) (bool, error) { return false, nil }
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_stuck"}, nil }
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	r.SetClock(func() time.Time { return at(13, 59) })
 	if err := r.Tick(ctx); err != nil {
@@ -191,10 +191,10 @@ func TestTick_ProbeErrorDoesNotConfirm(t *testing.T) {
 		return false, errors.New("connection reset")
 	}
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_1"}, nil }
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	lim := Limits{Hard: 10_000, Soft: 8_000}
-	_, lease, _ := m.Acquire(ctx, "key_1", KindToken, 3_000, lim, time.Minute)
+	_, lease, _ := m.Acquire(ctx, "volc", "key_1", KindToken, 3_000, lim, time.Minute)
 	_ = m.Commit(ctx, lease, 3_000)
 
 	r.SetClock(func() time.Time { return at(13, 0) })
@@ -205,7 +205,7 @@ func TestTick_ProbeErrorDoesNotConfirm(t *testing.T) {
 	if r.State("key_1") == RefreshConfirmed {
 		t.Error("探测报错不应确认刷新")
 	}
-	snap, _ := m.Get(ctx, "key_1", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_1", KindToken)
 	if snap.Used != 3_000 {
 		t.Errorf("探测失败不应改动配额, used = %d", snap.Used)
 	}
@@ -221,7 +221,7 @@ func TestTick_NoOpOutsideWindow(t *testing.T) {
 		return true, nil
 	}
 	list := func(ctx context.Context) ([]string, error) { return []string{"key_1"}, nil }
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	r.SetClock(func() time.Time { return at(20, 0) })
 	if err := r.Tick(ctx); err != nil {
@@ -264,7 +264,7 @@ func TestStaggerOffset_DeterministicAndSpread(t *testing.T) {
 }
 
 func TestPreRefreshActive(t *testing.T) {
-	r := NewRefresher(testRefresherConfig(), nil, nil, nil, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), nil, nil, nil, quietLogger())
 	lead := 30 * time.Minute
 
 	if !r.PreRefreshActive(at(11, 40), lead) {
@@ -288,7 +288,7 @@ func TestStats(t *testing.T) {
 	list := func(ctx context.Context) ([]string, error) {
 		return []string{"key_ok", "key_slow"}, nil
 	}
-	r := NewRefresher(testRefresherConfig(), m, probe, list, quietLogger())
+	r := NewRefresher("volc", testRefresherConfig(), m, probe, list, quietLogger())
 
 	now := at(13, 30)
 	r.SetClock(func() time.Time { return now })

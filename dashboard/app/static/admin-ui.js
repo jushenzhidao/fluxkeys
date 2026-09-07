@@ -214,10 +214,20 @@ window.FKAdmin = window.FKAdmin || {};
       try { payload = await resp.json(); } catch (e) { payload = null; }
     }
     if (!resp.ok) {
-      const err = new Error((payload && payload.detail) || resp.statusText || ('HTTP ' + resp.status));
+      const env = payload && payload.error;
+      const err = new Error(
+        (payload && payload.detail) ||
+        (env && env.message) ||
+        resp.statusText || ('HTTP ' + resp.status)
+      );
       err.status = resp.status;
       err.gatewayCode = payload && payload.gateway_code;
       err.payload = payload;
+      // provider 端点的四种 409 靠错误码分派文案，靠状态码分不出来。
+      // 两种来源都要读：看板转发层（gateway/client.py）把网关的
+      // {error:{code}} 信封压平成 {detail, gateway_code}，而网关被直连
+      // 或将来若有端点原样透传信封时，code 仍在 error.code 里。
+      err.code = err.gatewayCode || (env && env.code) || '';
       throw err;
     }
     return payload;

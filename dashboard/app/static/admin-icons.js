@@ -1,6 +1,6 @@
 /* FluxKeys 图标 sprite：来自 Lucide（ISC 许可，24×24 网格，stroke 风格）。
  *
- * 手工摘取所需的 10 个图标 path，不引 npm、不引 CDN、无构建步骤。
+ * 手工摘取所需的 16 个图标 path，不引 npm、不引 CDN、无构建步骤。
  * 独立成文件而非内联进 index.html，是为了让 index.html 保持在 300 行以内。
  *
  * 三条约定：
@@ -48,6 +48,24 @@
     '<path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>' +
     '<symbol id="icon-arrow" viewBox="0 0 24 24">' +
     '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>' +
+    '<symbol id="icon-provider" viewBox="0 0 24 24">' +
+    '<rect x="2" y="2" width="20" height="8" rx="2"/>' +
+    '<rect x="2" y="14" width="20" height="8" rx="2"/>' +
+    '<path d="M6 6h.01"/><path d="M6 18h.01"/></symbol>' +
+    '<symbol id="icon-add" viewBox="0 0 24 24">' +
+    '<path d="M5 12h14"/><path d="M12 5v14"/></symbol>' +
+    '<symbol id="icon-edit" viewBox="0 0 24 24">' +
+    '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/>' +
+    '<path d="m15 5 4 4"/></symbol>' +
+    '<symbol id="icon-history" viewBox="0 0 24 24">' +
+    '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>' +
+    '<path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>' +
+    '<symbol id="icon-rollback" viewBox="0 0 24 24">' +
+    '<path d="M9 14 4 9l5-5"/>' +
+    '<path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5 5.5 5.5 0 0 1-5.5 5.5H11"/></symbol>' +
+    '<symbol id="icon-lock" viewBox="0 0 24 24">' +
+    '<rect x="3" y="11" width="18" height="11" rx="2"/>' +
+    '<path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>' +
     '</svg>';
 
   // 按 HTML 规范，解析器一遇到 <body> 开标签就把 body 元素插入 DOM，之后才解析其

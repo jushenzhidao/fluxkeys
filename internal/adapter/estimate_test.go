@@ -129,6 +129,62 @@ func TestEstimateTokens_结果恒为正(t *testing.T) {
 	}
 }
 
+// 以下用例的基准数据来自真实上游实测（deepseek-v4-flash）:
+// max_tokens=16 → completion 141；max_tokens=64 → completion 121。
+// 思维链不受 max_tokens 约束，故小上限场景必须靠下限托底。
+var reasoningOn = ReasoningEstimate{Enabled: true, OutputMultiplier: 3.0, FloorTokens: 1024}
+
+func TestEstimateTokensFor_小max_tokens的推理模型由下限托底(t *testing.T) {
+	m := ChatRequestMeta{PromptChars: 20, MaxTokens: 16}
+
+	plain := EstimateTokens(m, 4096, 1.2)
+	reason := EstimateTokensFor(m, 4096, 1.2, reasoningOn)
+
+	// 实测 completion 达 141，仅按 16×3=48 预扣仍会击穿硬水位
+	if reason < 141 {
+		t.Errorf("推理模型预扣 %d 低于实测用量 141，会导致超刷", reason)
+	}
+	if reason <= plain {
+		t.Errorf("推理模型预扣 %d 应高于普通模型 %d", reason, plain)
+	}
+}
+
+func TestEstimateTokensFor_中等max_tokens按比例放大(t *testing.T) {
+	m := ChatRequestMeta{MaxTokens: 2048}
+	got := EstimateTokensFor(m, 4096, 1.0, reasoningOn)
+
+	// 2048×3 = 6144 已高于下限 1024，应走比例放大而非托底
+	if got < 6144 {
+		t.Errorf("EstimateTokensFor = %d, 期望至少 6144（2048×3）", got)
+	}
+}
+
+func TestEstimateTokensFor_未指定max_tokens时不套用下限(t *testing.T) {
+	// out 已是配置基准 4096，本身高于任何观测到的思维链长度，
+	// 再托底只会白占额度、压低单 Key 并发。
+	noMax := EstimateTokensFor(ChatRequestMeta{}, 4096, 1.0, reasoningOn)
+	withMax := EstimateTokensFor(ChatRequestMeta{MaxTokens: 4096}, 4096, 1.0, reasoningOn)
+	if noMax != withMax {
+		t.Errorf("未指定 max_tokens 的预扣 %d 应与显式 4096 的 %d 一致", noMax, withMax)
+	}
+}
+
+func TestEstimateTokensFor_非推理模型退化为原公式(t *testing.T) {
+	m := ChatRequestMeta{PromptChars: 500, MaxTokens: 256}
+	if got, want := EstimateTokensFor(m, 4096, 1.2, ReasoningEstimate{}), EstimateTokens(m, 4096, 1.2); got != want {
+		t.Errorf("零值 ReasoningEstimate 应等价于原公式: %d != %d", got, want)
+	}
+}
+
+func TestEstimateTokensFor_推理放大先于n倍展开(t *testing.T) {
+	// 每份候选各自产生一条独立思维链，放大属于单份输出成本
+	one := EstimateTokensFor(ChatRequestMeta{MaxTokens: 16, N: 1}, 4096, 1.0, reasoningOn)
+	two := EstimateTokensFor(ChatRequestMeta{MaxTokens: 16, N: 2}, 4096, 1.0, reasoningOn)
+	if two < one*2 {
+		t.Errorf("n=2 的预扣 %d 应约为 n=1 的 %d 的两倍", two, one)
+	}
+}
+
 func TestEstimateCountUnits(t *testing.T) {
 	if got := EstimateCountUnits(ChatRequestMeta{}); got != 1 {
 		t.Errorf("默认应为 1, got %d", got)

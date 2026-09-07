@@ -37,7 +37,7 @@ const maxSSELineBytes = 1 << 20
 // 返回非 nil 错误表示流未正常结束（客户端断开或上游中断）。此时 usage
 // 可能为空，调用方须按预扣量保守 Commit。
 func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request,
-	upResp *http.Response, plan *requestPlan, start time.Time) (adapter.Usage, *adapter.UpstreamError) {
+	upResp *http.Response, plan *requestPlan, ad adapter.Adapter, start time.Time) (adapter.Usage, *adapter.UpstreamError) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -140,12 +140,12 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request,
 		// 解析用量。usage 只出现在末尾 chunk，但不能假设它一定是最后一条 ——
 		// 部分实现会在 usage chunk 之后再发 [DONE]，也有实现把 usage 附在
 		// finish_reason chunk 上。故每个 chunk 都尝试解析，取到即记录。
-		if u, ok := s.adapter.ParseUsage(plan.Endpoint, data); ok && !u.Empty() {
+		if u, ok := ad.ParseUsage(plan.Endpoint, data); ok && !u.Empty() {
 			usage = u
 			gotUsage = true
 		}
 
-		out, terr := s.adapter.TransformStreamChunk(data)
+		out, terr := ad.TransformStreamChunk(data)
 		if terr != nil {
 			// 转换失败时透传原始内容: 丢一个 chunk 会让客户端收到不完整的
 			// 回答，比透传一个格式略有偏差的 chunk 严重得多。

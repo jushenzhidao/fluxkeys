@@ -89,6 +89,8 @@ func (s KeyState) TokenRatio() float64 {
 
 // SelectRequest 是一次调度请求的输入。
 type SelectRequest struct {
+	// Provider 是上游服务商，调度器按此过滤 Key 池。
+	Provider string
 	// Model 是对外模型名。
 	Model string
 	// Kind 决定读取哪一套配额快照 —— Token 型与次数型的水位完全独立，
@@ -153,7 +155,7 @@ type UsageRecord struct {
 	RequestID    string
 	UserID       int64
 	UserAPIKeyID int64
-	VolcKeyID    string
+	UpstreamKeyID    string
 	EgressIP     string
 	Provider     string
 	Model        string
@@ -162,14 +164,16 @@ type UsageRecord struct {
 	QuotaDay         time.Time
 	PromptTokens     int64
 	CompletionTokens int64
-	TotalTokens      int64
-	CountUnits       int64
-	EstimatedTokens  int64
-	StatusCode       int
-	IsStream         bool
-	ErrorCode        string
-	RetryCount       int
-	LatencyMS        int
+	// ReasoningTokens 已含在 CompletionTokens 内，不参与计费。
+	ReasoningTokens int64
+	TotalTokens     int64
+	CountUnits      int64
+	EstimatedTokens int64
+	StatusCode      int
+	IsStream        bool
+	ErrorCode       string
+	RetryCount      int
+	LatencyMS       int
 }
 
 // Store 是 gateway 对持久化层的依赖。
@@ -191,7 +195,13 @@ type Store interface {
 	// plaintext 仅此一次可见，服务端只存哈希。
 	CreateUserAPIKey(ctx context.Context, userID int64, name string) (plaintext string, key IssuedKey, err error)
 
-	// UpsertVolcKey 导入或更新一个火山 Key。
+	// RevokeUserAPIKey 吊销一条 API Key。
+	//
+	// userID 用于归属校验，防止拼错路径吊掉别人的 Key。目标不存在、
+	// 不属于该用户、或已非 active 时返回包装了 ErrKeyNotFound 的错误。
+	RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error
+
+	// UpsertUpstreamKey 导入或更新一个火山 Key。
 	//
 	// 没有这个入口，全新部署的 Key 池永远为空，网关只能对所有业务请求返回
 	// 503 —— 一套装配完好但无法承接任何流量的系统。
@@ -201,9 +211,9 @@ type Store interface {
 	//
 	// 返回 created 表示本次是新建而非更新，供导入接口区分「新增了几个」
 	// 与「更新了几个」——运维执行同一份清单两次时这个区分是唯一的反馈。
-	UpsertVolcKey(ctx context.Context, in NewVolcKey) (created bool, err error)
+	UpsertUpstreamKey(ctx context.Context, in NewVolcKey) (created bool, err error)
 
-	// PatchVolcKeyState 原子地局部更新 Key 的 status / pool / persona_id。
+	// PatchUpstreamKeyState 原子地局部更新 Key 的 status / pool / persona_id。
 	//
 	// 语义见 KeyPatch。三种返回:
 	//   - 成功: (结果, nil)
@@ -213,11 +223,18 @@ type Store interface {
 	// 第三种同时返回结果与错误，让 409 的文案能写出冲突的实际内容 ——
 	// 「当前状态为 banned，与 expected_status=active 不符」远比一句
 	// 「状态冲突」有用。
-	PatchVolcKeyState(ctx context.Context, keyID string, p KeyPatch) (*KeyPatchResult, error)
+	PatchUpstreamKeyState(ctx context.Context, keyID string, p KeyPatch) (*KeyPatchResult, error)
+
+	// AssignShard 批量指派 Key 的机器归属（多机部署分片），返回改动行数。
+	//
+	// 分片过滤是严格相等: 未指派的 Key 不被任何实例装载。这个方法是把
+	// Key 划入某台机器的唯一写入口 —— 归属决定该 Key 用哪台机器的出口
+	// IP 发请求，一经指派不应再漂移（跨机 = 换出口 = 风控信号）。
+	AssignShard(ctx context.Context, shard string, keyIDs []string) (int64, error)
 
 	// SetVolcKeyEgressIP 记录 Key 当前绑定的出口 IP。
 	//
-	// 与 PatchVolcKeyState 分开是刻意的: 出口绑定不是运维随手可改的元数据，
+	// 与 PatchUpstreamKeyState 分开是刻意的: 出口绑定不是运维随手可改的元数据，
 	// 而是「这个账号从哪个 IP 出去」这一既成事实的存档。写入方只应是那些
 	// 真正改变了内存中绑定关系的代码路径（Rebind / Migrate / 首次分配），
 	// 它们必须在改完内存后立刻落库 —— 否则重启后 restoreBindings 读到旧值，
@@ -232,7 +249,7 @@ type Store interface {
 //
 // 用指针而非零值判空是硬要求: status 的空串与「字段缺席」在 encoding/json
 // 解成 string 后不可区分，据零值判断会把「请求里没提 status」当成「要把
-// status 清空」。这与 UpsertVolcKey 踩过的 EXCLUDED 被 VALUES 兜底污染是
+// status 清空」。这与 UpsertUpstreamKey 踩过的 EXCLUDED 被 VALUES 兜底污染是
 // 同一类缺陷 —— 都是无法区分未提供与空值，后果都是静默改写不该改的列。
 type KeyPatch struct {
 	Status    *string
@@ -286,8 +303,11 @@ type NewUser struct {
 	DailyTokenLimit int64
 }
 
-// NewVolcKey 是导入一个火山 Key 的入参。
+// NewVolcKey 是导入一个上游 Key 的入参（名称保留 NewVolcKey 以兼容现有代码）。
 type NewVolcKey struct {
+	// Provider 是上游服务商标识（volc/sensenova/qwen 等），必填。
+	Provider string `json:"provider"`
+	
 	KeyID string `json:"key_id"`
 	// Secret 是明文密钥，由存储层加密后落库。
 	//
@@ -346,8 +366,8 @@ var ErrUnauthorized = errors.New("gateway: 用户鉴权失败")
 // internal/quota.Manager 已实现该接口。用接口而非具体类型是为了让测试
 // 能注入可控的配额行为（如强制返回 ErrInsufficient）。
 type QuotaManager interface {
-	Acquire(ctx context.Context, keyID string, kind quota.Kind, amount int64, lim quota.Limits, ttl time.Duration) (quota.Decision, *quota.Lease, error)
+	Acquire(ctx context.Context, provider, keyID string, kind quota.Kind, amount int64, lim quota.Limits, ttl time.Duration) (quota.Decision, *quota.Lease, error)
 	Commit(ctx context.Context, lease *quota.Lease, actual int64) error
 	Release(ctx context.Context, lease *quota.Lease) error
-	Get(ctx context.Context, keyID string, kind quota.Kind) (quota.Snapshot, error)
+	Get(ctx context.Context, provider, keyID string, kind quota.Kind) (quota.Snapshot, error)
 }

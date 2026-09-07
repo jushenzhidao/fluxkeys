@@ -70,7 +70,9 @@ func TestAdminPatch_路由注册不与既有子树冲突(t *testing.T) {
 	// 架构师用移植的冲突判定算法验证过不冲突，但那是推理；这条测试是断言。
 	cfg := config.Default()
 	cfg.Admin.APIKey = "admin-secret"
-	cfg.Upstream.ModelMapping = map[string]string{"gpt-4o": "ep-test"}
+	volc := cfg.Providers["volc"]
+	volc.ModelMapping = map[string]string{"gpt-4o": "ep-test"}
+	cfg.Providers["volc"] = volc
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("测试配置非法: %v", err)
 	}

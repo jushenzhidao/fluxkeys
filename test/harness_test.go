@@ -218,7 +218,17 @@ func (s *memStore) CreateUserAPIKey(ctx context.Context, userID int64, name stri
 	return "fk-itest-plain", gateway.IssuedKey{ID: 9, Prefix: "fk-itest"}, nil
 }
 
-func (s *memStore) UpsertVolcKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
+func (s *memStore) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error {
+	// 集成测试不覆盖吊销路径，返回未命中即可。
+	return fmt.Errorf("%w: key %d", gateway.ErrKeyNotFound, keyID)
+}
+
+func (s *memStore) AssignShard(ctx context.Context, shard string, keyIDs []string) (int64, error) {
+	// 集成测试不覆盖分片指派路径。
+	return 0, nil
+}
+
+func (s *memStore) UpsertUpstreamKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, existed := s.keys[in.KeyID]
@@ -226,11 +236,11 @@ func (s *memStore) UpsertVolcKey(ctx context.Context, in gateway.NewVolcKey) (bo
 	return !existed, nil
 }
 
-// PatchVolcKeyState 在内存中复刻局部更新语义。
+// PatchUpstreamKeyState 在内存中复刻局部更新语义。
 //
 // 复用 keys 这张表而非另开一张: 集成测试里 PATCH 的对象就是刚导入的 Key，
 // 分成两张表会让「导入后立刻 PATCH」这条最真实的路径反而测不到。
-func (s *memStore) PatchVolcKeyState(ctx context.Context, keyID string, p gateway.KeyPatch) (*gateway.KeyPatchResult, error) {
+func (s *memStore) PatchUpstreamKeyState(ctx context.Context, keyID string, p gateway.KeyPatch) (*gateway.KeyPatchResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -328,7 +338,7 @@ func newMemQuota() *memQuota {
 
 func mqKey(keyID string, kind quota.Kind) string { return keyID + "|" + string(kind) }
 
-func (q *memQuota) Acquire(ctx context.Context, keyID string, kind quota.Kind, amount int64,
+func (q *memQuota) Acquire(ctx context.Context, provider, keyID string, kind quota.Kind, amount int64,
 	lim quota.Limits, ttl time.Duration) (quota.Decision, *quota.Lease, error) {
 
 	q.mu.Lock()
@@ -400,7 +410,7 @@ func (q *memQuota) endLease(l *quota.Lease, how string) error {
 	return nil
 }
 
-func (q *memQuota) Get(ctx context.Context, keyID string, kind quota.Kind) (quota.Snapshot, error) {
+func (q *memQuota) Get(ctx context.Context, provider, keyID string, kind quota.Kind) (quota.Snapshot, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	k := mqKey(keyID, kind)
@@ -484,11 +494,13 @@ func newItEnvOpts(t *testing.T, keys []string, ips []*egress.IP,
 	cfg.Upstream.MaxRetries = 3
 	cfg.Upstream.RetryBaseDelay = 2 * time.Millisecond
 	cfg.Upstream.RetryJitter = 2 * time.Millisecond
-	cfg.Upstream.ModelMapping = map[string]string{
+	volcCfg := cfg.Providers["volc"]
+	volcCfg.ModelMapping = map[string]string{
 		"gpt-4o":       "ep-itest-chat",
 		"seedream-3.0": "ep-itest-image",
 	}
-	cfg.Upstream.CountModels = []string{"seedream-3.0"}
+	volcCfg.CountModels = []string{"seedream-3.0"}
+	cfg.Providers["volc"] = volcCfg
 	cfg.Quota.DefaultMaxTokens = 200
 	cfg.Quota.EstimateMultiplier = 1.2
 	cfg.Admin.APIKey = "itest-admin"
@@ -502,7 +514,9 @@ func newItEnvOpts(t *testing.T, keys []string, ips []*egress.IP,
 
 	ark := mockark.NewServer(arkOpt)
 	arkTS := httptest.NewServer(ark)
-	cfg.Upstream.VolcBaseURL = arkTS.URL
+	volcCfg = cfg.Providers["volc"]
+	volcCfg.BaseURL = arkTS.URL
+	cfg.Providers["volc"] = volcCfg
 
 	for _, id := range keys {
 		ark.RegisterKey(id, arkOpt.DefaultTokenLimit, arkOpt.DefaultCountLimit)

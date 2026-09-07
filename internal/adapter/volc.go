@@ -186,6 +186,12 @@ type usageEnvelope struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
 		TotalTokens      int64 `json:"total_tokens"`
+		// 推理模型的思维链用量。已实测确认它被计入 completion_tokens
+		// （prompt 88 + completion 141 = total 229），故仅用于可观测性，
+		// 不参与配额扣减，否则会重复计费。
+		CompletionDetails *struct {
+			ReasoningTokens int64 `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 	// 图片生成按次计费，用 data 数组长度计量
 	Data []json.RawMessage `json:"data"`
@@ -208,6 +214,9 @@ func (v *Volc) ParseUsage(ep Endpoint, payload []byte) (Usage, bool) {
 		u.PromptTokens = env.Usage.PromptTokens
 		u.CompletionTokens = env.Usage.CompletionTokens
 		u.TotalTokens = env.Usage.TotalTokens
+		if d := env.Usage.CompletionDetails; d != nil {
+			u.ReasoningTokens = d.ReasoningTokens
+		}
 	}
 
 	// 图片生成按生成张数计费，与 token 用量互不相干。

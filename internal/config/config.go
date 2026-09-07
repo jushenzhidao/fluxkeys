@@ -4,8 +4,13 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,16 +20,86 @@ import (
 
 // Config 是网关的根配置。
 type Config struct {
-	Server    Server    `yaml:"server"`
-	Redis     Redis     `yaml:"redis"`
-	Postgres  Postgres  `yaml:"postgres"`
-	Quota     Quota     `yaml:"quota"`
-	Egress    Egress    `yaml:"egress"`
-	Upstream  Upstream  `yaml:"upstream"`
-	Scheduler Scheduler `yaml:"scheduler"`
-	Refresh   Refresh   `yaml:"refresh"`
-	Fallback  Fallback  `yaml:"fallback"`
-	Admin     Admin     `yaml:"admin"`
+	Server    Server               `yaml:"server"`
+	Redis     Redis                `yaml:"redis"`
+	Postgres  Postgres             `yaml:"postgres"`
+	Quota     Quota                `yaml:"quota"`
+	Egress    Egress               `yaml:"egress"`
+	Providers map[string]Provider  `yaml:"providers"` // 多上游配置（替代 Upstream）
+	Upstream  UpstreamCommon       `yaml:"upstream"`  // 通用重试配置
+	Scheduler Scheduler            `yaml:"scheduler"`
+	Refresh   Refresh              `yaml:"refresh"`
+	Fallback  Fallback             `yaml:"fallback"`
+	Admin     Admin                `yaml:"admin"`
+
+	// DefaultProvider 是省略 provider 时的兜底上游。
+	//
+	// 存在的理由: 导入 Key 与模型路由都需要一个 provider，但单上游部署下
+	// 强制每次显式指定纯属噪音。留空时若只配了一个 provider 则自动采用它，
+	// 多 provider 场景则必须显式指定，避免静默路由到错误上游。
+	DefaultProvider string `yaml:"default_provider"`
+}
+
+// ResolveProvider 补全省略的 provider。
+//
+// 规则: 显式值原样返回；留空时仅在 DefaultProvider 已配置、或全局只有一个
+// provider 时才推断，多 provider 且未配默认值时返回空串由调用方报错。
+func (c *Config) ResolveProvider(provider string) string {
+	if provider != "" {
+		return provider
+	}
+	if c.DefaultProvider != "" {
+		return c.DefaultProvider
+	}
+	if len(c.Providers) == 1 {
+		for name := range c.Providers {
+			return name
+		}
+	}
+	return ""
+}
+
+// EgressVerifyTarget 返回出口自检应当拨测的 host:port。
+//
+// 优先取显式配置的 verify_target；未配置时从实际启用的 provider base_url
+// 推导，而**不是**退回某个写死的厂商域名。
+//
+// 为什么不能写死: 自检的意义是「从这个出口能否连到我们真正要发请求的地方」。
+// 目标一旦与真实上游不同，自检就变成了对无关域名的连通性测试 —— 它会在
+// 真实上游被出口 IP 拉黑时依旧全绿，恰好在最需要它报警时失效。这个偏差
+// 在多 provider 化后必然出现: 配置里是商汤，自检却在拨火山。
+//
+// 多 provider 时取 default_provider，无默认值则按名称排序取第一个，
+// 保证同一份配置每次得到相同目标（便于运维对照日志）。
+func (c *Config) EgressVerifyTarget() string {
+	if c.Egress.VerifyTarget != "" {
+		return c.Egress.VerifyTarget
+	}
+	if len(c.Providers) == 0 {
+		return ""
+	}
+
+	name := c.ResolveProvider("")
+	if _, ok := c.Providers[name]; !ok {
+		names := make([]string, 0, len(c.Providers))
+		for n := range c.Providers {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		name = names[0]
+	}
+
+	u, err := url.Parse(c.Providers[name].BaseURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "http" {
+		return u.Hostname() + ":80"
+	}
+	return u.Hostname() + ":443"
 }
 
 // Server 是 HTTP 服务配置。
@@ -36,6 +111,15 @@ type Server struct {
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int64         `yaml:"max_body_bytes"`
 	MetricsAddr     string        `yaml:"metrics_addr"`
+
+	// ShardID 是本实例的机器分片标识（多机部署）。
+	//
+	// 非空时调度器只装载 shard 等于该值的 Key（迁移期兼容: 首次启动还会
+	// 带上 shard 为空的存量 Key，见 store.UpstreamKeyFilter.IncludeUnsharded）。
+	// 空值 = 单机模式，全量装载，与既有行为完全一致。
+	//
+	// 属冷配置: 改机器归属涉及出口 IP 在云厂商侧的重绑定，本就要重启进程。
+	ShardID string `yaml:"shard_id"`
 }
 
 // Redis 是热状态存储配置。
@@ -82,6 +166,24 @@ type Quota struct {
 	DefaultMaxTokens int64 `yaml:"default_max_tokens"`
 	// EstimateMultiplier 是预扣估算的放大系数。
 	EstimateMultiplier float64 `yaml:"estimate_multiplier"`
+	// ReasoningOutputMultiplier 是推理模型输出部分的额外放大系数。
+	//
+	// 为什么必须单列: 推理模型的 reasoning_content 不受 max_tokens 约束。
+	// 实测 deepseek-v4-flash（max_tokens=64）实际 completion_tokens 达 121，
+	// 为上限的 1.89 倍；max_tokens=16 时更极端，达 8.8 倍。仅靠通用的
+	// EstimateMultiplier（1.2）远不足以覆盖，预扣会被系统性击穿 —— 真实
+	// 用量越过硬水位后 Commit 才发现，额度已经超刷。
+	//
+	// 取 3.0: 覆盖实测 1.89 倍并留出余量。不取更大值是因为预扣过高会让
+	// 单 Key 可并发请求数下降，而 max_tokens 极小的请求本身占用绝对值很低，
+	// 由 ReasoningFloorTokens 兜底更划算。
+	ReasoningOutputMultiplier float64 `yaml:"reasoning_output_multiplier"`
+	// ReasoningFloorTokens 是推理模型输出部分的预扣下限。
+	//
+	// 小 max_tokens 场景下按比例放大仍然不够（16 × 3 = 48，实测 141），
+	// 因为思维链长度取决于问题复杂度而非用户声明的上限。此处设一个绝对
+	// 下限，把这类请求托到安全线以上。
+	ReasoningFloorTokens int64 `yaml:"reasoning_floor_tokens"`
 	// SnapshotInterval 是调度打分用的只读快照刷新间隔。
 	SnapshotInterval time.Duration `yaml:"snapshot_interval"`
 }
@@ -97,6 +199,51 @@ func (q Quota) CountHard() int64 { return int64(float64(q.CountLimit) * q.CountH
 
 // CountSoft 返回次数型软水位。
 func (q Quota) CountSoft() int64 { return int64(float64(q.CountLimit) * q.CountSoftRatio) }
+
+// LimitsFor 返回指定 provider 在该配额类型下的软硬水位。
+//
+// 优先采用 provider 自己的 quota_limit，仅在其未配置（<=0）时回退到全局
+// quota.token_limit / count_limit。比例（hard_ratio / soft_ratio）始终取全局值 ——
+// 它表达的是「留多少安全余量」这一运维策略，与上游是谁无关。
+//
+// 必须按 provider 取额度: 各家上游的单 Key 限额天差地别（火山按 token 给
+// 数百万，商汤公测按次给一千多）。用全局值会同时错向两边 ——
+// 对额度小的上游是超发（真实额度耗尽后网关仍在放行，请求全部撞上游 429），
+// 对额度大的上游是白白闲置。而且这类偏差不会报错，只会表现为「配了
+// quota_limit 但完全没用」，极难从日志看出来。
+func (c *Config) LimitsFor(provider string, kindCount bool) (hard, soft int64) {
+	limit := int64(0)
+	if p, ok := c.Providers[provider]; ok {
+		limit = p.QuotaLimit
+	}
+	if limit <= 0 {
+		if kindCount {
+			limit = c.Quota.CountLimit
+		} else {
+			limit = c.Quota.TokenLimit
+		}
+	}
+	if kindCount {
+		return int64(float64(limit) * c.Quota.CountHardRatio),
+			int64(float64(limit) * c.Quota.CountSoftRatio)
+	}
+	return int64(float64(limit) * c.Quota.TokenHardRatio),
+		int64(float64(limit) * c.Quota.TokenSoftRatio)
+}
+
+// IsCountProvider 判断 provider 的配额口径是否为「按次」。
+//
+// 单独给出这个方法而不是让调用方各自读 QuotaKind: 归档、展示、对账都需要
+// 知道「这个 provider 的额度该拿哪个量纲去比」。少一处判断就会拿 token 数
+// 去除以按次额度 —— 两个数都真实存在、都非零，比值也在 [0,1] 里，没有任何
+// 一层会报错，只会让历史打分读到一个毫无意义的小数。
+func (c *Config) IsCountProvider(provider string) bool {
+	p, ok := c.Providers[provider]
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(p.QuotaKind, "count")
+}
 
 // Egress 是出口 IP 配置。
 type Egress struct {
@@ -173,22 +320,34 @@ type EgressIP struct {
 	Pool string `yaml:"pool"`
 }
 
-// Upstream 是上游渠道配置。
-type Upstream struct {
-	// VolcBaseURL 是火山 Ark 的基础地址。指向 mock 服务即可离线跑通全链路。
-	VolcBaseURL string `yaml:"volc_base_url"`
+// Provider 是单个上游服务商的配置。
+type Provider struct {
+	// BaseURL 是上游 API 的基础地址。
+	BaseURL string `yaml:"base_url"`
+	// QuotaKind 是配额计量单位: "token" | "count"
+	QuotaKind string `yaml:"quota_kind"`
+	// QuotaLimit 是单 Key 的配额上限（token 数或调用次数）。
+	QuotaLimit int64 `yaml:"quota_limit"`
+	// QuotaWindow 是配额周期（如 "24h" 或 "5h"）。
+	QuotaWindow time.Duration `yaml:"quota_window"`
+	// RefreshHour 是固定刷新点（0-23），火山为 12。商汤无固定刷新点时填 nil。
+	RefreshHour *int `yaml:"refresh_hour"`
+	// ModelMapping 将对外模型名映射为上游实际模型名。
+	ModelMapping map[string]string `yaml:"model_mapping"`
+	// CountModels 列出按次计费的模型。
+	CountModels []string `yaml:"count_models"`
+	// ReasoningModels 列出会输出思维链（reasoning_content）的模型。
+	ReasoningModels []string `yaml:"reasoning_models"`
+}
+
+// UpstreamCommon 是跨渠道的通用上游配置。
+type UpstreamCommon struct {
 	// MaxRetries 是单次用户请求内的最大换 Key 重试次数。
 	MaxRetries int `yaml:"max_retries"`
 	// RetryBaseDelay 是重试退避的基准间隔。
 	RetryBaseDelay time.Duration `yaml:"retry_base_delay"`
 	// RetryJitter 是叠加在退避上的随机抖动上限。
-	//
-	// 反作弊考虑: 纯指数退避本身就是机器特征，必须叠加 persona 化抖动。
 	RetryJitter time.Duration `yaml:"retry_jitter"`
-	// ModelMapping 将对外模型名映射为火山实际模型名。
-	ModelMapping map[string]string `yaml:"model_mapping"`
-	// CountModels 列出按次计费的模型。
-	CountModels []string `yaml:"count_models"`
 }
 
 // Scheduler 是调度打分配置。
@@ -465,13 +624,20 @@ func Default() *Config {
 			ReconcileInterval:  time.Hour,
 			DefaultMaxTokens:   4096,
 			EstimateMultiplier: 1.2,
-			SnapshotInterval:   time.Second,
+			// 推理模型思维链不受 max_tokens 约束，实测最高 8.8 倍上限，
+			// 需独立的放大系数与绝对下限，详见字段注释。
+			ReasoningOutputMultiplier: 3.0,
+			ReasoningFloorTokens:      1024,
+			SnapshotInterval:          time.Second,
 		},
 		Egress: Egress{
 			Mode:           "direct",
 			RequestTimeout: 300 * time.Second,
-			VerifyOnStart:  true,
-			VerifyTarget:   "ark.cn-beijing.volces.com:443",
+			VerifyOnStart: true,
+			// 刻意留空: 非空默认值会让 EgressVerifyTarget 永远命中
+			// 「显式配置」分支，从 provider base_url 推导的逻辑就成了死代码，
+			// 自检也就永远在拨一个与真实上游无关的域名。
+			VerifyTarget: "",
 			// 默认关闭自动封禁判定。误判的代价（健康出口上全部 Key 被迫换 IP）
 			// 高于漏判（运维观察后手动处理），故要求显式开启。
 			BanDetectKeys:   0,
@@ -483,13 +649,26 @@ func Default() *Config {
 			BanCooldownMax:      24 * time.Hour,
 			HealthCheckInterval: 30 * time.Second,
 		},
-		Upstream: Upstream{
-			VolcBaseURL:    "https://ark.cn-beijing.volces.com",
+		Upstream: UpstreamCommon{
 			MaxRetries:     3,
 			RetryBaseDelay: 200 * time.Millisecond,
 			RetryJitter:    500 * time.Millisecond,
-			ModelMapping:   map[string]string{},
-			CountModels:    []string{"seedream", "seedream-3.0"},
+		},
+		Providers: map[string]Provider{
+			"volc": {
+				BaseURL: "https://ark.cn-beijing.volces.com",
+				ModelMapping: map[string]string{},
+				CountModels:  []string{"seedream", "seedream-3.0"},
+				// 子串匹配，覆盖带版本后缀的实际模型名
+				ReasoningModels: []string{"deepseek", "doubao-1-5-thinking", "thinking", "-r1"},
+				QuotaKind: "token",
+				// 刻意不预设 QuotaLimit，留 0 让它回退到全局 quota.token_limit。
+				//
+				// 若在此填一个默认额度，运维调 quota.token_limit 会「配了没反应」——
+				// provider 默认值总是胜出，而日志里看不出任何异常。provider 的
+				// quota_limit 只应在用户明确要为该上游覆盖额度时才出现。
+				RefreshHour: intPtr(12),
+			},
 		},
 		Scheduler: Scheduler{
 			WeightQuota:        35,
@@ -533,8 +712,39 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("config: 读取 %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		// 严格模式: 未知字段直接报错而非静默丢弃。
+		//
+		// 静默丢弃的代价在生产上是隐蔽且昂贵的 —— 把 admin.api_key 误写成
+		// admin.token 会让整组管理路由不注册（server.go 以 APIKey 为空作为
+		// 禁用信号），把 egress.ips 误写成 bind_ips 会让多出口静默降级为
+		// direct 单出口。两者都表现为「配置写了但功能不存在」，且启动日志
+		// 一切正常，只能靠逐行比对结构体标签才能发现。
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("config: 解析 %s: %w", path, err)
+		}
+
+		// providers 必须整体替换默认值，不能合并。
+		//
+		// yaml 对 map 是逐键合并的，于是 Default() 里的 "volc" 会残留在
+		// 只配了 sensenova 的部署上。危害是双重的:
+		//
+		//  1. 模型静默路由到未部署的上游 —— seedream-3.0 命中 volc 的
+		//     count_models，请求被送去一个从未导入过 Key 的 provider，
+		//     表现为「配额耗尽」而非「模型不存在」，排查方向完全错。
+		//  2. ResolveProvider 的「只有一个 provider 时自动推断」永久失效，
+		//     因为 map 里永远有两个键。单上游部署被迫每次显式写 provider，
+		//     而这正是 DefaultProvider 想消除的噪音。
+		//
+		// 判据用「文件里是否出现 providers 键」而非「解析后是否非空」:
+		// 后者无法区分「没配」与「配成空 map」，而显式配空 map 应当报错
+		// （Validate 会拦），不该悄悄回落到 volc 默认值。
+		var probe struct {
+			Providers map[string]Provider `yaml:"providers"`
+		}
+		if err := yaml.Unmarshal(data, &probe); err == nil && probe.Providers != nil {
+			cfg.Providers = probe.Providers
 		}
 	}
 
@@ -553,6 +763,11 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("FLUXKEYS_METRICS_ADDR"); v != "" {
 		cfg.Server.MetricsAddr = v
 	}
+	// 分片标识走环境变量是刻意的: 多机部署时同一份配置文件与镜像分发到
+	// 每台机器，唯一的差异就是这个值。写进 YAML 就意味着每台机器一份配置。
+	if v := os.Getenv("FLUXKEYS_SHARD_ID"); v != "" {
+		cfg.Server.ShardID = v
+	}
 	if v := os.Getenv("REDIS_ADDR"); v != "" {
 		cfg.Redis.Addr = v
 	}
@@ -567,8 +782,24 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("POSTGRES_DSN"); v != "" {
 		cfg.Postgres.DSN = v
 	}
+	// 推理模型预扣的两个调优旋钮暴露为环境变量：真实输出倍率随模型版本
+	// 漂移，需要能在不重建镜像的前提下调整。非法值忽略，交由 Validate 兜底。
+	if v := os.Getenv("QUOTA_REASONING_OUTPUT_MULTIPLIER"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Quota.ReasoningOutputMultiplier = f
+		}
+	}
+	if v := os.Getenv("QUOTA_REASONING_FLOOR_TOKENS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.Quota.ReasoningFloorTokens = n
+		}
+	}
 	if v := os.Getenv("VOLC_BASE_URL"); v != "" {
-		cfg.Upstream.VolcBaseURL = v
+		// 向后兼容：VOLC_BASE_URL 环境变量更新 volc provider 的 BaseURL
+		if p, ok := cfg.Providers["volc"]; ok {
+			p.BaseURL = v
+			cfg.Providers["volc"] = p
+		}
 	}
 	if v := os.Getenv("EGRESS_MODE"); v != "" {
 		cfg.Egress.Mode = v
@@ -754,6 +985,13 @@ func (c *Config) Validate() error {
 	if c.Quota.EstimateMultiplier < 1 {
 		return fmt.Errorf("config: quota.estimate_multiplier 不应小于 1")
 	}
+	// 小于 1 会让推理模型的预扣低于常规模型，与该系数的设计意图相反。
+	if c.Quota.ReasoningOutputMultiplier < 1 {
+		return fmt.Errorf("config: quota.reasoning_output_multiplier 不应小于 1")
+	}
+	if c.Quota.ReasoningFloorTokens < 0 {
+		return fmt.Errorf("config: quota.reasoning_floor_tokens 不应为负")
+	}
 
 	// P1-10: 开启付费渠道 fallback 必须同时设定预算上限
 	if c.Fallback.Enabled && c.Fallback.DailyBudgetCents <= 0 {
@@ -793,20 +1031,97 @@ func parseClockOrZero(s string) time.Duration {
 	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute
 }
 
-// IsCountModel 判断模型是否按次计费。
-func (c *Config) IsCountModel(model string) bool {
-	for _, m := range c.Upstream.CountModels {
-		if strings.EqualFold(m, model) {
+// IsCountModel 判断模型在指定 provider 上是否按次计费。
+//
+// 先把 model 归一化到上游名再匹配。调用方（gateway 的 quotaKindFor）传入的是
+// 用户请求里的**对外名**，而 count_models 通常按**上游名**书写 —— 例如商汤配
+// model_mapping: {gpt-4: SenseChat-5} 且 count_models: [SenseChat-5]。不归一化
+// 时 "gpt-4" 匹配不上 "SenseChat-5"，按次计费的模型会被当成 token 型计量:
+// 配额扣的是估算 token 而非调用次数，count 档位的额度永远扣不动，
+// 而 token 档位被凭空消耗。两侧都能命中才是安全的。
+func (c *Config) IsCountModel(provider, model string) bool {
+	p, ok := c.Providers[provider]
+	if !ok {
+		return false
+	}
+	upstream := c.UpstreamModel(provider, model)
+	for _, m := range p.CountModels {
+		if strings.EqualFold(m, model) || strings.EqualFold(m, upstream) {
 			return true
 		}
 	}
 	return false
 }
 
-// UpstreamModel 返回模型在火山侧的实际名称。
-func (c *Config) UpstreamModel(model string) string {
-	if v, ok := c.Upstream.ModelMapping[model]; ok && v != "" {
+// IsReasoningModel 判断模型在指定 provider 上是否会输出思维链。
+//
+// 用子串匹配而非全等: 火山推理模型名带版本后缀（deepseek-v4-flash-ga-260731），
+// 且新版本会持续发布，枚举全名会漏掉未来的型号 —— 而漏判的后果是预扣不足、
+// 额度超刷，比误判（预扣偏高、并发略降）严重得多。
+func (c *Config) IsReasoningModel(provider, model string) bool {
+	if model == "" {
+		return false
+	}
+	p, ok := c.Providers[provider]
+	if !ok {
+		return false
+	}
+	// 同 IsCountModel: 调用方传对外名，配置按上游名书写，两侧都要匹配。
+	// 漏判在这里的代价是预扣不足、额度超刷。
+	lower := strings.ToLower(model)
+	lowerUp := strings.ToLower(c.UpstreamModel(provider, model))
+	for _, m := range p.ReasoningModels {
+		if m == "" {
+			continue
+		}
+		needle := strings.ToLower(m)
+		if strings.Contains(lower, needle) || strings.Contains(lowerUp, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// UpstreamModel 返回模型在指定 provider 上的实际名称。
+func (c *Config) UpstreamModel(provider, model string) string {
+	p, ok := c.Providers[provider]
+	if !ok {
+		return model
+	}
+	if v, ok := p.ModelMapping[model]; ok && v != "" {
 		return v
 	}
 	return model
+}
+
+// ProviderForModel 从模型名推断 provider。
+//
+// 遍历所有 provider 的 ModelMapping，返回第一个声明支持该模型的 provider。
+// 找不到时返回空字符串——调用方需判断并返回 400 "模型不存在"。
+func (c *Config) ProviderForModel(model string) string {
+	for name, p := range c.Providers {
+		// 模型名完全匹配（对外名）
+		if _, ok := p.ModelMapping[model]; ok {
+			return name
+		}
+		// 模型名匹配上游实际名（允许直接用上游名调用）
+		for _, upstreamName := range p.ModelMapping {
+			if upstreamName == model {
+				return name
+			}
+		}
+		// CountModels / ReasoningModels 里声明过的模型同样算这个 provider 认领。
+		// 按次计费模型常常不需要改名，因此不会出现在 ModelMapping 里。
+		for _, m := range p.CountModels {
+			if strings.EqualFold(m, model) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// intPtr 返回 int 指针，用于默认配置中的可选字段。
+func intPtr(v int) *int {
+	return &v
 }

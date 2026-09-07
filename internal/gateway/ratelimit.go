@@ -71,10 +71,16 @@ redis.call('EXPIRE', KEYS[1], ttl)
 return {allowed, math.floor(tokens), retry_after}
 `
 
+// scriptTokenBucket 在包级构建一次。
+//
+// 用 redis.Script 而非手工 ScriptLoad + EvalSha: Run 内部先试 EvalSha，
+// 收到 NOSCRIPT 时自动退回 Eval 并重新缓存。手工方案在 Redis 重启后所有
+// 限流调用持续失败（fail-open 放行，但每个请求都多一次失败往返和告警）。
+var scriptTokenBucket = redis.NewScript(luaTokenBucket)
+
 // RateLimiter 是基于 Redis 的用户级令牌桶限流器。
 type RateLimiter struct {
 	rdb *redis.Client
-	sha string
 	now func() time.Time
 	// failOpen 决定 Redis 故障时的行为。
 	//
@@ -84,13 +90,12 @@ type RateLimiter struct {
 	failOpen bool
 }
 
-// NewRateLimiter 创建限流器并预加载脚本。
+// NewRateLimiter 创建限流器并预热脚本。
 func NewRateLimiter(ctx context.Context, rdb *redis.Client) (*RateLimiter, error) {
-	sha, err := rdb.ScriptLoad(ctx, luaTokenBucket).Result()
-	if err != nil {
+	if err := scriptTokenBucket.Load(ctx, rdb).Err(); err != nil {
 		return nil, fmt.Errorf("gateway: 加载限流脚本: %w", err)
 	}
-	return &RateLimiter{rdb: rdb, sha: sha, now: time.Now, failOpen: true}, nil
+	return &RateLimiter{rdb: rdb, now: time.Now, failOpen: true}, nil
 }
 
 // SetClock 替换时钟，仅供测试。
@@ -170,9 +175,19 @@ func (l *RateLimiter) RefundTokens(ctx context.Context, userID int64, tpmLimit, 
 
 func (l *RateLimiter) consume(ctx context.Context, key string, capacity int64, rate float64, need int64, dim string) (Result, error) {
 	nowMS := l.now().UnixMilli()
-	// TTL 取 2 分钟: 覆盖一分钟窗口且足够回填，同时让闲置用户的桶自动过期
-	res, err := l.rdb.EvalSha(ctx, l.sha, []string{key},
-		capacity, rate, need, nowMS, 120).Result()
+	// TTL 必须覆盖「桶从空攒满」的时长，下限 2 分钟。
+	//
+	// 固定 120s 的问题: AllowTokens 会把容量放大到单请求预估量，大请求被拒
+	// 后的 retry_after 可能远超 120s —— 桶先过期重置，用户等于「刑满释放」，
+	// 限流对大请求形同虚设；反向亦然，攒了很久令牌的正常用户会被突然清零。
+	ttl := int64(120)
+	if rate > 0 {
+		if fill := int64(float64(capacity)/rate) * 2; fill > ttl {
+			ttl = fill
+		}
+	}
+	res, err := scriptTokenBucket.Run(ctx, l.rdb, []string{key},
+		capacity, rate, need, nowMS, ttl).Result()
 	if err != nil {
 		if l.failOpen {
 			// Redis 不可用时放行，真正的超刷防线在配额层

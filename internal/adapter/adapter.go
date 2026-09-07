@@ -39,6 +39,15 @@ type Usage struct {
 	TotalTokens      int64 `json:"total_tokens"`
 	// CountUnits 是按次计费的消耗次数（如 Seedream 生成的图片数）。
 	CountUnits int64 `json:"-"`
+	// ReasoningTokens 是推理模型思维链消耗的 token 数。
+	//
+	// 仅用于可观测性，不参与配额扣减 —— 上游已将其计入 CompletionTokens，
+	// 再累加会导致重复计费。它的价值在于定位「预扣为何总是不够」: 没有这个
+	// 数字，运维只能看到 completion 远超 max_tokens 却不知道成本花在哪里。
+	//
+	// 故意不加入 Empty() 判据: 若上游只回了 details 而分项全为 0，
+	// 那是异常响应，不应被当作有效用量去 Commit。
+	ReasoningTokens int64 `json:"-"`
 }
 
 // Total 返回用于配额修正的总量。上游未给 total_tokens 时按分项求和兜底。

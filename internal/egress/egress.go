@@ -768,6 +768,34 @@ func (p *Pool) rebind(keyID, pool string, penalize bool) (string, error) {
 	return p.BindInPool(keyID, pool)
 }
 
+// RetainClients 清理不在存活集合内的 Key 的 HTTP 客户端。
+//
+// clients 映射在请求路径上只增不减: Key 被删除 / 禁用 / 移出活跃池后，
+// 其独立 Transport（连接池、空闲连接、内部 goroutine）会永久驻留。
+// 1000 Key 规模且有正常汰换时这是稳定的慢泄漏。
+//
+// 由周期性 key_reload 在装载完新 Key 池后调用。只清 client 不清 bindings:
+// 绑定关系是「终身绑定」语义的一部分，Key 短暂下线再回来必须还落在原出口，
+// 而 client 只是随时可重建的传输资源。
+//
+// 返回清理的数量，供日志观测。
+func (p *Pool) RetainClients(live map[string]bool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for keyID, c := range p.clients {
+		if live[keyID] {
+			continue
+		}
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		delete(p.clients, keyID)
+		n++
+	}
+	return n
+}
+
 // Stats 汇总出口池状态，供看板与 /admin 使用。
 type Stats struct {
 	Mode      Mode           `json:"mode"`

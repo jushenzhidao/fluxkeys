@@ -66,7 +66,8 @@ func truncate(t *testing.T, s *Store) {
 	t.Helper()
 	_, err := s.pool.Exec(context.Background(), `
 		TRUNCATE usage_records, key_daily_history, audit_logs, quota_drift_logs,
-		         user_api_keys, users, volc_keys, egress_ips RESTART IDENTITY CASCADE`)
+		         user_api_keys, users, upstream_keys, egress_ips,
+		         provider_configs, config_versions RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatalf("清空测试表: %v", err)
 	}
@@ -297,14 +298,21 @@ func TestAuthenticateUserKey_失败路径区分三种原因(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeUserAPIKey(ctx, rec.ID); err != nil {
+	// 归属校验: 用错误的 user_id 吊销必须失败且不产生任何效果
+	if err := s.RevokeUserAPIKey(ctx, u.ID+999, rec.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("跨用户吊销期望 ErrNotFound，实际 %v", err)
+	}
+	if _, err := s.AuthenticateUserKey(ctx, revoked); err != nil {
+		t.Fatalf("跨用户吊销失败后 Key 应仍然有效，实际 %v", err)
+	}
+	if err := s.RevokeUserAPIKey(ctx, u.ID, rec.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AuthenticateUserKey(ctx, revoked); !errors.Is(err, ErrKeyRevoked) {
 		t.Fatalf("已吊销 Key 期望 ErrKeyRevoked，实际 %v", err)
 	}
 	// 重复吊销应报 ErrNotFound（已非 active）
-	if err := s.RevokeUserAPIKey(ctx, rec.ID); !errors.Is(err, ErrNotFound) {
+	if err := s.RevokeUserAPIKey(ctx, u.ID, rec.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("重复吊销期望 ErrNotFound，实际 %v", err)
 	}
 
@@ -380,13 +388,13 @@ func TestListUserAPIKeys_与TouchLastUsed(t *testing.T) {
 	}
 }
 
-// ---------- 火山 Key ----------
+// ---------- 上游 Key ----------
 
-func TestUpsertVolcKey_加密存储且可解密读回(t *testing.T) {
+func TestUpsertUpstreamKey_加密存储且可解密读回(t *testing.T) {
 	s, ctx := newTestStore(t)
 
 	const secret = "ak-volc-super-secret"
-	k, err := s.UpsertVolcKey(ctx, &VolcKey{
+	k, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{
 		KeyID: "volc_001", Secret: secret, Pool: "hot",
 		EgressIP: "172.16.0.2", PersonaID: "p_01",
 	})
@@ -396,11 +404,11 @@ func TestUpsertVolcKey_加密存储且可解密读回(t *testing.T) {
 	if k.SecretEnc == secret || k.SecretEnc == "" {
 		t.Fatalf("secret_enc 未加密: %q", k.SecretEnc)
 	}
-	if k.Status != VolcStatusActive || k.HealthScore != 100 || k.RefreshState != RefreshIdle {
+	if k.Status != KeyStatusActive || k.HealthScore != 100 || k.RefreshState != RefreshIdle {
 		t.Fatalf("默认值不符: %+v", k)
 	}
 
-	got, err := s.GetVolcKey(ctx, "volc_001")
+	got, err := s.GetUpstreamKey(ctx, "volc_001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,26 +416,26 @@ func TestUpsertVolcKey_加密存储且可解密读回(t *testing.T) {
 		t.Fatalf("解密后密钥不符: %q", got.Secret)
 	}
 
-	if _, err := s.GetVolcKey(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetUpstreamKey(ctx, "nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("期望 ErrNotFound，实际 %v", err)
 	}
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{KeyID: ""}); err == nil {
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{KeyID: ""}); err == nil {
 		t.Fatal("空 key_id 应报错")
 	}
 }
 
-func TestUpsertVolcKey_空Secret保留原密文(t *testing.T) {
+func TestUpsertUpstreamKey_空Secret保留原密文(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{KeyID: "volc_001", Secret: "orig", Pool: "hot"}); err != nil {
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{KeyID: "volc_001", Secret: "orig", Pool: "hot"}); err != nil {
 		t.Fatal(err)
 	}
 	// 只改 pool，不带 Secret
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{KeyID: "volc_001", Pool: "warm"}); err != nil {
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{KeyID: "volc_001", Pool: "warm"}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetVolcKey(ctx, "volc_001")
+	got, err := s.GetUpstreamKey(ctx, "volc_001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +447,7 @@ func TestUpsertVolcKey_空Secret保留原密文(t *testing.T) {
 	}
 }
 
-func TestUpsertVolcKey_例行导入不复活banned也不改画像与出口(t *testing.T) {
+func TestUpsertUpstreamKey_例行导入不复活banned也不改画像与出口(t *testing.T) {
 	// 回归测试。曾经的实现在 ON CONFLICT 里用 EXCLUDED.status = '' 判断
 	// 「调用方是否指定了状态」，而 VALUES 侧对 status 做了 COALESCE 兜底 ——
 	// EXCLUDED 拿到的是兜底后的 'active'，判断永远为假。
@@ -448,29 +456,29 @@ func TestUpsertVolcKey_例行导入不复活banned也不改画像与出口(t *te
 	// 静默复活并重新投入流量，同时抹掉画像与出口 IP 绑定。
 	s, ctx := newTestStore(t)
 
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{
 		KeyID: "volc_001", Secret: "s1", Pool: "hot",
 		PersonaID: "p_night", EgressIP: "172.16.0.9",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// 该 Key 被封禁
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{
-		KeyID: "volc_001", Status: VolcStatusBanned,
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{
+		KeyID: "volc_001", Status: KeyStatusBanned,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	// 例行导入: 只带 key_id 与 pool，其余留空
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{KeyID: "volc_001", Pool: "cold"}); err != nil {
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{KeyID: "volc_001", Pool: "cold"}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetVolcKey(ctx, "volc_001")
+	got, err := s.GetUpstreamKey(ctx, "volc_001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != VolcStatusBanned {
+	if got.Status != KeyStatusBanned {
 		t.Fatalf("banned Key 被例行导入复活为 %q", got.Status)
 	}
 	if got.PersonaID != "p_night" {
@@ -484,35 +492,35 @@ func TestUpsertVolcKey_例行导入不复活banned也不改画像与出口(t *te
 	}
 
 	// 显式指定时必须能改回来，否则封禁 Key 永远无法恢复
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{
-		KeyID: "volc_001", Status: VolcStatusActive, PersonaID: "p_day",
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{
+		KeyID: "volc_001", Status: KeyStatusActive, PersonaID: "p_day",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.GetVolcKey(ctx, "volc_001")
+	got, err = s.GetUpstreamKey(ctx, "volc_001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != VolcStatusActive || got.PersonaID != "p_day" {
+	if got.Status != KeyStatusActive || got.PersonaID != "p_day" {
 		t.Fatalf("显式指定未覆盖: status=%q persona=%q", got.Status, got.PersonaID)
 	}
 }
 
-func TestListVolcKeys_过滤与按需解密(t *testing.T) {
+func TestListUpstreamKeys_过滤与按需解密(t *testing.T) {
 	s, ctx := newTestStore(t)
 
-	seed := []VolcKey{
-		{KeyID: "volc_001", Secret: "s1", Pool: "hot", Status: VolcStatusActive},
-		{KeyID: "volc_002", Secret: "s2", Pool: "hot", Status: VolcStatusCooldown},
-		{KeyID: "volc_003", Secret: "s3", Pool: "cold", Status: VolcStatusActive},
+	seed := []UpstreamKey{
+		{KeyID: "volc_001", Secret: "s1", Pool: "hot", Status: KeyStatusActive},
+		{KeyID: "volc_002", Secret: "s2", Pool: "hot", Status: KeyStatusCooldown},
+		{KeyID: "volc_003", Secret: "s3", Pool: "cold", Status: KeyStatusActive},
 	}
 	for i := range seed {
-		if _, err := s.UpsertVolcKey(ctx, &seed[i]); err != nil {
+		if _, err := s.UpsertUpstreamKey(ctx, &seed[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	all, err := s.ListVolcKeys(ctx, VolcKeyFilter{})
+	all, err := s.ListUpstreamKeys(ctx, UpstreamKeyFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,8 +532,8 @@ func TestListVolcKeys_过滤与按需解密(t *testing.T) {
 		t.Fatalf("未请求解密却填充了明文: %q", all[0].Secret)
 	}
 
-	hotActive, err := s.ListVolcKeys(ctx, VolcKeyFilter{
-		Pool: "hot", Status: VolcStatusActive, WithSecret: true,
+	hotActive, err := s.ListUpstreamKeys(ctx, UpstreamKeyFilter{
+		Pool: "hot", Status: KeyStatusActive, WithSecret: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -537,7 +545,7 @@ func TestListVolcKeys_过滤与按需解密(t *testing.T) {
 		t.Fatalf("WithSecret 未解密: %q", hotActive[0].Secret)
 	}
 
-	limited, err := s.ListVolcKeys(ctx, VolcKeyFilter{Limit: 2})
+	limited, err := s.ListUpstreamKeys(ctx, UpstreamKeyFilter{Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,26 +554,26 @@ func TestListVolcKeys_过滤与按需解密(t *testing.T) {
 	}
 }
 
-func TestUpdateVolcKeyState_局部更新不影响其他列(t *testing.T) {
+func TestUpdateUpstreamKeyState_局部更新不影响其他列(t *testing.T) {
 	s, ctx := newTestStore(t)
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{
 		KeyID: "volc_001", Secret: "s1", Pool: "hot", EgressIP: "172.16.0.2",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	status, health := VolcStatusCooldown, 55
-	if err := s.UpdateVolcKeyState(ctx, "volc_001", VolcKeyState{
+	status, health := KeyStatusCooldown, 55
+	if err := s.UpdateUpstreamKeyState(ctx, "volc_001", UpstreamKeyState{
 		Status: &status, HealthScore: &health, TouchLastUsed: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.GetVolcKey(ctx, "volc_001")
+	got, err := s.GetUpstreamKey(ctx, "volc_001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != VolcStatusCooldown || got.HealthScore != 55 {
+	if got.Status != KeyStatusCooldown || got.HealthScore != 55 {
 		t.Fatalf("更新未生效: %+v", got)
 	}
 	if got.EgressIP != "172.16.0.2" || got.Secret != "s1" {
@@ -576,24 +584,24 @@ func TestUpdateVolcKeyState_局部更新不影响其他列(t *testing.T) {
 	}
 
 	// 空更新是 no-op，不应报错
-	if err := s.UpdateVolcKeyState(ctx, "volc_001", VolcKeyState{}); err != nil {
+	if err := s.UpdateUpstreamKeyState(ctx, "volc_001", UpstreamKeyState{}); err != nil {
 		t.Fatalf("空更新应为 no-op: %v", err)
 	}
-	if err := s.UpdateVolcKeyState(ctx, "nope", VolcKeyState{Status: &status}); !errors.Is(err, ErrNotFound) {
+	if err := s.UpdateUpstreamKeyState(ctx, "nope", UpstreamKeyState{Status: &status}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("期望 ErrNotFound，实际 %v", err)
 	}
 }
 
 func TestUpdateRefreshState_确认时写入时间戳(t *testing.T) {
 	s, ctx := newTestStore(t)
-	if _, err := s.UpsertVolcKey(ctx, &VolcKey{KeyID: "volc_001", Secret: "s1"}); err != nil {
+	if _, err := s.UpsertUpstreamKey(ctx, &UpstreamKey{KeyID: "volc_001", Secret: "s1"}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := s.UpdateRefreshState(ctx, "volc_001", RefreshProbing, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := s.GetVolcKey(ctx, "volc_001")
+	got, _ := s.GetUpstreamKey(ctx, "volc_001")
 	if got.RefreshState != RefreshProbing {
 		t.Fatalf("状态未更新: %q", got.RefreshState)
 	}
@@ -604,7 +612,7 @@ func TestUpdateRefreshState_确认时写入时间戳(t *testing.T) {
 	if err := s.UpdateRefreshState(ctx, "volc_001", RefreshConfirmed, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.GetVolcKey(ctx, "volc_001")
+	got, _ = s.GetUpstreamKey(ctx, "volc_001")
 	if got.RefreshConfirmedAt == nil {
 		t.Fatal("confirmed 应写入确认时间")
 	}
@@ -612,7 +620,7 @@ func TestUpdateRefreshState_确认时写入时间戳(t *testing.T) {
 	if err := s.UpdateRefreshState(ctx, "volc_001", RefreshFailed, "额度未刷新"); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.GetVolcKey(ctx, "volc_001")
+	got, _ = s.GetUpstreamKey(ctx, "volc_001")
 	if got.LastError != "额度未刷新" {
 		t.Fatalf("last_error 未写入: %q", got.LastError)
 	}
@@ -636,7 +644,7 @@ func TestInsertUsageRecord_异步批量落库(t *testing.T) {
 	for i := 0; i < n; i++ {
 		if err := s.InsertUsageRecord(ctx, UsageRecord{
 			RequestID: fmt.Sprintf("req-%d", i), UserID: u.ID, UserAPIKeyID: key.ID,
-			VolcKeyID: "volc_001", Model: "deepseek-v3", QuotaDay: day,
+			UpstreamKeyID: "volc_001", Model: "deepseek-v3", QuotaDay: day,
 			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
 			EstimatedTokens: 200, StatusCode: 200, LatencyMS: 42,
 		}); err != nil {
@@ -677,7 +685,7 @@ func TestInsertUsageRecord_校验与默认值(t *testing.T) {
 	day := quota.QuotaDayTime(time.Now())
 	// user_id = 0 表示无归属（如内部探测请求），应写成 NULL 而非违反外键
 	if err := s.InsertUsageRecord(ctx, UsageRecord{
-		RequestID: "probe-1", VolcKeyID: "volc_001", QuotaDay: day, StatusCode: 200,
+		RequestID: "probe-1", UpstreamKeyID: "volc_001", QuotaDay: day, StatusCode: 200,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +724,7 @@ func TestInsertUsageRecord_并发投递不丢不错(t *testing.T) {
 			for i := 0; i < perG; i++ {
 				_ = s.InsertUsageRecord(ctx, UsageRecord{
 					RequestID: fmt.Sprintf("r-%d-%d", g, i),
-					VolcKeyID: fmt.Sprintf("volc_%03d", g%5),
+					UpstreamKeyID: fmt.Sprintf("volc_%03d", g%5),
 					QuotaDay:  day, TotalTokens: 10, StatusCode: 200,
 				})
 			}
@@ -785,7 +793,7 @@ func TestClose_退出前flush完毕(t *testing.T) {
 	const n = 50
 	for i := 0; i < n; i++ {
 		if err := s.InsertUsageRecord(ctx, UsageRecord{
-			RequestID: fmt.Sprintf("close-%d", i), VolcKeyID: "volc_001",
+			RequestID: fmt.Sprintf("close-%d", i), UpstreamKeyID: "volc_001",
 			QuotaDay: day, TotalTokens: 1, StatusCode: 200,
 		}); err != nil {
 			t.Fatal(err)
@@ -831,16 +839,19 @@ func TestUpsertKeyDailyHistory_与GetKeyHistory(t *testing.T) {
 	s, ctx := newTestStore(t)
 	day := quota.QuotaDayTime(time.Now())
 
-	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{VolcKeyID: ""}); err == nil {
+	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{UpstreamKeyID: ""}); err == nil {
 		t.Fatal("空 key_id 应报错")
 	}
-	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{VolcKeyID: "volc_001"}); err == nil {
+	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{UpstreamKeyID: "volc_001"}); err == nil {
+		t.Fatal("空 provider 应报错")
+	}
+	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{UpstreamKeyID: "volc_001", Provider: "volc"}); err == nil {
 		t.Fatal("零值 quota_day 应报错")
 	}
 
 	// token_ratio 留空时应由 used/limit 推导
 	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{
-		VolcKeyID: "volc_001", QuotaDay: day,
+		UpstreamKeyID: "volc_001", Provider: "volc", QuotaDay: day,
 		TokenUsed: 1_000_000, TokenLimit: 5_000_000, RequestCount: 120,
 	}); err != nil {
 		t.Fatal(err)
@@ -852,24 +863,24 @@ func TestUpsertKeyDailyHistory_与GetKeyHistory(t *testing.T) {
 	if len(hist) != 1 {
 		t.Fatalf("期望 1 条，实际 %d", len(hist))
 	}
-	if got := hist["volc_001"].TokenRatio; got != 0.2 {
+	if got := hist[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}].TokenRatio; got != 0.2 {
 		t.Fatalf("token_ratio 推导错误: %v", got)
 	}
 
 	// 重复 upsert 覆盖而非累加
 	if err := s.UpsertKeyDailyHistory(ctx, &KeyDailyHistory{
-		VolcKeyID: "volc_001", QuotaDay: day,
+		UpstreamKeyID: "volc_001", Provider: "volc", QuotaDay: day,
 		TokenUsed: 2_000_000, TokenLimit: 5_000_000,
 		ConsecutiveLightDays: 3,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	hist, _ = s.GetKeyHistory(ctx, []string{"volc_001"}, day)
-	if hist["volc_001"].TokenUsed != 2_000_000 {
-		t.Fatalf("upsert 应覆盖: %d", hist["volc_001"].TokenUsed)
+	if hist[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}].TokenUsed != 2_000_000 {
+		t.Fatalf("upsert 应覆盖: %d", hist[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}].TokenUsed)
 	}
-	if hist["volc_001"].ConsecutiveLightDays != 3 {
-		t.Fatalf("连续低消耗天数未更新: %d", hist["volc_001"].ConsecutiveLightDays)
+	if hist[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}].ConsecutiveLightDays != 3 {
+		t.Fatalf("连续低消耗天数未更新: %d", hist[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}].ConsecutiveLightDays)
 	}
 
 	empty, err := s.GetKeyHistory(ctx, nil, day)
@@ -883,10 +894,15 @@ func TestAggregateUsageByKey_与SumUserTokens(t *testing.T) {
 	u := mustUser(t, s, ctx, "alice")
 	day := quota.QuotaDayTime(time.Now())
 
+	// k_shared 刻意在两个 provider 下各有流水: 汇总必须拆成两行。
+	// 早期实现按 key 分组再取 MAX(provider)，会把两边的量合并成一行、
+	// 并按字典序挑一个 provider 名 —— 用量被记到错误的上游账上。
 	recs := []UsageRecord{
-		{RequestID: "a1", UserID: u.ID, VolcKeyID: "volc_001", QuotaDay: day, TotalTokens: 100, StatusCode: 200},
-		{RequestID: "a2", UserID: u.ID, VolcKeyID: "volc_001", QuotaDay: day, TotalTokens: 200, StatusCode: 500, ErrorCode: "upstream"},
-		{RequestID: "a3", UserID: u.ID, VolcKeyID: "volc_002", QuotaDay: day, TotalTokens: 50, StatusCode: 200},
+		{RequestID: "a1", UserID: u.ID, UpstreamKeyID: "volc_001", Provider: "volc", QuotaDay: day, TotalTokens: 100, StatusCode: 200},
+		{RequestID: "a2", UserID: u.ID, UpstreamKeyID: "volc_001", Provider: "volc", QuotaDay: day, TotalTokens: 200, StatusCode: 500, ErrorCode: "upstream"},
+		{RequestID: "a3", UserID: u.ID, UpstreamKeyID: "volc_002", Provider: "volc", QuotaDay: day, TotalTokens: 50, StatusCode: 200},
+		{RequestID: "a4", UserID: u.ID, UpstreamKeyID: "k_shared", Provider: "volc", QuotaDay: day, TotalTokens: 70, StatusCode: 200},
+		{RequestID: "a5", UserID: u.ID, UpstreamKeyID: "k_shared", Provider: "sensenova", QuotaDay: day, CountUnits: 3, StatusCode: 200},
 	}
 	for _, r := range recs {
 		if err := s.InsertUsageRecord(ctx, r); err != nil {
@@ -901,20 +917,35 @@ func TestAggregateUsageByKey_与SumUserTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(agg) != 2 {
-		t.Fatalf("期望 2 个 Key，实际 %d", len(agg))
+	byPair := map[HistoryKey]KeyDailyHistory{}
+	for _, h := range agg {
+		byPair[HistoryKey{UpstreamKeyID: h.UpstreamKeyID, Provider: h.Provider}] = h
 	}
-	k1 := agg["volc_001"]
+	if len(agg) != 4 {
+		t.Fatalf("期望 4 个 (key,provider) 组合，实际 %d: %+v", len(agg), agg)
+	}
+	k1 := byPair[HistoryKey{UpstreamKeyID: "volc_001", Provider: "volc"}]
 	if k1.TokenUsed != 300 || k1.RequestCount != 2 || k1.ErrorCount != 1 {
 		t.Fatalf("volc_001 汇总不符: %+v", k1)
 	}
+	sv := byPair[HistoryKey{UpstreamKeyID: "k_shared", Provider: "volc"}]
+	ss := byPair[HistoryKey{UpstreamKeyID: "k_shared", Provider: "sensenova"}]
+	if sv.TokenUsed != 70 || sv.CountUsed != 0 {
+		t.Fatalf("k_shared@volc 应只含 volc 的量: %+v", sv)
+	}
+	if ss.CountUsed != 3 || ss.TokenUsed != 0 {
+		t.Fatalf("k_shared@sensenova 应只含 sensenova 的量: %+v", ss)
+	}
 
+	// 用户级汇总跨 provider 求和、且不区分成败: 100+200+50+70=420。
+	// a2 是 500 但 token 已被上游计费，必须计入日限额，否则失败请求
+	// 成了绕过限额的免费通道。a5 走 count 计费不产生 token，不参与此和。
 	total, err := s.SumUserTokens(ctx, u.ID, day)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 350 {
-		t.Fatalf("用户用量汇总不符: %d", total)
+	if total != 420 {
+		t.Fatalf("用户用量汇总不符: 期望 420，实际 %d", total)
 	}
 	if total, _ := s.SumUserTokens(ctx, 999999, day); total != 0 {
 		t.Fatalf("无流水用户应为 0，实际 %d", total)
@@ -960,16 +991,22 @@ func TestInsertQuotaDrift(t *testing.T) {
 	s, ctx := newTestStore(t)
 	day := quota.QuotaDayTime(time.Now())
 
-	if err := s.InsertQuotaDrift(ctx, QuotaDrift{VolcKeyID: ""}); err == nil {
+	if err := s.InsertQuotaDrift(ctx, QuotaDrift{UpstreamKeyID: ""}); err == nil {
 		t.Fatal("空 key_id 应报错")
 	}
-	if err := s.InsertQuotaDrift(ctx, QuotaDrift{VolcKeyID: "volc_001"}); err == nil {
+	if err := s.InsertQuotaDrift(ctx, QuotaDrift{UpstreamKeyID: "volc_001"}); err == nil {
 		t.Fatal("零值 quota_day 应报错")
+	}
+	if err := s.InsertQuotaDrift(ctx, QuotaDrift{
+		UpstreamKeyID: "volc_001", BillingKind: "token", QuotaDay: day, Drift: 1,
+	}); err == nil {
+		t.Fatal("空 provider 应报错")
 	}
 	// 负偏差同样要能记录: prededuct 少于租约之和也是异常
 	for _, d := range []int64{5000, -3000} {
 		if err := s.InsertQuotaDrift(ctx, QuotaDrift{
-			VolcKeyID: "volc_001", BillingKind: "token", QuotaDay: day, Drift: d,
+			UpstreamKeyID: "volc_001", Provider: "volc",
+			BillingKind: "token", QuotaDay: day, Drift: d,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -980,6 +1017,17 @@ func TestInsertQuotaDrift(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("期望 2 条，实际 %d", count)
+	}
+	// 断言 provider 真的落到了库里。只数行数的话，漏写 provider 列这类
+	// 缺陷会被 NOT NULL 约束挡在数据库层、表现为「写入报错」而非「写错」，
+	// 而生产里唯一调用方对写失败只 warn，缺陷就此静默。
+	var gotProvider string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT DISTINCT provider FROM quota_drift_logs`).Scan(&gotProvider); err != nil {
+		t.Fatal(err)
+	}
+	if gotProvider != "volc" {
+		t.Fatalf("provider 落库不符: %q", gotProvider)
 	}
 }
 
@@ -1024,7 +1072,7 @@ func TestInsertUsageRecord_构造context取消后仍能落库(t *testing.T) {
 	const n = 25
 	for i := 0; i < n; i++ {
 		if err := s.InsertUsageRecord(bg, UsageRecord{
-			RequestID: fmt.Sprintf("ctxdead-%d", i), VolcKeyID: "volc_001",
+			RequestID: fmt.Sprintf("ctxdead-%d", i), UpstreamKeyID: "volc_001",
 			QuotaDay: day, TotalTokens: 7, StatusCode: 200,
 		}); err != nil {
 			t.Fatal(err)

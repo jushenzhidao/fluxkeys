@@ -10,7 +10,7 @@ import (
 
 // 本文件只做一件事: 在单条 SQL 内完成「条件匹配 + 取旧值 + 写新值」。
 //
-// 为什么不复用 UpdateVolcKeyState:
+// 为什么不复用 UpdateUpstreamKeyState:
 //
 // 那个方法的签名是 (…) error —— 拿不到旧值，也没有条件匹配。用它实现
 // 管理接口的 PATCH 就必须退化成「先 SELECT 取旧值并校验，再 UPDATE」，
@@ -29,16 +29,16 @@ import (
 // 和「状态已被别人改过」之间无从下手。
 var ErrPreconditionFailed = errors.New("store: 前置条件不满足")
 
-// VolcKeyPatch 是一次 Key 元数据的局部更新意图。
+// UpstreamKeyPatch 是一次 Key 元数据的局部更新意图。
 //
 // 指针为 nil 表示「调用方未提供该字段」，该列一律不参与更新。
 //
 // 用指针而非零值判空是硬要求: status 的空串与「字段缺席」在 encoding/json
 // 解成 string 之后不可区分，据零值判断会把「请求里没提 status」当成
-// 「要把 status 清空」。这与 UpsertVolcKey 注释里记的 EXCLUDED 被 VALUES
+// 「要把 status 清空」。这与 UpsertUpstreamKey 注释里记的 EXCLUDED 被 VALUES
 // 兜底污染是同一类缺陷 —— 都是无法区分未提供与空值，后果都是静默改写
 // 不该改的列。
-type VolcKeyPatch struct {
+type UpstreamKeyPatch struct {
 	Status    *string
 	Pool      *string
 	PersonaID *string
@@ -58,15 +58,15 @@ type VolcKeyPatch struct {
 //
 // 三个可改字段全部缺席时调用方应当报错而不是返回成功: 否则调用方无法
 // 区分「改了」与「什么都没改」。
-func (p VolcKeyPatch) HasFieldUpdate() bool {
+func (p UpstreamKeyPatch) HasFieldUpdate() bool {
 	return p.Status != nil || p.Pool != nil || p.PersonaID != nil
 }
 
-// VolcKeyPatchResult 是一次局部更新的新旧值对照。
+// UpstreamKeyPatchResult 是一次局部更新的新旧值对照。
 //
 // 回显旧值而非只回显新值: 运维需要「改之前确实是那个值」的凭据，
 // 且只记新值的审计无法回答「这个 Key 是什么时候从 active 变成 banned 的」。
-type VolcKeyPatchResult struct {
+type UpstreamKeyPatchResult struct {
 	PrevStatus    string
 	PrevPool      string
 	PrevPersonaID string
@@ -75,7 +75,7 @@ type VolcKeyPatchResult struct {
 	NewPersonaID  string
 }
 
-// PatchVolcKeyState 原子地局部更新 Key 的 status / pool / persona_id。
+// PatchUpstreamKeyState 原子地局部更新 Key 的 status / pool / persona_id。
 //
 // 返回值约定:
 //   - 成功: (结果, nil)
@@ -94,7 +94,7 @@ type VolcKeyPatchResult struct {
 //
 //	health_score 不在此处，它是运行时观测值，人工改写会立刻被下一次
 //	成功/失败请求覆盖，只会给运维「改了但没用」的错觉。
-func (s *Store) PatchVolcKeyState(ctx context.Context, keyID string, p VolcKeyPatch) (*VolcKeyPatchResult, error) {
+func (s *Store) PatchUpstreamKeyState(ctx context.Context, keyID string, p UpstreamKeyPatch) (*UpstreamKeyPatchResult, error) {
 	if keyID == "" {
 		return nil, errors.New("store: key_id 不能为空")
 	}
@@ -124,17 +124,17 @@ func (s *Store) PatchVolcKeyState(ctx context.Context, keyID string, p VolcKeyPa
 	//
 	// 已实测: 条件在 old 上时两个并发 CAS 都返回 1 行（都成功、互相覆盖）；
 	// 条件改到 t 上时后到者返回 0 行。回归测试见
-	// TestPatchVolcKeyState_并发下乐观并发控制严格成立。
+	// TestPatchUpstreamKeyState_并发下乐观并发控制严格成立。
 	//
 	// t.status 出现在 WHERE 里读到的是本行更新前的值，语义上正是「当前值」，
 	// 与判定意图一致。
 	row := s.pool.QueryRow(ctx, `
-		UPDATE volc_keys AS t
+		UPDATE upstream_keys AS t
 		   SET status     = COALESCE($2::text, t.status),
 		       pool       = COALESCE($3::text, t.pool),
 		       persona_id = COALESCE($4::text, t.persona_id),
 		       updated_at = now()
-		  FROM volc_keys AS old
+		  FROM upstream_keys AS old
 		 WHERE t.key_id = old.key_id
 		   AND t.key_id = $1
 		   AND ($5::text   IS NULL OR t.status = $5::text)
@@ -143,7 +143,7 @@ func (s *Store) PatchVolcKeyState(ctx context.Context, keyID string, p VolcKeyPa
 		          t.status, t.pool, t.persona_id`,
 		keyID, p.Status, p.Pool, p.PersonaID, p.ExpectedStatus, reject)
 
-	var out VolcKeyPatchResult
+	var out UpstreamKeyPatchResult
 	err := row.Scan(&out.PrevStatus, &out.PrevPool, &out.PrevPersonaID,
 		&out.NewStatus, &out.NewPool, &out.NewPersonaID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -155,15 +155,15 @@ func (s *Store) PatchVolcKeyState(ctx context.Context, keyID string, p VolcKeyPa
 	return &out, nil
 }
 
-// explainPatchMiss 判定 PatchVolcKeyState 未命中的原因。
+// explainPatchMiss 判定 PatchUpstreamKeyState 未命中的原因。
 //
 // 这次补查不构成竞态隐患: 无论期间该行是否被别人改动，两种结论
 // （不存在 → 404、存在但条件不满足 → 409）都是当时真实发生过的事实，
 // 而关键的「不误改」已由上一条 SQL 的原子条件保证。
-func (s *Store) explainPatchMiss(ctx context.Context, keyID string) (*VolcKeyPatchResult, error) {
-	var cur VolcKeyPatchResult
+func (s *Store) explainPatchMiss(ctx context.Context, keyID string) (*UpstreamKeyPatchResult, error) {
+	var cur UpstreamKeyPatchResult
 	err := s.pool.QueryRow(ctx,
-		`SELECT status, pool, persona_id FROM volc_keys WHERE key_id = $1`, keyID).
+		`SELECT status, pool, persona_id FROM upstream_keys WHERE key_id = $1`, keyID).
 		Scan(&cur.PrevStatus, &cur.PrevPool, &cur.PrevPersonaID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

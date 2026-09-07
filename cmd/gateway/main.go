@@ -34,6 +34,7 @@ import (
 
 	"github.com/fluxkeys/fluxkeys/internal/adapter"
 	"github.com/fluxkeys/fluxkeys/internal/config"
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/gateway"
 	"github.com/fluxkeys/fluxkeys/internal/metrics"
@@ -79,11 +80,17 @@ func run() error {
 		return fmt.Errorf("配置校验: %w", err)
 	}
 
+	// 收集 provider 名称
+	providers := make([]string, 0, len(cfg.Providers))
+	for name := range cfg.Providers {
+		providers = append(providers, name)
+	}
+	
 	log.Info("fluxkeys 启动",
 		"version", version,
 		"addr", cfg.Server.Addr,
 		"egress_mode", cfg.Egress.Mode,
-		"upstream", cfg.Upstream.VolcBaseURL,
+		"providers", providers,
 		"quota_day", quota.QuotaDay(time.Now()),
 	)
 
@@ -147,6 +154,13 @@ func run() error {
 		log.Info("数据库迁移完成")
 	}
 
+	// provider 配置首次入库。必须在迁移之后、装配之前 ——
+	// 表空时若不 seed，进程会带着零个 provider 正常启动，
+	// healthz/readyz 全绿而所有业务请求失败。详见 provider_seed.go。
+	if _, err := seedProviderConfigs(ctx, st, cfg, log); err != nil {
+		return fmt.Errorf("导入 provider 配置: %w", err)
+	}
+
 	// ===== 4. 出口池 =====
 	pool, err := buildEgressPool(cfg)
 	if err != nil {
@@ -157,7 +171,7 @@ func run() error {
 	// 为已有 Key 恢复绑定。Bind 用哈希做确定性分配，重启后同一 Key 仍落到
 	// 同一 IP —— 出口 IP 漂移会让火山侧看到「同一账号换了机器」。
 	if pool.Mode() == egress.ModeMultiIP {
-		if err := restoreBindings(ctx, st, pool, log); err != nil {
+		if err := restoreBindings(ctx, st, pool, cfg.Server.ShardID, log); err != nil {
 			return fmt.Errorf("恢复 Key-IP 绑定: %w", err)
 		}
 	}
@@ -169,9 +183,31 @@ func run() error {
 		}
 	}
 
-	// ===== 5. 调度器 =====
+	// ===== 5. 配置快照 =====
+	//
+	// 所有 provider 相关的读取都经由它，热切时整体原子替换。
+	//
+	// 建在调度器之前: 调度器、后台任务、网关三方必须拿到同一个 Holder，
+	// 各自留一份配置副本就等于各自在不同时刻定格 —— 热切后三者行为不一致，
+	// 而每一方单看都正常。version 从 0 起，由热加载路径接管后覆盖。
+	snaps, err := confsnap.NewHolderFromConfig(cfg, 0)
+	if err != nil {
+		return fmt.Errorf("构建配置快照: %w", err)
+	}
+
+	// ===== 6. 调度器 =====
+	//
+	// 存储包一层分片作用域: ShardID 非空时调度器只装载本机分片的 Key。
+	// 多机部署下每台机器持有独立的 Key 分片与出口 IP 池，Key 跟着 IP 走、
+	// 永不跨机 —— 跨机等于换出口，正是风控最敏感的「老账号换 IP」信号。
+	// ShardID 为空时透传，单机行为不变。
+	schedStore := shardScopedStore{st: st, shard: cfg.Server.ShardID}
+	if cfg.Server.ShardID != "" {
+		log.Info("多机分片模式已启用", "shard_id", cfg.Server.ShardID)
+		warnUnshardedKeys(ctx, st, log)
+	}
 	qr := quotaReader{qm: qm}
-	sched := scheduler.New(cfg.Scheduler, cfg.Quota, st, qr)
+	sched := scheduler.New(confsnap.SchedConfig{H: snaps}, schedStore, qr)
 
 	// 注入出口只读视图，启用出口级最小间隔约束。
 	//
@@ -203,7 +239,7 @@ func run() error {
 	poolSize := sched.PoolSize()
 	if poolSize == 0 {
 		log.Warn("Key 池为空，网关将对所有业务请求返回 503；" +
-			"请通过 POST /admin/keys 导入火山 Key")
+			"请通过 POST /admin/keys 导入上游 Key")
 	} else {
 		// 两个口径都打: 池子总量决定日配额总额，此刻可调度量决定当下吞吐。
 		// 启用画像时后者会随时段浮动，只报总量会让人高估容量。
@@ -225,14 +261,11 @@ func run() error {
 
 	schedAdapter := &schedulerAdapter{
 		sched: sched, st: st, qm: qm,
-		cfg: quotaLimits{
-			TokenHard: cfg.Quota.TokenHard(),
-			CountHard: cfg.Quota.CountHard(),
-		},
+		cfg: quotaLimits{snaps: snaps},
 	}
 	storeAdapter := &storeAdapter{st: st}
 
-	// ===== 6. 后台任务 =====
+	// ===== 7. 后台任务 =====
 	//
 	// 全部后台循环统一由 background 托管（见 background.go）。这里不再单独
 	// 起 reap/refresh 协程 —— 那样会让租约回收同时跑两遍，更要紧的是两套
@@ -248,14 +281,22 @@ func run() error {
 	//                    可用额度逐日缩水直到该 Key 完全不可用。
 	//   - refresh_probe: P0-4 刷新探测。不跑则 12:00 后不会恢复调度。
 	bg := newBackground(bgDeps{
-		cfg: cfg, qm: qm, st: st, sched: sched,
+		snaps: snaps, qm: qm, st: st, sched: sched,
 		pool: pool, metrics: m, log: log,
+		shard: cfg.Server.ShardID,
 	})
-	bg.start(ctx)
+	if err := bg.start(ctx); err != nil {
+		return fmt.Errorf("启动后台任务: %w", err)
+	}
 
-	// ===== 7. HTTP 服务 =====
+	// ===== 8. HTTP 服务 =====
+	//
+	// adapter registry 不在这里建 —— 它由 confsnap.Build 与 config 绑成同一个
+	// 快照对象。两处分别构造会让热切后出现「换了 base_url 但 adapter 还持着
+	// 旧 model_mapping」，请求会带着错误的模型名成功发出去。
 	srv, err := gateway.New(gateway.Deps{
 		Config:  cfg,
+		Snaps:   snaps,
 		Quota:   qm,
 		Egress:  pool,
 		Sched:   schedAdapter,
@@ -263,7 +304,6 @@ func run() error {
 		Limiter: limiter,
 		Metrics: m,
 		Logger:  log,
-		Adapter: adapter.NewVolc(cfg.Upstream.ModelMapping),
 		RedisPing: func(ctx context.Context) error {
 			return rdb.Ping(ctx).Err()
 		},
@@ -283,7 +323,7 @@ func run() error {
 		log.Info("指标端点已监听", "addr", cfg.Server.MetricsAddr, "path", "/metrics")
 	}
 
-	// ===== 8. 等待退出 =====
+	// ===== 9. 等待退出 =====
 	select {
 	case <-ctx.Done():
 		log.Info("收到退出信号，开始优雅关闭")
@@ -373,9 +413,16 @@ func buildEgressPool(cfg *config.Config) (*egress.Pool, error) {
 // 而候选集会随 IP 增删、封禁、绑定顺序而变化。只有采纳 volc_keys.egress_ip
 // 里的历史值，才能让 Key 在重启、扩容、故障恢复后仍走同一个出口。
 //
+// shard 非空时只恢复本机分片的 Key: 别的分片的 Key 绑的是别的机器的 IP，
+// 本机出口池里根本没有那些地址，尝试 Adopt 只会打出一排误导性的
+// 「绑定无法沿用，将重新分配」告警，然后把它错绑到本机 IP 上。
+//
 // 新分配的绑定会写回库中，使其在下次启动时成为「历史值」。
-func restoreBindings(ctx context.Context, st *store.Store, pool *egress.Pool, log *slog.Logger) error {
-	keys, err := st.ListVolcKeys(ctx, store.VolcKeyFilter{Status: store.VolcStatusActive})
+func restoreBindings(ctx context.Context, st *store.Store, pool *egress.Pool, shard string, log *slog.Logger) error {
+	keys, err := st.ListUpstreamKeys(ctx, store.UpstreamKeyFilter{
+		Status: store.KeyStatusActive,
+		Shard:  shard,
+	})
 	if err != nil {
 		return err
 	}
@@ -407,7 +454,7 @@ func restoreBindings(ctx context.Context, st *store.Store, pool *egress.Pool, lo
 		// 写回库中，让本次分配在下次启动时成为可沿用的历史值。
 		// 失败不阻断启动 —— 本次运行的绑定已在内存中生效。
 		if addr != "" {
-			if err := st.UpdateVolcKeyState(ctx, k.KeyID, store.VolcKeyState{EgressIP: &addr}); err != nil {
+			if err := st.UpdateUpstreamKeyState(ctx, k.KeyID, store.UpstreamKeyState{EgressIP: &addr}); err != nil {
 				log.Warn("出口绑定写回失败，重启后可能改绑",
 					"key_id", k.KeyID, "egress_ip", addr, "error", err)
 			}
@@ -421,15 +468,50 @@ func restoreBindings(ctx context.Context, st *store.Store, pool *egress.Pool, lo
 	return nil
 }
 
+// warnUnshardedKeys 在分片模式下告警尚未指派归属的活跃 Key。
+//
+// 存在的理由: 分片过滤是严格的，未指派的 Key 不会被任何实例装载 —— 它们
+// 静默地从池中消失，而每台机器单看都「正常装载了自己的 Key」。这个盲区
+// 只能靠启动时主动报出来。
+//
+// 只告警不自动指派: 自动分配会把 Key 绑到一台机器的出口 IP 上，而这个
+// 决定是不可逆的（改绑等于换出口）。这种决定必须由运维显式做出。
+//
+// 查询失败仅记日志: 这是可观测性辅助，不该阻断启动。
+func warnUnshardedKeys(ctx context.Context, st *store.Store, log *slog.Logger) {
+	keys, err := st.ListUpstreamKeys(ctx, store.UpstreamKeyFilter{Status: store.KeyStatusActive})
+	if err != nil {
+		log.Warn("检查未指派分片的 Key 失败", "error", err)
+		return
+	}
+	var orphans []string
+	for _, k := range keys {
+		if k.Shard == "" {
+			orphans = append(orphans, k.KeyID)
+		}
+	}
+	if len(orphans) == 0 {
+		return
+	}
+	sample := orphans
+	if len(sample) > 10 {
+		sample = sample[:10]
+	}
+	log.Warn("存在未指派机器归属的活跃 Key，它们不会被任何实例装载；"+
+		"请用 POST /admin/keys/shard 指派",
+		"count", len(orphans), "sample", sample)
+}
+
 // verifyEgress 校验每个出口 IP 的实际连通性。
 //
 // 这是 P1-6 的启动护栏。multi_ip 模式下云厂商绑定辅助私网 IP 后，OS 既不会
 // 自动配置到网卡也不会建策略路由，此时 LocalAddr 绑定会失败或流量回落到
 // 主 IP —— 两种情况都不会有任何报错，只是「不生效」。
 func verifyEgress(ctx context.Context, cfg *config.Config, pool *egress.Pool, log *slog.Logger) error {
-	target := cfg.Egress.VerifyTarget
+	target := cfg.EgressVerifyTarget()
 	if target == "" {
-		log.Warn("egress.verify_on_start 已开启但未设置 verify_target，跳过自检")
+		log.Warn("egress.verify_on_start 已开启，但未设置 verify_target 且无法从 provider " +
+			"base_url 推导自检目标，跳过自检")
 		return nil
 	}
 
@@ -457,7 +539,7 @@ func verifyEgress(ctx context.Context, cfg *config.Config, pool *egress.Pool, lo
 	return nil
 }
 
-// newProbe 构造刷新探测函数。
+// newProbes 按 provider 构造刷新探测函数。
 //
 // 探测的语义是「问上游: 这个 Key 的额度恢复了吗」。实现方式是发一个最小
 // 成本的真实请求:
@@ -467,18 +549,65 @@ func verifyEgress(ctx context.Context, cfg *config.Config, pool *egress.Pool, lo
 //
 // 关键点是绝不按时间推测（P0-4）。V3 的做法是「到点了就认为刷新完成并清零
 // 本地计数」，若火山实际还没重置，恢复调度的瞬间就是超刷。
-func newProbe(cfg *config.Config, st *store.Store, pool *egress.Pool, log *slog.Logger) quota.Probe {
-	ad := adapter.NewVolc(cfg.Upstream.ModelMapping)
+//
+// 一个 provider 一个探测器，而不是共用一个。此前的实现是
+// `for _, p := range cfg.Providers { mapping = p.ModelMapping; break }`，
+// 靠 map 遍历取「第一个」provider 的映射去探测所有上游的 Key —— 而 Go 的
+// map 遍历顺序是随机的，实际每次启动随机挑一个。后果是探测请求带着 A 上游的
+// 模型名打到 B 上游: B 大概率返回「模型不存在」，被归入「其他错误」分支，
+// 于是恒返回未恢复。表现就是刷新窗口过后 B 的 Key 迟迟不恢复调度，而日志里
+// 只有一条「探测返回非配额错误」，看不出根因是模型名串了上游。
+//
+// adapter 也从快照的 registry 取，不再一律 NewVolc —— 探测请求的鉴权头格式
+// 各家不同，用错 adapter 会拿到 401，同样落进「其他错误」分支。
+func newProbes(snap *confsnap.Snapshot, st *store.Store, pool *egress.Pool,
+	log *slog.Logger) (map[string]quota.Probe, error) {
+
+	out := make(map[string]quota.Probe, len(snap.Cfg.Providers))
+	for name := range snap.Cfg.Providers {
+		ad, err := snap.Adapters.Get(name)
+		if err != nil {
+			return nil, fmt.Errorf("构造 %s 的探测器: %w", name, err)
+		}
+		out[name] = newProbe(name, ad, snap, st, pool, log)
+	}
+	return out, nil
+}
+
+// newProbe 构造单个 provider 的探测函数。
+//
+// snap 从参数传入并被闭包捕获: 探测器是常驻协程，捕获快照而非 Holder 保证
+// 它整个生命周期内用的是同一份配置。配置变了由 reconcileRefreshers 重建，
+// 而不是让运行中的探测器自己去读新值 —— 后者会出现「新 base_url 配旧
+// model_mapping」的混合态，而探测失败在这条路径上是静默的。
+func newProbe(providerName string, ad adapter.Adapter, snap *confsnap.Snapshot,
+	st *store.Store, pool *egress.Pool, log *slog.Logger) quota.Probe {
+
+	cfg := snap.Cfg
 
 	return func(ctx context.Context, keyID string) (bool, error) {
 		// WithSecret 为 true: 探测需要真实调用上游，必须解密。
-		key, err := st.GetVolcKey(ctx, keyID)
+		key, err := st.GetUpstreamKey(ctx, keyID)
 		if err != nil {
 			return false, fmt.Errorf("读取 Key %s: %w", keyID, err)
 		}
+
+		// 守卫错配: 这个探测器只认自己那个 provider 的 Key。调度侧若因某种
+		// 原因把别家的 Key 传进来，宁可报错也不能拿错误的模型名去打上游。
+		if key.Provider != providerName {
+			return false, fmt.Errorf("Key %s 属于 provider %s，不能用 %s 的探测器",
+				keyID, key.Provider, providerName)
+		}
+
 		secret, err := st.Cipher().DecryptSecret(key.SecretEnc)
 		if err != nil {
 			return false, fmt.Errorf("解密 Key %s: %w", keyID, err)
+		}
+
+		// 获取该 Key 所属 provider 的 BaseURL
+		provider, ok := cfg.Providers[key.Provider]
+		if !ok {
+			return false, fmt.Errorf("Key %s 的 provider %s 在配置中不存在", keyID, key.Provider)
 		}
 
 		// 必须用该 Key 自己的出口客户端 —— 探测请求走错 IP 等于
@@ -488,11 +617,17 @@ func newProbe(cfg *config.Config, st *store.Store, pool *egress.Pool, log *slog.
 			return false, fmt.Errorf("获取出口客户端 %s: %w", keyID, err)
 		}
 
-		body := probeBody(cfg)
-		path := ad.UpstreamPath(adapter.EndpointChat)
+		// 走 TransformRequest 而非自己拼路径: 它同时负责把对外模型名按该
+		// provider 的 model_mapping 换成上游真实模型名。绕过它就等于拿
+		// 对外名去打上游，上游返回「模型不存在」，被归入非配额错误 ——
+		// 探测于是恒返回未恢复，而这条路径不会报任何错。
+		path, body, err := ad.TransformRequest(adapter.EndpointChat, []byte(probeBody(cfg)))
+		if err != nil {
+			return false, fmt.Errorf("构造 %s 的探测请求体: %w", providerName, err)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			strings.TrimRight(cfg.Upstream.VolcBaseURL, "/")+path,
-			strings.NewReader(body))
+			strings.TrimRight(provider.BaseURL, "/")+path,
+			strings.NewReader(string(body)))
 		if err != nil {
 			return false, err
 		}

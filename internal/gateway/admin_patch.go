@@ -42,7 +42,7 @@ var (
 // 三个可改字段与 expected_status 全部用 *string: nil 表示调用方没提这个
 // 字段。这是本端点最容易写错的地方 —— 用 string 的话，`{"status":""}`
 // 与请求体里根本没有 status 解出来完全一样，服务端会把「没提」当成
-// 「改成空串」。与 UpsertVolcKey 踩过的 EXCLUDED 被 VALUES 兜底污染同型:
+// 「改成空串」。与 UpsertUpstreamKey 踩过的 EXCLUDED 被 VALUES 兜底污染同型:
 // 都是无法区分未提供与空值，后果都是静默改写不该改的字段。
 type patchKeyRequest struct {
 	Status    *string `json:"status"`
@@ -92,7 +92,7 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		patch.RejectStatusFrom = terminalKeyStatuses
 	}
 
-	res, err := s.store.PatchVolcKeyState(r.Context(), keyID, patch)
+	res, err := s.store.PatchUpstreamKeyState(r.Context(), keyID, patch)
 	switch {
 	case errors.Is(err, ErrKeyNotFound):
 		s.writeError(w, r, http.StatusNotFound, "invalid_request", "Key 不存在: "+keyID)

@@ -455,3 +455,74 @@ func TestDefault_默认启用封禁恢复(t *testing.T) {
 			cfg.Egress.BanCooldownMax, cfg.Egress.BanCooldown)
 	}
 }
+
+// deploy/.env.example 里写的推理预扣旋钮必须真的能生效，否则运维改了没反应。
+func TestApplyEnv_推理预扣参数(t *testing.T) {
+	t.Setenv("QUOTA_REASONING_OUTPUT_MULTIPLIER", "4.5")
+	t.Setenv("QUOTA_REASONING_FLOOR_TOKENS", "2048")
+
+	cfg := Default()
+	applyEnv(cfg)
+
+	if cfg.Quota.ReasoningOutputMultiplier != 4.5 {
+		t.Errorf("ReasoningOutputMultiplier = %v, 期望 4.5",
+			cfg.Quota.ReasoningOutputMultiplier)
+	}
+	if cfg.Quota.ReasoningFloorTokens != 2048 {
+		t.Errorf("ReasoningFloorTokens = %d, 期望 2048",
+			cfg.Quota.ReasoningFloorTokens)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("环境变量覆盖后配置应仍合法: %v", err)
+	}
+}
+
+// 非法值必须被拦住：系数小于 1 会让推理模型预扣低于常规模型，
+// 与该系数的设计意图完全相反，属于静默失效。
+func TestValidate_推理预扣参数下限(t *testing.T) {
+	cases := []struct {
+		multiplier float64
+		floor      int64
+		wantErr    bool
+		why        string
+	}{
+		{3.0, 1024, false, "默认值"},
+		{1.0, 0, false, "1.0 等价于不额外放大，是允许的下限"},
+		{0.5, 1024, true, "小于 1 会缩小预扣，与设计意图相反"},
+		{0, 1024, true, "0 会让输出部分预扣归零"},
+		{3.0, -1, true, "负下限无意义"},
+	}
+	for _, c := range cases {
+		cfg := Default()
+		cfg.Quota.ReasoningOutputMultiplier = c.multiplier
+		cfg.Quota.ReasoningFloorTokens = c.floor
+		err := cfg.Validate()
+		if c.wantErr && err == nil {
+			t.Errorf("multiplier=%v floor=%d 应报错（%s）",
+				c.multiplier, c.floor, c.why)
+		}
+		if !c.wantErr && err != nil {
+			t.Errorf("multiplier=%v floor=%d 不应报错（%s）: %v",
+				c.multiplier, c.floor, c.why, err)
+		}
+	}
+}
+
+// 环境变量传入垃圾值时应保持默认，而非污染成 0 导致预扣归零。
+func TestApplyEnv_推理预扣非法值保持默认(t *testing.T) {
+	t.Setenv("QUOTA_REASONING_OUTPUT_MULTIPLIER", "abc")
+	t.Setenv("QUOTA_REASONING_FLOOR_TOKENS", "not-a-number")
+
+	def := Default()
+	cfg := Default()
+	applyEnv(cfg)
+
+	if cfg.Quota.ReasoningOutputMultiplier != def.Quota.ReasoningOutputMultiplier {
+		t.Errorf("非法值不应改动默认系数，得到 %v",
+			cfg.Quota.ReasoningOutputMultiplier)
+	}
+	if cfg.Quota.ReasoningFloorTokens != def.Quota.ReasoningFloorTokens {
+		t.Errorf("非法值不应改动默认下限，得到 %d",
+			cfg.Quota.ReasoningFloorTokens)
+	}
+}

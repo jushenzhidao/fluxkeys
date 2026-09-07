@@ -50,19 +50,22 @@ type RefresherConfig struct {
 
 // Refresher 管理配额刷新窗口。
 //
-// P0-4 的核心设计: 刷新发生在火山侧，系统无法控制其发生时刻，只能探测
-// 「是否已刷新」。V3 按时间推测刷新完成并清零本地 used，若火山实际尚未
+// P0-4 的核心设计: 刷新发生在上游侧，系统无法控制其发生时刻，只能探测
+// 「是否已刷新」。V3 按时间推测刷新完成并清零本地 used，若上游实际尚未
 // 重置就恢复调度，会直接超刷。
 //
 // 因此本实现遵循两条铁律:
 //  1. 只有探测到成功响应才认为已刷新，绝不按时间推测；
-//  2. stagger_offset 作用于「恢复调度的时刻」，不是「火山刷新的时刻」。
+//  2. stagger_offset 作用于「恢复调度的时刻」，不是「上游刷新的时刻」。
+//
+// 每个 provider 应独立创建一个 Refresher 实例。
 type Refresher struct {
-	cfg   RefresherConfig
-	qm    *Manager
-	probe Probe
-	list  KeyLister
-	log   *slog.Logger
+	provider string
+	cfg      RefresherConfig
+	qm       *Manager
+	probe    Probe
+	list     KeyLister
+	log      *slog.Logger
 
 	mu     sync.RWMutex
 	states map[string]RefreshState
@@ -74,8 +77,8 @@ type Refresher struct {
 	now func() time.Time
 }
 
-// NewRefresher 构造刷新探测器。
-func NewRefresher(cfg RefresherConfig, qm *Manager, probe Probe, list KeyLister, log *slog.Logger) *Refresher {
+// NewRefresher 构造刷新探测器。每个 provider 应独立创建一个实例。
+func NewRefresher(provider string, cfg RefresherConfig, qm *Manager, probe Probe, list KeyLister, log *slog.Logger) *Refresher {
 	if cfg.ProbeInterval <= 0 {
 		cfg.ProbeInterval = 5 * time.Minute
 	}
@@ -86,7 +89,8 @@ func NewRefresher(cfg RefresherConfig, qm *Manager, probe Probe, list KeyLister,
 		log = slog.Default()
 	}
 	return &Refresher{
-		cfg: cfg, qm: qm, probe: probe, list: list, log: log,
+		provider: provider,
+		cfg:      cfg, qm: qm, probe: probe, list: list, log: log,
 		states:    make(map[string]RefreshState),
 		rampUntil: make(map[string]time.Time),
 		lastProbe: make(map[string]time.Time),
@@ -243,12 +247,46 @@ func (r *Refresher) Tick(ctx context.Context) error {
 	return nil
 }
 
+// UpdateLimits 就地替换刷新确认后要写回的水位，不重建实例。
+//
+// 存在的理由: 存量 provider 改了 quota_limit 或水位系数后，若靠重建 Refresher
+// 来生效，会连带清空状态机（states / rampUntil / lastProbe）。重建若恰好落在
+// 刷新窗口内，全部 Key 从 confirmed 退回 idle 再走一遍 pending → probing ——
+// 而 pending 状态是不承接流量的，等于用一次「必然中断刷新流程」去换一次配置
+// 生效。就地更新没有这个代价。
+//
+// 就地换值安全的前提: 这两个字段只在 confirm 写回时被读，不参与状态机推进，
+// 因此中途换值不会让状态机进入不一致状态。
+//
+// 不更新 WindowStart / WindowEnd / ProbeInterval / RampDuration: 这四项参与
+// 状态机判定，且来自全局 refresh.* 配置，不在本期热加载范围内。改它们需重启
+// 网关 —— reconcileRefreshers 会为此打 WARN。
+func (r *Refresher) UpdateLimits(token, count Limits) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg.TokenLimits = token
+	r.cfg.CountLimits = count
+}
+
+// limitsFor 在读锁下取当次写回要用的水位。
+//
+// 必须加锁: UpdateLimits 可能与 confirm 并发（前者在 reconcile 协程、后者在
+// 探测协程），裸读 r.cfg 会与写侧构成数据竞争。
+func (r *Refresher) limitsFor() (token, count Limits) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg.TokenLimits, r.cfg.CountLimits
+}
+
 // confirm 在探测确认后清零配额并进入限速期。
 func (r *Refresher) confirm(ctx context.Context, keyID string, now time.Time) error {
-	if err := r.qm.MarkRefreshed(ctx, keyID, KindToken, r.cfg.TokenLimits); err != nil {
+	// 两路水位一次取齐。分两次取会让 token 用旧值、count 用新值,
+	// 同一个 Key 的两个量纲落在不同配置版本上。
+	tokenLim, countLim := r.limitsFor()
+	if err := r.qm.MarkRefreshed(ctx, r.provider, keyID, KindToken, tokenLim); err != nil {
 		return err
 	}
-	if err := r.qm.MarkRefreshed(ctx, keyID, KindCount, r.cfg.CountLimits); err != nil {
+	if err := r.qm.MarkRefreshed(ctx, r.provider, keyID, KindCount, countLim); err != nil {
 		return err
 	}
 	r.mu.Lock()

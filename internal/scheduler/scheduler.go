@@ -47,6 +47,8 @@ var ErrNoCandidate = errors.New("scheduler: 无可用 Key")
 
 // Request 是一次调度请求的输入。
 type Request struct {
+	// Provider 是上游服务商，调度器按此过滤 Key 池。
+	Provider string
 	// Model 是对外模型名，用于 persona 偏好匹配。
 	Model string
 	// Kind 是计费类型，决定读取哪一套配额快照。
@@ -94,6 +96,7 @@ const (
 type keyEntry struct {
 	keyID     string
 	secret    string
+	provider  string // 上游服务商
 	egressIP  string
 	pool      string
 	dbStatus  string
@@ -116,8 +119,8 @@ func (e keyEntry) poolOf() string {
 
 // Store 是调度器对持久化层的最小依赖，便于测试替换。
 type Store interface {
-	ListVolcKeys(ctx context.Context, filter store.VolcKeyFilter) ([]store.VolcKey, error)
-	GetKeyHistory(ctx context.Context, keyIDs []string, quotaDay time.Time) (map[string]store.KeyDailyHistory, error)
+	ListUpstreamKeys(ctx context.Context, filter store.UpstreamKeyFilter) ([]store.UpstreamKey, error)
+	GetKeyHistory(ctx context.Context, keyIDs []string, quotaDay time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error)
 }
 
 // QuotaReader 是调度器对配额层的最小依赖（只读！）。
@@ -125,7 +128,7 @@ type Store interface {
 // 这个接口刻意只暴露读方法: 从类型上就断绝调度器写配额的可能，
 // 让 P0-1 的约束由编译器而非注释来保证。
 type QuotaReader interface {
-	GetMany(ctx context.Context, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error)
+	GetMany(ctx context.Context, provider string, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error)
 }
 
 // EgressReader 是调度器对出口层的最小依赖（只读！）。
@@ -142,10 +145,50 @@ type EgressReader interface {
 	LastUsedOn(keyID string) time.Time
 }
 
+// ConfigSource 提供调度所需的配置读取。
+//
+// 定成接口而非直接持 config 值，是为了让配置能热切。此前 Scheduler 持的是
+// config.Scheduler 值拷贝，New 也按值传 —— 热切后调度器手里仍是启动那一刻的
+// 副本，权重、画像开关、水位改了全都不生效，而管理页面会照常显示「配置已
+// 生效」。操作成功但系统行为与用户心智模型不符，是这里最不能接受的失效。
+//
+// 由调用方（cmd/gateway 的装配层）用配置快照实现，调度器不认识 confsnap，
+// 也就不会因此间接依赖 adapter。
+type ConfigSource interface {
+	// Scheduler 返回当前生效的调度配置。
+	Scheduler() config.Scheduler
+	// Quota 返回当前生效的全局配额配置。
+	Quota() config.Quota
+	// LimitsFor 返回指定 provider 在该量纲下的软硬水位。
+	LimitsFor(provider string, kindCount bool) (hard, soft int64)
+	// IsCountProvider 判断该 provider 的额度量纲是否为「按次」。
+	IsCountProvider(provider string) bool
+}
+
+// StaticConfig 是固定不变的配置源，包一份 *config.Config。
+//
+// 仅供测试与一次性工具使用。生产装配必须传基于配置快照的实现 ——
+// 用这个等于把启动时的配置钉死，正是 ConfigSource 要解决的问题。
+//
+// 水位与量纲一律委托给 config.Config 的既有方法，不在这里重算: 那两处
+// 「provider 额度优先、比例取全局」的规则改了以后，复制品不会跟着改，
+// 而两边算出来的都是正常数字，对不上也没人会发现。
+type StaticConfig struct{ Cfg *config.Config }
+
+func (s StaticConfig) Scheduler() config.Scheduler { return s.Cfg.Scheduler }
+func (s StaticConfig) Quota() config.Quota         { return s.Cfg.Quota }
+
+func (s StaticConfig) LimitsFor(provider string, kindCount bool) (int64, int64) {
+	return s.Cfg.LimitsFor(provider, kindCount)
+}
+
+func (s StaticConfig) IsCountProvider(provider string) bool {
+	return s.Cfg.IsCountProvider(provider)
+}
+
 // Scheduler 是调度引擎。
 type Scheduler struct {
-	cfg    config.Scheduler
-	quotaC config.Quota
+	conf   ConfigSource
 	st     Store
 	qr     QuotaReader
 	health *healthTable
@@ -158,9 +201,9 @@ type Scheduler struct {
 	now func() time.Time
 
 	mu      sync.RWMutex
-	keys    []keyEntry                               // 活跃池静态元数据
-	history map[string]store.KeyDailyHistory         // 昨日归档
-	snaps   map[quota.Kind]map[string]quota.Snapshot // 配额快照（只读用于排序）
+	keys    []keyEntry                                 // 活跃池静态元数据
+	history map[store.HistoryKey]store.KeyDailyHistory // 昨日归档
+	snaps   map[quota.Kind]map[string]quota.Snapshot   // 配额快照（只读用于排序）
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
@@ -171,16 +214,15 @@ type Scheduler struct {
 }
 
 // New 创建调度器。调用方需自行调用 Reload 装载 Key，并按需 Start 后台刷新。
-func New(cfg config.Scheduler, quotaCfg config.Quota, st Store, qr QuotaReader) *Scheduler {
+func New(conf ConfigSource, st Store, qr QuotaReader) *Scheduler {
 	now := time.Now
 	return &Scheduler{
-		cfg:     cfg,
-		quotaC:  quotaCfg,
+		conf:    conf,
 		st:      st,
 		qr:      qr,
 		health:  newHealthTable(now),
 		now:     now,
-		history: map[string]store.KeyDailyHistory{},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
 		snaps:   map[quota.Kind]map[string]quota.Snapshot{},
 		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		stopCh:  make(chan struct{}),
@@ -222,10 +264,11 @@ func (s *Scheduler) SetRandSource(seed int64) {
 // 装载而非每次请求查库: Key 元数据变化频率是"天"级（人工增删 Key），
 // 而请求是 20 QPS。每请求查一次库纯属浪费。
 func (s *Scheduler) Reload(ctx context.Context) error {
-	rows, err := s.st.ListVolcKeys(ctx, store.VolcKeyFilter{
-		Status:     store.VolcStatusActive,
+	conf := s.conf
+	rows, err := s.st.ListUpstreamKeys(ctx, store.UpstreamKeyFilter{
+		Status:     store.KeyStatusActive,
 		WithSecret: true,
-		Limit:      s.cfg.ActivePoolSize,
+		Limit:      conf.Scheduler().ActivePoolSize,
 	})
 	if err != nil {
 		return fmt.Errorf("scheduler: 装载 Key 池: %w", err)
@@ -234,10 +277,21 @@ func (s *Scheduler) Reload(ctx context.Context) error {
 	entries := make([]keyEntry, 0, len(rows))
 	keyIDs := make([]string, 0, len(rows))
 	for _, r := range rows {
-		hard, soft := s.quotaC.TokenHard(), s.quotaC.TokenSoft()
+		// 水位必须按该 Key 所属 provider 的量纲取。
+		//
+		// 原先一律用 TokenHard()/TokenSoft()，对按次计费的 provider 就是量纲
+		// 错配: 拿「500 万 token 的 95%」当成「1200 次的硬水位」。这个数不会
+		// 让任何一层报错 —— snap.Hard 是正数，Used+Prededuct 永远远小于它，
+		// 于是 :434 的硬水位过滤对按次 provider 完全失效，超额只能等 Acquire
+		// 的 Lua 兜底，而调度打分里的 Ratio 也一路失真。
+		//
+		// 这是上一阶段那个缺陷的同源残留: 当时修了归档与打分的 ratio 口径，
+		// 漏了 Key 池装载这一层。
+		hard, soft := conf.LimitsFor(r.Provider, conf.IsCountProvider(r.Provider))
 		entries = append(entries, keyEntry{
 			keyID:     r.KeyID,
 			secret:    r.Secret,
+			provider:  r.Provider,
 			egressIP:  r.EgressIP,
 			pool:      r.Pool,
 			dbStatus:  r.Status,
@@ -254,7 +308,7 @@ func (s *Scheduler) Reload(ctx context.Context) error {
 	yesterday := quota.QuotaDayTime(s.now().AddDate(0, 0, -1))
 	hist, err := s.st.GetKeyHistory(ctx, keyIDs, yesterday)
 	if err != nil {
-		hist = map[string]store.KeyDailyHistory{}
+		hist = map[store.HistoryKey]store.KeyDailyHistory{}
 	}
 
 	s.mu.Lock()
@@ -270,7 +324,8 @@ func (s *Scheduler) Reload(ctx context.Context) error {
 // SnapshotInterval），任何基于它的准入判断都会在并发下超刷。
 // 准入永远只看 quota.Acquire 的 Lua 返回值。
 func (s *Scheduler) Start(ctx context.Context) {
-	interval := s.quotaC.SnapshotInterval
+	// 刷新间隔在启动时定一次。ticker 周期改了要重启进程，属冷配置。
+	interval := s.conf.Quota().SnapshotInterval
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -307,24 +362,39 @@ func (s *Scheduler) Stop() {
 // RefreshSnapshot 批量刷新配额快照（单次 pipeline）。
 func (s *Scheduler) RefreshSnapshot(ctx context.Context) {
 	s.mu.RLock()
-	ids := make([]string, len(s.keys))
-	for i, e := range s.keys {
-		ids[i] = e.keyID
+	// 按 provider 分组 key IDs
+	keysByProvider := make(map[string][]string)
+	for _, e := range s.keys {
+		keysByProvider[e.provider] = append(keysByProvider[e.provider], e.keyID)
 	}
 	s.mu.RUnlock()
 
-	if len(ids) == 0 {
+	if len(keysByProvider) == 0 {
 		return
 	}
+	
 	for _, kind := range []quota.Kind{quota.KindToken, quota.KindCount} {
-		m, err := s.qr.GetMany(ctx, ids, kind)
-		if err != nil {
-			// 快照刷新失败保留上一轮的值。快照本就允许陈旧，
-			// 且它不参与准入，因此这里不需要任何降级动作。
-			continue
+		// 以上一轮快照为基底做增量覆盖: 某个 provider 读取失败时，它名下的
+		// Key 保留旧值，而不是被整体清空。快照本就允许陈旧且不参与准入（P0-1），
+		// 因此这里不需要任何降级动作。
+		s.mu.RLock()
+		allSnaps := make(map[string]quota.Snapshot, len(s.snaps[kind]))
+		for k, v := range s.snaps[kind] {
+			allSnaps[k] = v
+		}
+		s.mu.RUnlock()
+
+		for provider, ids := range keysByProvider {
+			m, err := s.qr.GetMany(ctx, provider, ids, kind)
+			if err != nil {
+				continue
+			}
+			for k, v := range m {
+				allSnaps[k] = v
+			}
 		}
 		s.mu.Lock()
-		s.snaps[kind] = m
+		s.snaps[kind] = allSnaps
 		s.mu.Unlock()
 	}
 }
@@ -355,6 +425,11 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 	// 逐 Key 加读锁只会在热路径上白白抢锁。
 	eg := s.egressReader()
 
+	// 调度配置同样循环外取一次。逐 Key 取会让同一次 Select 里前几个 Key 按
+	// 旧权重打分、后几个按新权重打分 —— 打出来的名次不对应任何一份真实配置，
+	// 而结果看起来完全正常。
+	scfg := s.conf.Scheduler()
+
 	// 100 个 Key 的朴素遍历。不分桶、不预计算、不加位图（P1-7）。
 	candidates := make([]scored, 0, len(keys))
 	var reasons rejectReasons
@@ -362,6 +437,12 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 	for _, e := range keys {
 		if req.Exclude[e.keyID] {
 			reasons.excluded++
+			continue
+		}
+
+		// Provider 过滤: 只选择匹配的上游 Key
+		if e.provider != req.Provider {
+			reasons.wrongProvider++
 			continue
 		}
 
@@ -373,8 +454,8 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 
 		// 最小请求间隔: 同一 Key 短时间内连续被选中，会形成远超人类操作
 		// 频率的请求密度。按画像节奏放大间隔，让不同 Key 的密度也各不相同。
-		if s.cfg.MinRequestInterval > 0 && !hs.LastSelectedAt.IsZero() {
-			gap := time.Duration(float64(s.cfg.MinRequestInterval) * e.persona.PaceFactor())
+		if scfg.MinRequestInterval > 0 && !hs.LastSelectedAt.IsZero() {
+			gap := time.Duration(float64(scfg.MinRequestInterval) * e.persona.PaceFactor())
 			if req.Now.Sub(hs.LastSelectedAt) < gap {
 				reasons.tooSoon++
 				continue
@@ -387,9 +468,9 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 		//
 		// 分级配比把大部分流量压到 hot 档后这个缺口最明显 —— hot 档 Key 少、
 		// 权重高，同一出口被连续选中的概率远高于均匀分配时。
-		if eg != nil && s.cfg.EgressMinInterval > 0 {
+		if eg != nil && scfg.EgressMinInterval > 0 {
 			if last := eg.LastUsedOn(e.keyID); !last.IsZero() &&
-				req.Now.Sub(last) < s.cfg.EgressMinInterval {
+				req.Now.Sub(last) < scfg.EgressMinInterval {
 				reasons.egressTooSoon++
 				continue
 			}
@@ -411,13 +492,13 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 			continue
 		}
 
-		personaScore, drop := scorePersona(e.persona, req, s.cfg.EnablePersona)
+		personaScore, drop := scorePersona(e.persona, req, scfg.EnablePersona)
 		if drop {
 			reasons.offHours++
 			continue
 		}
 
-		h, hasHist := history[e.keyID]
+		h, hasHist := history[store.HistoryKey{UpstreamKeyID: e.keyID, Provider: e.provider}]
 		sc := Score{
 			KeyID:   e.keyID,
 			Quota:   scoreQuota(snap),
@@ -428,13 +509,13 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 		// 软水位: 扣分但仍可选。这是"降权"而非"淘汰"的关键区别 ——
 		// 全池都过软水位时系统仍需可用。
 		if snap.Used+snap.Prededuct >= snap.Soft && snap.Soft > 0 {
-			sc.SoftPenalty = s.cfg.SoftPenalty
+			sc.SoftPenalty = scfg.SoftPenalty
 		}
 
-		sc.Total = s.cfg.WeightQuota*sc.Quota/100 +
-			s.cfg.WeightHistory*sc.History/25 +
-			s.cfg.WeightPersona*sc.Persona/100 +
-			s.cfg.WeightHealth*sc.Health/100 -
+		sc.Total = scfg.WeightQuota*sc.Quota/100 +
+			scfg.WeightHistory*sc.History/25 +
+			scfg.WeightPersona*sc.Persona/100 +
+			scfg.WeightHealth*sc.Health/100 -
 			sc.SoftPenalty
 
 		candidates = append(candidates, scored{entry: e, score: sc, snap: snap})
@@ -444,7 +525,7 @@ func (s *Scheduler) Select(ctx context.Context, req Request) (*Candidate, error)
 		return nil, fmt.Errorf("%w: %s", ErrNoCandidate, reasons.String())
 	}
 
-	chosen, pickedPool, fellBack, err := s.pick(candidates)
+	chosen, pickedPool, fellBack, err := s.pick(scfg, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -500,8 +581,10 @@ const minSelectWeight = 0.01
 // 附加分会被其余四维稀释，实际配比完全不可控 —— 一个 cold 档但配额充裕、
 // 健康度满分的 Key 照样能压过 hot 档。而分层的前提恰恰是 cold 档必须
 // **稳定地**只承接极少流量，否则它那高 max_keys 的密度假设就崩了。
-func (s *Scheduler) pick(candidates []scored) (scored, string, bool, error) {
-	shares := s.cfg.NormalizedPoolShares()
+// scfg 由 Select 传入而非在这里重取: 抽样必须和打分用同一份配置，否则会出现
+// 「按新权重打了分、按旧配比抽档位」这种谁都对不上的组合。
+func (s *Scheduler) pick(scfg config.Scheduler, candidates []scored) (scored, string, bool, error) {
+	shares := scfg.NormalizedPoolShares()
 	if len(shares) == 0 {
 		return weightedPick(candidates, s.randFloat()), "", false, nil
 	}
@@ -530,7 +613,7 @@ func (s *Scheduler) pick(candidates []scored) (scored, string, bool, error) {
 	}
 
 	// 目标档位此刻无可用 Key（全部在非活跃时段、超水位或不健康）。
-	if !s.cfg.PoolFallback {
+	if !scfg.PoolFallback {
 		return scored{}, target, false, fmt.Errorf(
 			"%w: 档位 %q 无可用 Key 且已禁用跨档回退", ErrNoCandidate, target)
 	}
@@ -637,9 +720,10 @@ func (s *Scheduler) randFloat() float64 {
 
 // rejectReasons 汇总各 Key 被淘汰的原因，让 "无可用 Key" 这个错误可诊断。
 type rejectReasons struct {
-	excluded  int
-	unhealthy int
-	tooSoon   int
+	excluded      int
+	wrongProvider int // Provider 不匹配
+	unhealthy     int
+	tooSoon       int
 	// egressTooSoon 与 tooSoon 分开统计: 前者说明出口密度到顶（需要加 IP 或
 	// 放宽 EgressMinInterval），后者说明单 Key 太热（需要扩池）。
 	// 合并计数会让这两种完全不同的容量问题无法区分。
@@ -649,8 +733,8 @@ type rejectReasons struct {
 }
 
 func (r rejectReasons) String() string {
-	return fmt.Sprintf("已排除=%d 不健康=%d 间隔不足=%d 出口间隔不足=%d 超硬水位=%d 非活跃时段=%d",
-		r.excluded, r.unhealthy, r.tooSoon, r.egressTooSoon, r.overHard, r.offHours)
+	return fmt.Sprintf("已排除=%d Provider不匹配=%d 不健康=%d 间隔不足=%d 出口间隔不足=%d 超硬水位=%d 非活跃时段=%d",
+		r.excluded, r.wrongProvider, r.unhealthy, r.tooSoon, r.egressTooSoon, r.overHard, r.offHours)
 }
 
 // MarkSuccess 记录一次成功请求。
@@ -681,6 +765,20 @@ func (s *Scheduler) PoolSize() int {
 	return len(s.keys)
 }
 
+// KeyIDSet 返回活跃池中全部 Key 的 ID 集合。
+//
+// 供出口池清理下线 Key 的传输资源（egress.RetainClients）等「按存活集合
+// 收缩」的消费方使用。返回新 map，调用方可自由持有。
+func (s *Scheduler) KeyIDSet() map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]bool, len(s.keys))
+	for _, e := range s.keys {
+		out[e.keyID] = true
+	}
+	return out
+}
+
 // SchedulableAt 返回在给定时刻通过画像时段过滤的 Key 数量。
 //
 // 与 PoolSize 的差别是容量口径: PoolSize 是「装载了多少 Key」，这个是
@@ -690,7 +788,7 @@ func (s *Scheduler) PoolSize() int {
 // 用它算吞吐上限才有意义。拿 PoolSize 算会得出一个整天不变的乐观数字，
 // 而真实的 503 恰恰集中在可调度量最低的那几个小时。
 func (s *Scheduler) SchedulableAt(now time.Time) int {
-	if !s.cfg.EnablePersona {
+	if !s.conf.Scheduler().EnablePersona {
 		return s.PoolSize()
 	}
 	s.mu.RLock()
@@ -720,6 +818,10 @@ func (s *Scheduler) ScoreAll(req Request) []Score {
 	snaps := s.snaps[req.Kind]
 	s.mu.RUnlock()
 
+	// 与 Select 同理: 一次调用内的打分口径必须统一，否则看板会展示出一张
+	// 各行权重不一致的分数表，而排查问题的人正是靠它对齐线上行为。
+	scfg := s.conf.Scheduler()
+
 	out := make([]Score, 0, len(keys))
 	for _, e := range keys {
 		hs := s.health.get(e.keyID)
@@ -727,8 +829,8 @@ func (s *Scheduler) ScoreAll(req Request) []Score {
 		if snap.Hard <= 0 {
 			snap.Hard, snap.Soft = e.hardLimit, e.softLimit
 		}
-		personaScore, _ := scorePersona(e.persona, req, s.cfg.EnablePersona)
-		h, hasHist := history[e.keyID]
+		personaScore, _ := scorePersona(e.persona, req, scfg.EnablePersona)
+		h, hasHist := history[store.HistoryKey{UpstreamKeyID: e.keyID, Provider: e.provider}]
 
 		sc := Score{
 			KeyID:   e.keyID,
@@ -738,12 +840,12 @@ func (s *Scheduler) ScoreAll(req Request) []Score {
 			Health:  scoreHealth(hs),
 		}
 		if snap.Soft > 0 && snap.Used+snap.Prededuct >= snap.Soft {
-			sc.SoftPenalty = s.cfg.SoftPenalty
+			sc.SoftPenalty = scfg.SoftPenalty
 		}
-		sc.Total = s.cfg.WeightQuota*sc.Quota/100 +
-			s.cfg.WeightHistory*sc.History/25 +
-			s.cfg.WeightPersona*sc.Persona/100 +
-			s.cfg.WeightHealth*sc.Health/100 -
+		sc.Total = scfg.WeightQuota*sc.Quota/100 +
+			scfg.WeightHistory*sc.History/25 +
+			scfg.WeightPersona*sc.Persona/100 +
+			scfg.WeightHealth*sc.Health/100 -
 			sc.SoftPenalty
 		out = append(out, sc)
 	}

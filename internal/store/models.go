@@ -42,9 +42,9 @@ type AuthContext struct {
 	DailyTokenLimit int64
 }
 
-// VolcKey 是火山 Key 池中的一个 Key。Secret 字段为解密后的明文，
+// UpstreamKey 是上游 Key 池中的一个 Key。Secret 字段为解密后的明文，
 // 仅在显式调用带解密的读取方法时填充。
-type VolcKey struct {
+type UpstreamKey struct {
 	ID                 int64
 	KeyID              string
 	SecretEnc          string
@@ -54,6 +54,8 @@ type VolcKey struct {
 	Status             string
 	PersonaID          string
 	EgressIP           string
+	// Shard 是该 Key 的机器归属。空串表示未分片。语义见 schema.sql。
+	Shard              string
 	HealthScore        int
 	RefreshState       string
 	RefreshConfirmedAt *time.Time
@@ -63,12 +65,12 @@ type VolcKey struct {
 	UpdatedAt          time.Time
 }
 
-// 火山 Key 的状态取值。
+// 上游 Key 的状态取值。
 const (
-	VolcStatusActive   = "active"
-	VolcStatusCooldown = "cooldown"
-	VolcStatusBanned   = "banned"
-	VolcStatusInvalid  = "invalid"
+	KeyStatusActive   = "active"
+	KeyStatusCooldown = "cooldown"
+	KeyStatusBanned   = "banned"
+	KeyStatusInvalid  = "invalid"
 )
 
 // 刷新探测状态取值（P0-4）。
@@ -79,19 +81,31 @@ const (
 	RefreshFailed    = "failed"
 )
 
-// VolcKeyFilter 是 ListVolcKeys 的过滤条件，零值表示不过滤。
-type VolcKeyFilter struct {
+// UpstreamKeyFilter 是 ListUpstreamKeys 的过滤条件，零值表示不过滤。
+type UpstreamKeyFilter struct {
 	Pool         string
 	Status       string
 	Provider     string
 	RefreshState string
+
+	// Shard 非空时只返回归属该分片的 Key。
+	//
+	// 语义是严格的: 分片实例绝不装载别的分片或未指派分片的 Key。
+	// 「顺带装载未分片的」看似方便迁移，实际会让多台分片实例同时装载
+	// 同一批存量 Key —— Key 与出口 IP 终身绑定，等于让同一账号从两个
+	// IP 出去，正是风控最敏感的信号。未指派的 Key 由启动日志告警，
+	// 运维用 AssignShard 指派后自然出现在对应实例。
+	//
+	// 空串仍表示不过滤（单机部署全量装载），装载范围的决定权在调用方。
+	Shard string
+
 	// WithSecret 为 true 时解密并填充 Secret 字段。
 	WithSecret bool
 	Limit      int
 }
 
-// VolcKeyState 是一次 Key 运行时状态更新。指针字段为 nil 表示不更新该列。
-type VolcKeyState struct {
+// UpstreamKeyState 是一次 Key 运行时状态更新。指针字段为 nil 表示不更新该列。
+type UpstreamKeyState struct {
 	Status      *string
 	Pool        *string
 	HealthScore *int
@@ -102,12 +116,13 @@ type VolcKeyState struct {
 	TouchLastUsed bool
 }
 
+
 // UsageRecord 是一条用量流水，计费与审计的事实来源。
 type UsageRecord struct {
 	RequestID        string
 	UserID           int64 // 0 表示无归属（如内部探测请求）
 	UserAPIKeyID     int64
-	VolcKeyID        string
+	UpstreamKeyID        string
 	EgressIP         string
 	Provider         string
 	Model            string
@@ -115,19 +130,25 @@ type UsageRecord struct {
 	QuotaDay         time.Time
 	PromptTokens     int64
 	CompletionTokens int64
-	TotalTokens      int64
-	CountUnits       int
-	EstimatedTokens  int64
-	StatusCode       int
-	IsStream         bool
-	ErrorCode        string
-	RetryCount       int
-	LatencyMS        int
+	// ReasoningTokens 已含在 CompletionTokens 内，不参与计费。
+	ReasoningTokens int64
+	TotalTokens     int64
+	CountUnits      int
+	EstimatedTokens int64
+	StatusCode      int
+	IsStream        bool
+	ErrorCode       string
+	RetryCount      int
+	LatencyMS       int
 }
 
 // KeyDailyHistory 是 Key 的每日归档，供调度的 S_history 维度使用。
 type KeyDailyHistory struct {
-	VolcKeyID            string
+	UpstreamKeyID string
+	// Provider 必须随归档一起落库: S_history 是 provider 内部的相对打分，
+	// 缺了它就无法把「这个 Key 昨天很闲」限定在同一上游的池子里比较。
+	// 表上是 NOT NULL 列，漏传会让整个归档任务每轮静默失败。
+	Provider             string
 	QuotaDay             time.Time
 	TokenUsed            int64
 	CountUsed            int
@@ -147,9 +168,14 @@ type AuditLog struct {
 }
 
 // QuotaDrift 是一次配额对账偏差记录（P0-2）。
+//
+// Provider 必填: 同一个 upstream_key_id 在不同 provider 下是两套独立配额，
+// 偏差不带 provider 就无法归因到具体上游账户，而排查超刷时第一件事就是
+// 定位「哪个上游的水位对不上」。
 type QuotaDrift struct {
-	VolcKeyID   string
-	BillingKind string
-	QuotaDay    time.Time
-	Drift       int64
+	UpstreamKeyID string
+	Provider      string
+	BillingKind   string
+	QuotaDay      time.Time
+	Drift         int64
 }

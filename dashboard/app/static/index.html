@@ -110,6 +110,71 @@
     </div>
   </section>
 
+  <!-- Provider 配置 -->
+  <section>
+    <h2>Provider 配置</h2>
+    <p class="hint">
+      改动即时热生效，无需重启网关。provider 名与配额量纲（quota_kind）是 Redis 配额 key
+      的组成部分，建成后不可改 —— 需要换量纲请新建 provider 并重新导入 Key。
+      没有删除操作，退役一律用「停用」，历史用量与版本记录完整保留。
+    </p>
+    <div class="toolbar">
+      <button id="btn-prov-add" class="btn btn-primary" type="button">
+        <svg class="icon" aria-hidden="true"><use href="#icon-add"></use></svg>新增 provider
+      </button>
+      <select id="sel-prov-state" aria-label="按启用状态筛选">
+        <option value="">全部状态</option>
+        <option value="enabled">仅启用</option>
+        <option value="disabled">仅停用</option>
+      </select>
+      <span class="spacer" style="flex:1"></span>
+      <span id="prov-version" class="hint" style="margin:0"></span>
+    </div>
+    <div id="prov-form-host"></div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table>
+        <thead>
+          <tr>
+            <th>Provider</th><th>状态</th><th>Base URL</th>
+            <th>量纲</th><th class="num">上限</th><th>窗口</th>
+            <th>今日水位</th><th>凭据</th><th>Adapter</th>
+            <th class="num">版本</th><th>更新时间</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-providers"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 配置版本历史 -->
+  <section>
+    <h2>配置版本历史</h2>
+    <p class="hint">
+      每次写操作生成一个版本，只读留存。回滚会生成一个新版本而非抹掉历史。
+      跨量纲回滚被直接拒绝：它会让 Redis 里已按旧量纲累加的计数被按新量纲解读，水位全程失真且不报错。
+    </p>
+    <!-- 版本历史按 provider 分组，网关没有「全局版本流」这个端点，
+         所以必须先选定看谁的历史 —— 不选则表格无从加载。 -->
+    <div class="toolbar">
+      <label class="hint" for="sel-cfg-provider">查看哪个 provider 的历史</label>
+      <select id="sel-cfg-provider"></select>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="num">版本</th><th>动作</th><th>对象</th>
+            <th>变更字段</th><th>原因</th><th>操作人</th><th>时间</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody-cfg-versions"></tbody>
+      </table>
+    </div>
+    <div class="toolbar" style="margin-top:10px">
+      <button id="btn-cfg-more" class="btn" type="button" hidden>加载更多</button>
+    </div>
+  </section>
+
   <!-- 行为相似度 -->
   <section>
     <h2>行为相似度自检</h2>
@@ -275,5 +340,8 @@
 <script src="/admin-ui.js"></script>
 <script src="/admin.js"></script>
 <script src="/admin-import.js"></script>
+<script src="/admin-provider.js"></script>
+<script src="/admin-provider-form.js"></script>
+<script src="/admin-provider-act.js"></script>
 </body>
 </html>

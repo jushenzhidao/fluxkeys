@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fluxkeys/fluxkeys/internal/adapter"
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
 )
@@ -52,6 +53,7 @@ type attemptResult struct {
 // requestPlan 描述一次用户请求的执行计划。
 type requestPlan struct {
 	Endpoint  adapter.Endpoint
+	Provider  string       // 上游服务商
 	Model     string
 	Body      []byte
 	Stream    bool
@@ -60,6 +62,15 @@ type requestPlan struct {
 	LeaseTTL  time.Duration
 	RequestID string
 	UserCtx   *UserContext
+
+	// Snap 是本请求的配置快照，在 handler 入口取一次并贯穿全程。
+	//
+	// 用显式字段而非 context.Value: 配置读取必须在代码 diff 里看得见。
+	// 藏进 context 后，「这里读了配置」既不在函数签名上，也躲过编译检查，
+	// 而配置读错正是本项目最贵的失效类型 —— 它不报错，只是算错。
+	//
+	// execute 及其以下全部只读此字段，禁止重新调用 Holder.Current()。
+	Snap *confsnap.Snapshot
 
 	// 以下字段由 execute 在尝试结束后回填，供用量流水使用。
 	// 单个请求在一个 goroutine 内串行执行，无需加锁。
@@ -72,9 +83,19 @@ type requestPlan struct {
 //
 // 返回最终状态码、总重试次数与最后一次的错误（若有）。
 func (s *Server) execute(w http.ResponseWriter, r *http.Request, plan *requestPlan) (int, int, *adapter.UpstreamError) {
-	exclude := make(map[string]bool, s.cfg.Upstream.MaxRetries+1)
+	// 快照在循环外取一次，循环内严禁重取。
+	//
+	// 重试期间发生热加载时，若每个 attempt 各取一次快照，同一个用户请求的
+	// 三次尝试可能分别用上新旧两套配置 —— 第 1 次用旧 base_url + 旧 mapping，
+	// 第 2 次用新 base_url + 旧 adapter。这类混合态不报错，表现为请求打到
+	// 一个能连通的地址却发了错的模型名。
+	//
+	// plan.Snap 已由 handler 入口填好，这里只是把「循环外」这个约束写死。
+	snap := plan.Snap
+
+	exclude := make(map[string]bool, snap.Cfg.Upstream.MaxRetries+1)
 	var lastErr *adapter.UpstreamError
-	maxAttempts := s.cfg.Upstream.MaxRetries + 1
+	maxAttempts := snap.Cfg.Upstream.MaxRetries + 1
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
@@ -191,9 +212,10 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	// ===== 1. 选 Key =====
 	selStart := time.Now()
 	cand, err := s.sched.Select(ctx, SelectRequest{
-		Model:   plan.Model,
-		Kind:    plan.QuotaKind,
-		Exclude: exclude,
+		Provider: plan.Provider,
+		Model:    plan.Model,
+		Kind:     plan.QuotaKind,
+		Exclude:  exclude,
 	})
 	selDur := time.Since(selStart)
 	if err != nil {
@@ -245,8 +267,8 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	}
 
 	// ===== 2. 预扣配额 =====
-	lim := s.limitsFor(kind)
-	decision, lease, err := s.quota.Acquire(ctx, cand.KeyID, kind, plan.Estimated, lim, plan.LeaseTTL)
+	lim := s.limitsFor(plan.Snap, plan.Provider, kind)
+	decision, lease, err := s.quota.Acquire(ctx, plan.Provider, cand.KeyID, kind, plan.Estimated, lim, plan.LeaseTTL)
 	if err != nil {
 		if errors.Is(err, quota.ErrInsufficient) {
 			s.metrics.ObserveQuotaAcquire(string(kind), "denied")
@@ -302,8 +324,24 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 		}
 	}()
 
-	// ===== 3. 构造上游请求 =====
-	upstreamPath, upstreamBody, terr := s.adapter.TransformRequest(plan.Endpoint, plan.Body)
+	// ===== 3. 获取适配器 =====
+	//
+	// 从快照取而非 s.adapters: adapter 在构造时把 model_mapping 固化成两张
+	// map，与 BaseURL 必须同源。分开取就会出现「新 base_url + 旧 mapping」——
+	// 请求发到对的地址、带着错的上游模型名，上游返回 404 或更糟地返回了
+	// 另一个模型的结果。
+	ad, err := plan.Snap.Adapters.Get(plan.Provider)
+	if err != nil {
+		return attemptResult{KeyID: cand.KeyID, Err: &adapter.UpstreamError{
+			Class:        adapter.ErrClassClient,
+			ClientStatus: http.StatusNotFound,
+			Code:         "provider_not_found",
+			Message:      fmt.Sprintf("未注册的 provider: %s", plan.Provider),
+		}}
+	}
+
+	// ===== 4. 构造上游请求 =====
+	upstreamPath, upstreamBody, terr := ad.TransformRequest(plan.Endpoint, plan.Body)
 	if terr != nil {
 		var ue *adapter.UpstreamError
 		if errors.As(terr, &ue) {
@@ -313,12 +351,20 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 			http.StatusBadRequest, "invalid_request", terr.Error())}
 	}
 
-	url := strings.TrimRight(s.cfg.Upstream.VolcBaseURL, "/") + upstreamPath
+	// 从 provider 配置获取 BaseURL。与上面的 adapter 同取自 plan.Snap，
+	// 保证一次请求的全部 attempt 打到同一个地址、用同一套 mapping。
+	provider, ok := plan.Snap.Cfg.Providers[plan.Provider]
+	if !ok {
+		return attemptResult{KeyID: cand.KeyID, Err: adapter.NewClientError(
+			http.StatusInternalServerError, "provider_not_found", "provider 配置缺失: "+plan.Provider)}
+	}
+	
+	url := strings.TrimRight(provider.BaseURL, "/") + upstreamPath
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return attemptResult{KeyID: cand.KeyID, Err: adapter.NewNetworkError("构造上游请求失败: " + err.Error())}
 	}
-	for k, vs := range s.adapter.BuildAuthHeaders(cand.Secret) {
+	for k, vs := range ad.BuildAuthHeaders(cand.Secret) {
 		for _, v := range vs {
 			upReq.Header.Add(k, v)
 		}
@@ -365,7 +411,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	if upResp.StatusCode >= 400 {
 		// 错误体通常很小，但仍需限长防御异常大的响应
 		errBody, _ := io.ReadAll(io.LimitReader(upResp.Body, 64<<10))
-		ue := s.adapter.MapError(upResp.StatusCode, errBody)
+		ue := ad.MapError(upResp.StatusCode, errBody)
 
 		s.markEgress(cand.KeyID, egressVerdictFor(ue.Class))
 		// auth 类失败单独走出口封禁判定: 它对单次请求而言与出口无关，
@@ -389,11 +435,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 
 	// ===== 6. 成功响应转发 =====
 	if plan.Stream {
-		usage, sErr := s.streamResponse(w, r, upResp, plan, start)
+		usage, sErr := s.streamResponse(w, r, upResp, plan, ad, start)
 		if sErr != nil {
 			// 流式已开始写出，无法再换 Key。有多少用量算多少，
 			// 拿不到 usage 时按预扣量保守 Commit —— 上游确实已经消耗了。
-			commitActual = fallbackActual(usage, plan.Estimated, kind)
+			commitActual = actualFor(usage, plan.Estimated, kind)
 			return attemptResult{Done: true, HeadersSent: true, KeyID: cand.KeyID,
 				StatusCode: 499, Err: sErr, Usage: usage, Estimated: plan.Estimated}
 		}
@@ -403,7 +449,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 			StatusCode: http.StatusOK, Usage: usage, Estimated: plan.Estimated}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(upResp.Body, s.cfg.Server.MaxBodyBytes))
+	// 多读 1 字节以区分「恰好等于上限」与「超过上限」。直接按上限截断的
+	// 问题: 截断不报错，残缺 JSON 解析 usage 失败 → 按预扣量记账，且截断
+	// 的 body 会被原样发给客户端 —— 用户收到一段解析不了的半截 JSON。
+	limit := s.cfg.Server.MaxBodyBytes
+	body, err := io.ReadAll(io.LimitReader(upResp.Body, limit+1))
 	if err != nil {
 		// 响应读取失败: 上游可能已经产生了完整用量，按预扣量保守计入
 		commitActual = plan.Estimated
@@ -411,12 +461,24 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 		return attemptResult{KeyID: cand.KeyID, Estimated: plan.Estimated,
 			Err: adapter.NewNetworkError("读取上游响应失败: " + err.Error())}
 	}
+	if int64(len(body)) > limit {
+		// 超限按上游异常处理: 上游确实消耗了额度，保守按预扣量计入。
+		commitActual = plan.Estimated
+		s.sched.MarkFailure(cand.KeyID, FailureServer)
+		return attemptResult{KeyID: cand.KeyID, Estimated: plan.Estimated,
+			Err: &adapter.UpstreamError{
+				Class:        adapter.ErrClassServer,
+				ClientStatus: http.StatusBadGateway,
+				Code:         "upstream_response_too_large",
+				Message:      fmt.Sprintf("上游响应超过 %d 字节上限", limit),
+			}}
+	}
 
-	usage, _ := s.adapter.ParseUsage(plan.Endpoint, body)
+	usage, _ := ad.ParseUsage(plan.Endpoint, body)
 	commitActual = actualFor(usage, plan.Estimated, kind)
 	s.metrics.ObserveTokens(plan.Model, usage.PromptTokens, usage.CompletionTokens)
 
-	out, _ := s.adapter.TransformResponse(plan.Endpoint, body)
+	out, _ := ad.TransformResponse(plan.Endpoint, body)
 
 	copyResponseHeaders(w, upResp)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
@@ -444,11 +506,6 @@ func actualFor(u adapter.Usage, estimated int64, kind quota.Kind) int64 {
 		return t
 	}
 	return estimated
-}
-
-// fallbackActual 用于流式中断的场景。
-func fallbackActual(u adapter.Usage, estimated int64, kind quota.Kind) int64 {
-	return actualFor(u, estimated, kind)
 }
 
 // reportFailure 将错误分类翻译为 Key 状态机事件。
@@ -587,13 +644,20 @@ func (s *Server) markEgress(keyID string, v egressVerdict) {
 	}
 }
 
-// limitsFor 返回该配额类型的水位。
-func (s *Server) limitsFor(kind quota.Kind) quota.Limits {
-	if kind == quota.KindCount {
-		return quota.Limits{Hard: s.cfg.Quota.CountHard(), Soft: s.cfg.Quota.CountSoft()}
-	}
-	return quota.Limits{Hard: s.cfg.Quota.TokenHard(), Soft: s.cfg.Quota.TokenSoft()}
+// limitsFor 返回该 provider 在该配额类型下的水位。
+//
+// 必须带 provider: 各家上游的单 Key 限额可以差一个数量级（火山按 token 给
+// 数百万，商汤公测按次给一千多）。忽略 provider 会让额度小的上游被超发 ——
+// 本地水位还没到就放行，请求全部撞上游 429；额度大的则被白白闲置。
+// 这类偏差不报错，只表现为「配了 quota_limit 却毫无效果」。
+//
+// 必须带 snap: 水位与本次请求的 base_url、model_mapping 取自同一份配置。
+// 从 s.cfg 读会拿到启动时的副本，热切后水位静默不变。
+func (s *Server) limitsFor(snap *confsnap.Snapshot, provider string, kind quota.Kind) quota.Limits {
+	hard, soft := snap.Cfg.LimitsFor(provider, kind == quota.KindCount)
+	return quota.Limits{Hard: hard, Soft: soft}
 }
+
 
 // copyResponseHeaders 透传上游的相关响应头，跳过逐跳头。
 func copyResponseHeaders(w http.ResponseWriter, upResp *http.Response) {

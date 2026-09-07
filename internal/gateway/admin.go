@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -228,7 +229,7 @@ func (s *Server) handleAdminKeyByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleImportKeys 处理 POST /admin/keys，导入或更新火山 Key。
+// handleImportKeys 处理 POST /admin/keys，导入或更新上游 Key。
 //
 // 支持单个对象与数组两种请求体，方便运维用一份清单一次导入上千个 Key。
 //
@@ -280,22 +281,47 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 	seen := make(map[string]bool, len(items))
 	var createdCount int
 
+	// 整批导入共用一份快照。分两次取会出现「按 A 快照解析出 provider、
+	// 按 B 快照校验它是否存在」—— 中间恰好停用了该 provider 时，前一步
+	// 认领成功、后一步报不存在，同一批里相邻两个 Key 得到不同结论。
+	snap := s.snaps.Current()
+
 	for _, it := range items {
 		it.KeyID = strings.TrimSpace(it.KeyID)
+		// 单上游部署允许省略 provider，多上游必须显式指定，否则会静默
+		// 把 Key 挂到错误的上游上。
+		it.Provider = snap.Cfg.ResolveProvider(strings.TrimSpace(it.Provider))
+
+		if it.Provider == "" {
+			failures = append(failures, failure{
+				KeyID:  it.KeyID,
+				Reason: "provider 不能为空（配置了多个上游时必须显式指定）",
+			})
+			continue
+		}
 		if it.KeyID == "" {
 			failures = append(failures, failure{Reason: "key_id 不能为空"})
 			continue
 		}
-		// 同一批内重复的 key_id 直接报错而非静默后写覆盖前写: 清单里出现
-		// 重复 ID 通常意味着生成脚本有问题，静默接受会让运维以为导入了
-		// N 个 Key 而实际只有 N-1 个。
-		if seen[it.KeyID] {
+		
+		// 验证 provider 是否在配置中存在
+		if _, exists := snap.Cfg.Providers[it.Provider]; !exists {
+			failures = append(failures, failure{
+				KeyID:  it.KeyID,
+				Reason: "provider '" + it.Provider + "' 未在配置中定义",
+			})
+			continue
+		}
+		
+		// 同一批内重复的 provider+key_id 组合直接报错
+		compositeKey := it.Provider + ":" + it.KeyID
+		if seen[compositeKey] {
 			failures = append(failures, failure{KeyID: it.KeyID, Reason: "同一批内重复出现"})
 			continue
 		}
-		seen[it.KeyID] = true
+		seen[compositeKey] = true
 
-		created, err := s.store.UpsertVolcKey(r.Context(), it)
+		created, err := s.store.UpsertUpstreamKey(r.Context(), it)
 		if err != nil {
 			// 单个失败不中断整批: 导入 1000 个 Key 时因第 3 个格式错误而
 			// 全部回滚，运维只能反复试错。逐条报告让一次调用就能修完。
@@ -309,9 +335,25 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 
 		// 立刻建立出口绑定，避免等到首个请求到达时才惰性绑定 ——
 		// 惰性绑定的顺序取决于请求到达顺序，重启后同一 Key 可能落到不同 IP。
-		if _, err := s.egress.Bind(it.KeyID); err != nil {
+		//
+		// 必须带档位: Bind(PoolAny) 会把 Key 哈希到任意档位的出口上，
+		// 分层就有了缺口 —— hot Key 可能落到 cold 档 IP，白白带上
+		// 「这个出口曾有大量账号」的历史。
+		//
+		// 分配结果必须落库: 只改内存等于没有终身绑定 —— 重启后
+		// restoreBindings 读到空 egress_ip，会按当时的候选集重新哈希，
+		// 而候选集已随 IP 增删与封禁变化，Key 大概率换到另一个出口。
+		// 对上游而言就是「这个账号换了 IP」，正是风控最敏感的信号。
+		if addr, err := s.egress.BindInPool(it.KeyID, it.Pool); err != nil {
 			s.log.WarnContext(r.Context(), "Key 出口绑定失败",
-				"key_id", it.KeyID, "err", err)
+				"key_id", it.KeyID, "pool", it.Pool, "err", err)
+		} else if addr != "" {
+			// 落库失败只降级告警: Key 已导入且本次运行的绑定是正确的，
+			// 此时整批报错会让运维误以为导入失败而重试。
+			if err := s.store.SetVolcKeyEgressIP(r.Context(), it.KeyID, addr); err != nil {
+				s.log.WarnContext(r.Context(), "出口绑定已生效但落库失败，重启后可能改绑",
+					"key_id", it.KeyID, "egress_ip", addr, "err", err)
+			}
 		}
 
 		imported = append(imported, it.KeyID)
@@ -333,7 +375,7 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 审计只记 key_id 与元数据，绝不记 secret。
-	s.audit(r, "import_volc_keys", strconv.Itoa(len(imported)), map[string]any{
+	s.audit(r, "import_upstream_keys", strconv.Itoa(len(imported)), map[string]any{
 		"imported":   imported,
 		"created":    createdCount,
 		"updated":    len(imported) - createdCount,
@@ -341,7 +383,7 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 		"request_id": RequestIDFromContext(r.Context()),
 	})
 
-	s.log.InfoContext(r.Context(), "火山 Key 导入完成",
+	s.log.InfoContext(r.Context(), "上游 Key 导入完成",
 		"imported", len(imported), "created", createdCount,
 		"updated", len(imported)-createdCount,
 		"failed", len(failures), "actor", adminActor(r))
@@ -414,18 +456,36 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAdminUserByID 处理 POST /admin/users/{id}/keys。
+// handleAdminUserByID 处理 /admin/users/{id}/keys 与 /admin/users/{id}/keys/{key_id}。
+//
+//	POST   /admin/users/{id}/keys           签发新 Key
+//	DELETE /admin/users/{id}/keys/{key_id}  吊销 Key（立即生效）
 func (s *Server) handleAdminUserByID(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/admin/users/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) != 2 || parts[1] != "keys" {
+	if len(parts) < 2 || parts[1] != "keys" || len(parts) > 3 {
 		s.writeError(w, r, http.StatusNotFound, "invalid_request",
-			"路径格式应为 /admin/users/{id}/keys")
+			"路径格式应为 /admin/users/{id}/keys 或 /admin/users/{id}/keys/{key_id}")
 		return
 	}
 	userID, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || userID <= 0 {
 		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "用户 ID 非法")
+		return
+	}
+
+	// DELETE /admin/users/{id}/keys/{key_id}: 吊销
+	if len(parts) == 3 {
+		if r.Method != http.MethodDelete {
+			s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 DELETE")
+			return
+		}
+		keyID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || keyID <= 0 {
+			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "Key ID 非法")
+			return
+		}
+		s.revokeUserKey(w, r, userID, keyID)
 		return
 	}
 
@@ -464,5 +524,37 @@ func (s *Server) handleAdminUserByID(w http.ResponseWriter, r *http.Request) {
 		// 明文仅此一次返回，服务端只存哈希
 		"api_key": plaintext,
 		"warning": "请立即保存，该明文不会再次返回",
+	})
+}
+
+// revokeUserKey 吊销一条用户 API Key 并使鉴权缓存立即失效。
+func (s *Server) revokeUserKey(w http.ResponseWriter, r *http.Request, userID, keyID int64) {
+	if err := s.store.RevokeUserAPIKey(r.Context(), userID, keyID); err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "key_not_found",
+				"Key 不存在、不属于该用户或已非 active 状态")
+			return
+		}
+		s.log.ErrorContext(r.Context(), "吊销用户 API Key 失败",
+			"user_id", userID, "api_key_id", keyID, "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "吊销失败: "+err.Error())
+		return
+	}
+
+	// 清空鉴权缓存，把吊销的生效延迟从缓存 TTL 压到零。
+	//
+	// 全清而非按条目清: 这里只有 key_id，而缓存以 token 哈希为键，无法定位
+	// 单条。吊销是低频管理操作，全清的代价只是一轮回源。
+	s.authCache.invalidate()
+
+	s.audit(r, "revoke_user_api_key", strconv.FormatInt(userID, 10), map[string]any{
+		"api_key_id": keyID,
+		"request_id": RequestIDFromContext(r.Context()),
+	})
+	s.log.InfoContext(r.Context(), "已吊销用户 API Key",
+		"user_id", userID, "api_key_id", keyID, "actor", adminActor(r))
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"revoked": true, "user_id": userID, "api_key_id": keyID,
 	})
 }

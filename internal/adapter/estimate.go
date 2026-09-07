@@ -135,20 +135,46 @@ func countValue(v any) int64 {
 	return 0
 }
 
+// ReasoningEstimate 描述推理模型的输出预扣修正参数。
+//
+// 零值表示非推理模型，此时估算退化为原有公式。
+type ReasoningEstimate struct {
+	// Enabled 标识当前模型会输出思维链。
+	Enabled bool
+	// OutputMultiplier 是输出部分的额外放大系数。
+	OutputMultiplier float64
+	// FloorTokens 是输出部分的预扣下限。
+	FloorTokens int64
+}
+
 // EstimateTokens 计算一次请求应当预扣的 token 数。
 //
-// 公式: (prompt_tokens_est + max_tokens) * multiplier
+// 公式: (prompt_tokens_est + output_est) * multiplier
+//
+// 其中 output_est 对普通模型即 max_tokens；对推理模型则额外放大并托底，
+// 因为 reasoning_content 的 token 不受 max_tokens 约束（详见 applyReasoning）。
 //
 // defaultMaxTokens 用于用户未指定 max_tokens 的情况 —— 此时输出长度完全
 // 不可知，只能按配置的基准值预扣，靠 Commit 时的实际用量修正。
 func EstimateTokens(m ChatRequestMeta, defaultMaxTokens int64, multiplier float64) int64 {
+	return EstimateTokensFor(m, defaultMaxTokens, multiplier, ReasoningEstimate{})
+}
+
+// EstimateTokensFor 是 EstimateTokens 的带推理修正版本。
+func EstimateTokensFor(m ChatRequestMeta, defaultMaxTokens int64, multiplier float64, r ReasoningEstimate) int64 {
 	out := m.MaxTokens
+	explicit := out > 0
 	if out <= 0 {
 		out = defaultMaxTokens
 	}
 	if out <= 0 {
 		out = 4096
 	}
+
+	// 推理模型的输出放大必须在乘 n 之前完成: 每份候选都会各自产生一条
+	// 独立的思维链，放大属于「单份输出成本」而非「总量的修正」。
+	out = applyReasoning(out, explicit, r)
+
 	// n > 1 时会生成多份输出，成本相应放大
 	if m.N > 1 {
 		out *= m.N
@@ -163,6 +189,34 @@ func EstimateTokens(m ChatRequestMeta, defaultMaxTokens int64, multiplier float6
 		est = 1
 	}
 	return est
+}
+
+// applyReasoning 修正推理模型的单份输出预扣量。
+//
+// 实测（deepseek-v4-flash，真实上游）:
+//
+//	max_tokens=16   → completion 141（8.8x）
+//	max_tokens=64   → completion 121（1.89x）
+//	max_tokens=256  → completion 214（0.84x）
+//	max_tokens=1024 → completion 227（0.22x）
+//
+// 规律是思维链长度由问题复杂度决定，与 max_tokens 基本无关。因此:
+//   - 按比例放大处理 max_tokens 处于中间量级的情况；
+//   - 绝对下限处理 max_tokens 极小的情况（16 × 3 = 48 仍远不够）。
+//
+// 未显式指定 max_tokens 时不套用下限: 此时 out 已是配置基准值（默认 4096），
+// 本身高于任何观测到的思维链长度，再放大只会白占额度、压低单 Key 并发。
+func applyReasoning(out int64, explicit bool, r ReasoningEstimate) int64 {
+	if !r.Enabled {
+		return out
+	}
+	if r.OutputMultiplier > 1 {
+		out = int64(float64(out) * r.OutputMultiplier)
+	}
+	if explicit && r.FloorTokens > out {
+		out = r.FloorTokens
+	}
+	return out
 }
 
 // EstimateCountUnits 计算按次计费模型应预扣的次数。

@@ -225,15 +225,15 @@ func (s *Store) insertUsageBatch(ctx context.Context, recs []UsageRecord) error 
 		}
 		b.Queue(`
 			INSERT INTO usage_records (
-				request_id, user_id, user_api_key_id, volc_key_id, egress_ip, provider,
+				request_id, user_id, user_api_key_id, upstream_key_id, egress_ip, provider,
 				model, billing_kind, quota_day, prompt_tokens, completion_tokens,
-				total_tokens, count_units, estimated_tokens, status_code, is_stream,
-				error_code, retry_count, latency_ms)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
-			r.RequestID, userID, keyID, r.VolcKeyID, r.EgressIP, r.Provider,
+				reasoning_tokens, total_tokens, count_units, estimated_tokens,
+				status_code, is_stream, error_code, retry_count, latency_ms)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+			r.RequestID, userID, keyID, r.UpstreamKeyID, r.EgressIP, r.Provider,
 			r.Model, r.BillingKind, r.QuotaDay, r.PromptTokens, r.CompletionTokens,
-			r.TotalTokens, r.CountUnits, r.EstimatedTokens, r.StatusCode, r.IsStream,
-			r.ErrorCode, r.RetryCount, r.LatencyMS)
+			r.ReasoningTokens, r.TotalTokens, r.CountUnits, r.EstimatedTokens,
+			r.StatusCode, r.IsStream, r.ErrorCode, r.RetryCount, r.LatencyMS)
 	}
 	if err := s.pool.SendBatch(ctx, b).Close(); err != nil {
 		return fmt.Errorf("store: 批量写入用量流水: %w", err)

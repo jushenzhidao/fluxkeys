@@ -114,10 +114,11 @@ egress:
     - addr: "172.16.0.2"
       public_ip: "1.2.3.4"
       max_keys: 8
-upstream:
-  volc_base_url: "http://mockark:8081"
-  model_mapping:
-    deepseek-v3: deepseek-v3-241226
+providers:
+  volc:
+    base_url: "http://mockark:8081"
+    model_mapping:
+      deepseek-v3: deepseek-v3-241226
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -144,10 +145,10 @@ upstream:
 	if cfg.Quota.LeaseTTL != 120*time.Second {
 		t.Errorf("未指定的字段应保留默认值, got %s", cfg.Quota.LeaseTTL)
 	}
-	if got := cfg.UpstreamModel("deepseek-v3"); got != "deepseek-v3-241226" {
+	if got := cfg.UpstreamModel("volc", "deepseek-v3"); got != "deepseek-v3-241226" {
 		t.Errorf("模型映射 = %s", got)
 	}
-	if got := cfg.UpstreamModel("unknown"); got != "unknown" {
+	if got := cfg.UpstreamModel("volc", "unknown"); got != "unknown" {
 		t.Errorf("未映射模型应原样返回, got %s", got)
 	}
 }
@@ -202,14 +203,35 @@ func TestLoad_EmptyPathUsesDefaults(t *testing.T) {
 
 func TestIsCountModel(t *testing.T) {
 	cfg := Default()
-	if !cfg.IsCountModel("seedream") {
+	if !cfg.IsCountModel("volc", "seedream") {
 		t.Error("seedream 应为次数型")
 	}
-	if !cfg.IsCountModel("SeeDream") {
+	if !cfg.IsCountModel("volc", "SeeDream") {
 		t.Error("模型名匹配应忽略大小写")
 	}
-	if cfg.IsCountModel("deepseek-v3") {
+	if cfg.IsCountModel("volc", "deepseek-v3") {
 		t.Error("deepseek-v3 应为 Token 型")
+	}
+}
+
+func TestIsReasoningModel(t *testing.T) {
+	cfg := Default()
+
+	// 带版本后缀的真实模型名必须命中 —— 这是线上实际下发的模型
+	if !cfg.IsReasoningModel("volc", "deepseek-v4-flash-ga-260731") {
+		t.Error("deepseek-v4-flash-ga-260731 应识别为推理模型")
+	}
+	if !cfg.IsReasoningModel("volc", "DeepSeek-R1") {
+		t.Error("模型名匹配应忽略大小写")
+	}
+	if !cfg.IsReasoningModel("volc", "doubao-1-5-thinking-pro") {
+		t.Error("doubao thinking 系列应识别为推理模型")
+	}
+	if cfg.IsReasoningModel("volc", "doubao-pro-32k") {
+		t.Error("非思维链模型不应误判，否则白占额度压低并发")
+	}
+	if cfg.IsReasoningModel("volc", "") {
+		t.Error("空模型名应返回 false")
 	}
 }
 
@@ -305,5 +327,76 @@ func TestParseEgressIPs_档位与容量(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// providers 是 map，yaml 默认逐键合并，于是 Default() 里的 volc 会残留在
+// 只配了别的上游的部署上。危害是模型静默路由到未部署的 provider，
+// 以及单上游自动推断永久失效 —— 两者都不报错，只在运行期表现为诡异行为。
+func TestLoad_显式providers替换默认值(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `
+providers:
+  sensenova:
+    base_url: "https://api.sensenova.cn"
+    quota_kind: count
+    model_mapping:
+      gpt-4: SenseChat-5
+    count_models:
+      - SenseChat-5
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if _, ok := cfg.Providers["volc"]; ok {
+		t.Error("默认的 volc 不应残留在只配了 sensenova 的部署上")
+	}
+	if len(cfg.Providers) != 1 {
+		t.Errorf("providers 应只有 1 个, got %d: %v", len(cfg.Providers), cfg.Providers)
+	}
+	// volc 残留会让 seedream-3.0 命中它的 count_models，请求被送去
+	// 一个从未导入 Key 的上游，报错方向完全偏离。
+	if got := cfg.ProviderForModel("seedream-3.0"); got != "" {
+		t.Errorf("未配置的模型应无归属 provider, got %q", got)
+	}
+	// 唯一 provider 时应能自动推断，这是 DefaultProvider 的核心价值。
+	if got := cfg.ResolveProvider(""); got != "sensenova" {
+		t.Errorf("单上游应自动推断, got %q", got)
+	}
+}
+
+// 计费与推理判定的入参是用户请求里的对外名，而 count_models /
+// reasoning_models 通常按上游名书写。不归一化会让按次模型被当成 token 型:
+// count 额度扣不动，token 额度被凭空消耗。
+func TestIsCountModel_对外名经映射后匹配(t *testing.T) {
+	cfg := Default()
+	cfg.Providers = map[string]Provider{
+		"sensenova": {
+			BaseURL:         "https://api.sensenova.cn",
+			ModelMapping:    map[string]string{"gpt-4": "SenseChat-5"},
+			CountModels:     []string{"SenseChat-5"},
+			ReasoningModels: []string{"SenseChat-Reasoner"},
+		},
+	}
+
+	if !cfg.IsCountModel("sensenova", "gpt-4") {
+		t.Error("对外名 gpt-4 映射到 SenseChat-5，应判为次数型")
+	}
+	if !cfg.IsCountModel("sensenova", "SenseChat-5") {
+		t.Error("直接用上游名调用也应判为次数型")
+	}
+	if cfg.IsCountModel("sensenova", "gpt-3.5-turbo") {
+		t.Error("未映射且不在 count_models 的模型应为 Token 型")
+	}
+
+	cfg.Providers["sensenova"].ModelMapping["r1"] = "SenseChat-Reasoner-V1"
+	if !cfg.IsReasoningModel("sensenova", "r1") {
+		t.Error("对外名 r1 映射到推理模型，应判为推理型")
 	}
 }

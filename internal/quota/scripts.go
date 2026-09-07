@@ -145,19 +145,25 @@ return {1}
 //
 // KEYS[1] 租约 ZSET
 // ARGV[1] now
-// ARGV[2] batch  单批最大回收数
+// ARGV[2] batch        单批最大回收数
+// ARGV[3] data_prefix  租约数据 key 前缀（"{provider}:lease:data:"）
+//
+// 前缀必须由调用方传入而非写死: Go 侧 leaseDataKey 按 provider 拼前缀，
+// 写死 'volc:' 会让非 volc 上游的回收「ZREM 成功但 prededuct 永不还原」——
+// 自愈机制静默失效，正是它要防的假枯竭。
 //
 // 返回已回收的租约数
 const luaReap = `
 local leaseZSet = KEYS[1]
-local now   = tonumber(ARGV[1])
-local batch = tonumber(ARGV[2])
+local now    = tonumber(ARGV[1])
+local batch  = tonumber(ARGV[2])
+local prefix = ARGV[3]
 
 local expired = redis.call('ZRANGEBYSCORE', leaseZSet, '-inf', now, 'LIMIT', 0, batch)
 local n = 0
 
 for _, leaseID in ipairs(expired) do
-  local leaseData = 'volc:lease:data:' .. leaseID
+  local leaseData = prefix .. leaseID
   local quotaKey = redis.call('HGET', leaseData, 'quota_key')
   if quotaKey then
     local amount = tonumber(redis.call('HGET', leaseData, 'amount') or '0')
@@ -174,23 +180,66 @@ end
 return n
 `
 
-// luaReconcile 对账: 以未过期租约之和为准，强制修正 prededuct。
+// luaReconcile 对账: 单脚本内完成「扫租约 → 分组求和 → 修正 prededuct」。
 //
-// 用于兜底 Lua 之外的任何异常路径（如 Redis 主从切换丢写）。
+// 整体原子是硬要求。拆成「Go 侧求和 + Lua 覆写」两步的旧方案存在竞态:
+// 求和之后、覆写之前完成的新 Acquire 会被覆写抹掉预扣，该租约随后
+// Release/Commit 再减一次，prededuct 被钳到 0 —— 本地水位低于真实值，
+// 偏差方向是超刷。放进单脚本后由 Redis 单线程执行保证原子，竞态窗口为零。
 //
-// KEYS[1] 配额 Hash
-// ARGV[1] expected  该 Key 未过期租约金额之和
-// 返回 {drift, corrected}
+// KEYS[1] 租约 ZSET（当日）
+// ARGV[1] now             只统计未过期租约（score >= now）
+// ARGV[2] data_prefix     租约数据 key 前缀（"{provider}:lease:data:"）
+// ARGV[3] quota_tmpl      配额 key 模板（"{provider}:quota:%s:%s:{day}"，
+//                         string.format 依次填入 kind、key_id）
+// ARGV[4..] key_id        参与对账的 Key 列表
+//
+// Key 列表必须由调用方传入而非只扫租约: 「有泄漏但已无未过期租约」的 Key
+// 不会出现在租约集合里，只扫租约永远修不到它 —— 而那恰恰是最需要对账的
+// 形态（预扣悬置、租约记录又已丢失）。
+//
+// 返回扁平数组 {key_id, kind, drift, ...}，只含发生修正的条目。
 const luaReconcile = `
-local quotaKey = KEYS[1]
-local expected = tonumber(ARGV[1])
+local leaseZSet = KEYS[1]
+local now    = tonumber(ARGV[1])
+local prefix = ARGV[2]
+local tmpl   = ARGV[3]
 
-local pre = tonumber(redis.call('HGET', quotaKey, 'prededuct') or '0')
-local drift = pre - expected
-if drift ~= 0 then
-  redis.call('HSET', quotaKey, 'prededuct', expected)
+-- 1. 一次扫描汇总全部未过期租约: expected["kind|key_id"] = Σ amount
+local expected = {}
+local ids = redis.call('ZRANGEBYSCORE', leaseZSet, now, '+inf')
+for _, leaseID in ipairs(ids) do
+  local d = redis.call('HMGET', prefix .. leaseID, 'key_id', 'kind', 'amount')
+  local keyID, kind, amount = d[1], d[2], tonumber(d[3] or '0')
+  if keyID and kind then
+    local b = kind .. '|' .. keyID
+    expected[b] = (expected[b] or 0) + amount
+  end
 end
-return {drift, expected}
+
+-- 2. 逐 Key × kind 比对并修正
+local out = {}
+local kinds = {'token', 'count'}
+for i = 4, #ARGV do
+  local keyID = ARGV[i]
+  for _, kind in ipairs(kinds) do
+    local qk = string.format(tmpl, kind, keyID)
+    -- 只修正已存在的配额 Hash: 对不存在的 key 写 prededuct 会创建一个
+    -- 无 TTL 的孤儿 Hash，永不过期。
+    if redis.call('EXISTS', qk) == 1 then
+      local pre = tonumber(redis.call('HGET', qk, 'prededuct') or '0')
+      local exp = expected[kind .. '|' .. keyID] or 0
+      local drift = pre - exp
+      if drift ~= 0 then
+        redis.call('HSET', qk, 'prededuct', exp)
+        out[#out+1] = keyID
+        out[#out+1] = kind
+        out[#out+1] = drift
+      end
+    end
+  end
+end
+return out
 `
 
 // luaRefreshReset 探测确认某 Key 已在火山侧刷新后，清零本地配额计数。

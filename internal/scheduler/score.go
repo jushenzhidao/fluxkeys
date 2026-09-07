@@ -65,7 +65,14 @@ func scoreHistory(h store.KeyDailyHistory, hasHistory bool) float64 {
 	}
 	ratio := h.TokenRatio
 	if ratio <= 0 && h.TokenLimit > 0 {
-		ratio = float64(h.TokenUsed) / float64(h.TokenLimit)
+		// 与 store 层的回退保持同一口径: 按次计费的上游 token_used 恒为 0，
+		// 只看 token 会让这些 Key 永远拿到满额历史分 —— 正好与 -15 那条
+		// 「昨日刷满必须让位」的反封禁规则相反，越是被刷穿的 Key 越优先。
+		used := h.TokenUsed
+		if used == 0 && h.CountUsed > 0 {
+			used = int64(h.CountUsed)
+		}
+		ratio = float64(used) / float64(h.TokenLimit)
 	}
 
 	if ratio > 0.95 {

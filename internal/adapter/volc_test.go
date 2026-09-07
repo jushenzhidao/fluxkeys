@@ -134,6 +134,36 @@ func TestVolc_解析非流式用量(t *testing.T) {
 	}
 }
 
+func TestVolc_解析推理模型思维链用量(t *testing.T) {
+	v := newTestVolc()
+	// 真实上游响应形状（deepseek-v4-flash）: 88 + 141 = 229，
+	// reasoning_tokens 已含在 completion_tokens 内。
+	u, ok := v.ParseUsage(EndpointChat, []byte(`{"usage":{
+		"prompt_tokens":88,"completion_tokens":141,"total_tokens":229,
+		"completion_tokens_details":{"reasoning_tokens":124}}}`))
+	if !ok {
+		t.Fatal("应解析出 usage")
+	}
+	if u.ReasoningTokens != 124 {
+		t.Errorf("ReasoningTokens = %d, 期望 124", u.ReasoningTokens)
+	}
+	// 关键不变量: 思维链不得叠加进计费口径，否则会重复计费
+	if u.Total() != 229 {
+		t.Errorf("Total() = %d, 期望 229（思维链不额外累加）", u.Total())
+	}
+}
+
+func TestVolc_无思维链字段时reasoning为零(t *testing.T) {
+	v := newTestVolc()
+	u, ok := v.ParseUsage(EndpointChat, []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`))
+	if !ok {
+		t.Fatal("应解析出 usage")
+	}
+	if u.ReasoningTokens != 0 {
+		t.Errorf("ReasoningTokens = %d, 非推理模型应为 0", u.ReasoningTokens)
+	}
+}
+
 func TestVolc_流式中间chunk无usage属正常情况(t *testing.T) {
 	v := newTestVolc()
 	if _, ok := v.ParseUsage(EndpointChat, []byte(`{"choices":[{"delta":{"content":"hi"}}],"usage":null}`)); ok {

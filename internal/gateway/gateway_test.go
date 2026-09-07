@@ -171,7 +171,7 @@ func TestChat_用量流水记录完整字段(t *testing.T) {
 	}{
 		{"UserID", r.UserID, int64(7)},
 		{"UserAPIKeyID", r.UserAPIKeyID, int64(70)},
-		{"VolcKeyID", r.VolcKeyID, "volc_001"},
+		{"UpstreamKeyID", r.UpstreamKeyID, "volc_001"},
 		{"Model", r.Model, "gpt-4o"},
 		{"BillingKind", r.BillingKind, string(quota.KindToken)},
 		{"PromptTokens", r.PromptTokens, int64(30)},
@@ -570,7 +570,7 @@ func TestRetry_耗尽上限后返回错误且租约全部结束(t *testing.T) {
 		t.Fatalf("流水条数 = %d, 期望 1", len(recs))
 	}
 	// 失败也要记流水: 排障时需要知道是哪个 Key 在哪个出口上失败的
-	if recs[0].VolcKeyID == "" || recs[0].ErrorCode == "" {
+	if recs[0].UpstreamKeyID == "" || recs[0].ErrorCode == "" {
 		t.Errorf("失败流水缺少定位信息: %+v", recs[0])
 	}
 }
@@ -735,7 +735,7 @@ func TestConcurrent_预扣阶段的水位约束严格成立(t *testing.T) {
 	var peak int64
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		snap, _ := env.quota.Get(context.Background(), "volc_001", quota.KindToken)
+		snap, _ := env.quota.Get(context.Background(), "volc", "volc_001", quota.KindToken)
 		if snap.Prededuct > peak {
 			peak = snap.Prededuct
 		}
@@ -994,6 +994,86 @@ func TestAdmin_签发用户Key审计只记前缀不记明文(t *testing.T) {
 	}
 }
 
+func TestAdmin_吊销用户Key后鉴权缓存立即失效(t *testing.T) {
+	env := newTestEnv(t)
+	env.upstream.setScript(stubResponse{Status: 200, Body: okChatResp})
+
+	// 1. 先用该 Key 成功请求一次，把鉴权结果灌进缓存
+	resp := env.post(t, "/v1/chat/completions", "user-key-ok", chatBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("预热请求状态码 = %d", resp.StatusCode)
+	}
+
+	// 2. 吊销（默认用户 UserID=7, APIKeyID=70）
+	req, _ := http.NewRequest(http.MethodDelete, env.ts.URL+"/admin/users/7/keys/70", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	dresp, err := env.ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("吊销请求失败: %v", err)
+	}
+	body := readAll(t, dresp)
+	if dresp.StatusCode != http.StatusOK {
+		t.Fatalf("吊销状态码 = %d: %s", dresp.StatusCode, body)
+	}
+
+	// 3. 吊销必须立即生效 —— 不能等缓存 TTL 过期。
+	// fakeStore 已删掉该用户，若缓存未被清空，这里会拿到缓存的旧结果 200。
+	resp = env.post(t, "/v1/chat/completions", "user-key-ok", chatBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("吊销后请求状态码 = %d, 期望 401（缓存未随吊销失效）", resp.StatusCode)
+	}
+
+	// 4. 审计已记录
+	audits := env.store.auditRecords()
+	found := false
+	for _, a := range audits {
+		if a.Action == "revoke_user_api_key" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("吊销操作未写审计日志")
+	}
+}
+
+func TestAdmin_吊销不存在的Key返回404(t *testing.T) {
+	env := newTestEnv(t)
+
+	// key_id 不存在
+	req, _ := http.NewRequest(http.MethodDelete, env.ts.URL+"/admin/users/7/keys/999", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	resp, err := env.ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("状态码 = %d, 期望 404", resp.StatusCode)
+	}
+
+	// key 存在但归属不符（真实 user_id 是 7）: 同样 404，不能吊掉别人的 Key
+	req, _ = http.NewRequest(http.MethodDelete, env.ts.URL+"/admin/users/8/keys/70", nil)
+	req.Header.Set("Authorization", "Bearer admin-secret")
+	resp, err = env.ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("跨用户吊销状态码 = %d, 期望 404", resp.StatusCode)
+	}
+
+	// 归属不符的吊销不得产生任何效果: 原 Key 仍可用
+	env.upstream.setScript(stubResponse{Status: 200, Body: okChatResp})
+	ok := env.post(t, "/v1/chat/completions", "user-key-ok", chatBody)
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Errorf("跨用户吊销后原 Key 状态码 = %d, 应仍为 200", ok.StatusCode)
+	}
+}
+
 // ===== 优雅关闭 =====
 
 func TestShutdown_关闭期间拒绝新请求但等待进行中的流式(t *testing.T) {
@@ -1153,6 +1233,42 @@ func TestImages_按次计费(t *testing.T) {
 	recs := env.store.usageRecords()
 	if len(recs) != 1 || recs[0].BillingKind != string(quota.KindCount) {
 		t.Errorf("流水计费类型 = %v, 期望 count", recs)
+	}
+	// 落库的计费量必须与实扣量一致，否则对账时账面凭空少掉一部分用量。
+	if recs[0].CountUnits != 2 {
+		t.Errorf("流水 count_units = %d, 期望 2（与实扣量一致）", recs[0].CountUnits)
+	}
+	if recs[0].Provider != "volc" {
+		t.Errorf("流水 provider = %q, 期望 volc（本次实际路由的上游）", recs[0].Provider)
+	}
+}
+
+// 上游不回 usage 的按次计费请求（chat 端点即如此）仍要按实扣量落库。
+// 这是真实环境暴露过的缺陷: Redis 实扣 1，流水却记 0。
+func TestCount_上游不回usage时流水仍记实扣量(t *testing.T) {
+	env := newTestEnv(t)
+	env.upstream.setScript(stubResponse{
+		Status: 200,
+		Body:   `{"model":"seedream-3.0","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`,
+	})
+
+	resp := env.post(t, "/v1/chat/completions", "user-key-ok",
+		`{"model":"seedream-3.0","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d: %s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+
+	used := env.quota.usedFor("volc_001", quota.KindCount)
+	if used == 0 {
+		t.Fatalf("count 配额未扣减，用例前提不成立")
+	}
+	recs := env.store.usageRecords()
+	if len(recs) != 1 {
+		t.Fatalf("流水条数 = %d, 期望 1", len(recs))
+	}
+	if got := int64(recs[0].CountUnits); got != used {
+		t.Errorf("流水 count_units = %d, 实扣 = %d —— 账面与配额不一致", got, used)
 	}
 }
 
@@ -1595,6 +1711,65 @@ func TestRateLimit_TPM按预估量扣减(t *testing.T) {
 	env.quota.assertClean(t)
 }
 
+func TestRateLimit_请求结束后归还TPM差额(t *testing.T) {
+	// 预扣按 (估算 + max_tokens) × 放大系数，通常远大于实际用量。
+	// 不归还的话 TPM 被系统性高估，用户在远低于名义限额时就会被 429。
+	env := newTestEnv(t)
+	lim := newFakeLimiter()
+	env.withLimiter(lim)
+	env.store.addUser("user-tpm", UserContext{
+		UserID: 8, APIKeyID: 80, Name: "tpm-user", TPMLimit: 1_000_000,
+	})
+	env.upstream.setScript(stubResponse{Status: 200, Body: okChatResp})
+
+	resp := env.post(t, "/v1/chat/completions", "user-tpm", chatBody)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d", resp.StatusCode)
+	}
+
+	amounts := lim.tokenAmounts()
+	if len(amounts) != 1 {
+		t.Fatalf("AllowTokens 调用 %d 次, 期望 1", len(amounts))
+	}
+	lim.mu.Lock()
+	refunds := append([]int64(nil), lim.refunds...)
+	lim.mu.Unlock()
+	if len(refunds) != 1 {
+		t.Fatalf("RefundTokens 调用 %d 次, 期望 1", len(refunds))
+	}
+	// okChatResp 的实际用量远小于预扣量，归还量必须为正且小于预扣量
+	if refunds[0] <= 0 || refunds[0] >= amounts[0] {
+		t.Errorf("归还量 = %d, 应在 (0, %d) 内", refunds[0], amounts[0])
+	}
+}
+
+func TestRateLimit_失败请求全额归还TPM(t *testing.T) {
+	// 上游全部失败时没有任何真实消耗，预扣的令牌必须原数还回，
+	// 否则重试风暴会把用户的 TPM 白白吃光。
+	env := newTestEnv(t)
+	lim := newFakeLimiter()
+	env.withLimiter(lim)
+	env.store.addUser("user-tpm2", UserContext{
+		UserID: 9, APIKeyID: 90, Name: "tpm-user2", TPMLimit: 1_000_000,
+	})
+	env.upstream.setScript(stubResponse{Status: 500, Body: `{"error":{"message":"boom"}}`})
+
+	resp := env.post(t, "/v1/chat/completions", "user-tpm2", chatBody)
+	resp.Body.Close()
+
+	amounts := lim.tokenAmounts()
+	lim.mu.Lock()
+	refunds := append([]int64(nil), lim.refunds...)
+	lim.mu.Unlock()
+	if len(amounts) != 1 || len(refunds) != 1 {
+		t.Fatalf("allow=%d refund=%d, 均期望 1 次", len(amounts), len(refunds))
+	}
+	if refunds[0] != amounts[0] {
+		t.Errorf("失败请求应全额归还: 预扣 %d, 归还 %d", amounts[0], refunds[0])
+	}
+}
+
 func TestRateLimit_Redis故障时放行(t *testing.T) {
 	// fail-open: 限流是用量保护而非安全边界。Redis 抖动时拒绝全部请求会把
 	// 一次依赖故障放大成完全不可用。真正的超刷防线是配额层的 Lua 预扣。
@@ -1655,7 +1830,9 @@ func TestRateLimit_类型化nil指针不导致panic(t *testing.T) {
 		t.Fatalf("构造出口池: %v", err)
 	}
 	cfg := config.Default()
-	cfg.Upstream.ModelMapping = map[string]string{"gpt-4o": "ep"}
+	volcCfg := cfg.Providers["volc"]
+	volcCfg.ModelMapping = map[string]string{"gpt-4o": "ep"}
+	cfg.Providers["volc"] = volcCfg
 	srv, err := New(Deps{
 		Config: cfg, Quota: newFakeQuota(1000), Egress: pool,
 		Sched: newFakeSched("k1"), Store: newFakeStore(),

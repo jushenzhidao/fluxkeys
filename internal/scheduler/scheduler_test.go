@@ -20,19 +20,19 @@ import (
 // fakeStore 用内存数据替代 Postgres，让调度逻辑测试不依赖外部服务。
 type fakeStore struct {
 	mu      sync.Mutex
-	keys    []store.VolcKey
-	history map[string]store.KeyDailyHistory
+	keys    []store.UpstreamKey
+	history map[store.HistoryKey]store.KeyDailyHistory
 	listErr error
 	histErr error
 }
 
-func (f *fakeStore) ListVolcKeys(ctx context.Context, filter store.VolcKeyFilter) ([]store.VolcKey, error) {
+func (f *fakeStore) ListUpstreamKeys(ctx context.Context, filter store.UpstreamKeyFilter) ([]store.UpstreamKey, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	var out []store.VolcKey
+	var out []store.UpstreamKey
 	for _, k := range f.keys {
 		if filter.Status != "" && k.Status != filter.Status {
 			continue
@@ -42,16 +42,22 @@ func (f *fakeStore) ListVolcKeys(ctx context.Context, filter store.VolcKeyFilter
 	return out, nil
 }
 
-func (f *fakeStore) GetKeyHistory(ctx context.Context, keyIDs []string, day time.Time) (map[string]store.KeyDailyHistory, error) {
+func (f *fakeStore) GetKeyHistory(ctx context.Context, keyIDs []string, day time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.histErr != nil {
 		return nil, f.histErr
 	}
-	out := map[string]store.KeyDailyHistory{}
+	// 按 keyID 过滤但保留完整复合键: 真实实现返回的是 (key, provider) 维度，
+	// 替身若把 provider 抹平，就无法暴露调度侧拿错 provider 历史的问题。
+	want := make(map[string]bool, len(keyIDs))
 	for _, id := range keyIDs {
-		if h, ok := f.history[id]; ok {
-			out[id] = h
+		want[id] = true
+	}
+	out := map[store.HistoryKey]store.KeyDailyHistory{}
+	for k, h := range f.history {
+		if want[k.UpstreamKeyID] {
+			out[k] = h
 		}
 	}
 	return out, nil
@@ -65,7 +71,7 @@ type fakeQuota struct {
 	calls int
 }
 
-func (f *fakeQuota) GetMany(ctx context.Context, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
+func (f *fakeQuota) GetMany(ctx context.Context, provider string, keyIDs []string, kind quota.Kind) (map[string]quota.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -102,6 +108,16 @@ func testCfg() config.Scheduler {
 	return c
 }
 
+// testConf 把调度配置包成完整的 *config.Config 配置源。
+//
+// 水位与量纲要走 config.Config 上的真实规则（provider 覆盖优先、比例取全局），
+// 在测试里另搭一套假的会让量纲类断言测的是假实现而不是生产逻辑。
+func testConf(sc config.Scheduler) StaticConfig {
+	cfg := config.Default()
+	cfg.Scheduler = sc
+	return StaticConfig{Cfg: cfg}
+}
+
 func newFixture(t *testing.T, n int, opts ...func(*config.Scheduler)) (*Scheduler, *fakeStore, *fakeQuota) {
 	t.Helper()
 
@@ -109,19 +125,18 @@ func newFixture(t *testing.T, n int, opts ...func(*config.Scheduler)) (*Schedule
 	for _, o := range opts {
 		o(&cfg)
 	}
-	qcfg := config.Default().Quota
 
-	fs := &fakeStore{history: map[string]store.KeyDailyHistory{}}
+	fs := &fakeStore{history: map[store.HistoryKey]store.KeyDailyHistory{}}
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("volc_%03d", i)
-		fs.keys = append(fs.keys, store.VolcKey{
-			KeyID: id, Secret: "secret-" + id, Status: store.VolcStatusActive,
+		fs.keys = append(fs.keys, store.UpstreamKey{
+			KeyID: id, Secret: "secret-" + id, Status: store.KeyStatusActive,
 			Pool: "hot", EgressIP: fmt.Sprintf("172.16.0.%d", i%250+2), HealthScore: 100,
 		})
 	}
 	fq := &fakeQuota{}
 
-	s := New(cfg, qcfg, fs, fq)
+	s := New(testConf(cfg), fs, fq)
 	s.SetClock(testTime)
 	s.SetRandSource(42)
 	if err := s.Reload(context.Background()); err != nil {
@@ -129,6 +144,19 @@ func newFixture(t *testing.T, n int, opts ...func(*config.Scheduler)) (*Schedule
 	}
 	s.RefreshSnapshot(context.Background())
 	return s, fs, fq
+}
+
+// setQuotaInterval 改配置源里的快照刷新间隔。
+//
+// 不能再像以前那样直接改 s.quotaC —— 配置已改为从 ConfigSource 读，
+// 改一份副本不会影响调度器实际读到的值，测试会静默失去时序控制。
+func setQuotaInterval(t *testing.T, s *Scheduler, d time.Duration) {
+	t.Helper()
+	sc, ok := s.conf.(StaticConfig)
+	if !ok {
+		t.Fatalf("测试配置源应为 StaticConfig，实际为 %T", s.conf)
+	}
+	sc.Cfg.Quota.SnapshotInterval = d
 }
 
 // activeKeyAt 返回在给定时刻处于活跃时段的一个 Key ID。
@@ -277,10 +305,10 @@ func TestSelect_高分Key被选中概率更高(t *testing.T) {
 	cfg.EnablePersona = false // 排除画像干扰，只看配额维度
 	qcfg := config.Default().Quota
 
-	fs := &fakeStore{history: map[string]store.KeyDailyHistory{}}
+	fs := &fakeStore{history: map[store.HistoryKey]store.KeyDailyHistory{}}
 	for _, id := range []string{"rich", "poor"} {
-		fs.keys = append(fs.keys, store.VolcKey{
-			KeyID: id, Secret: "s", Status: store.VolcStatusActive, HealthScore: 100,
+		fs.keys = append(fs.keys, store.UpstreamKey{
+			KeyID: id, Secret: "s", Status: store.KeyStatusActive, HealthScore: 100,
 		})
 	}
 	fq := &fakeQuota{}
@@ -289,7 +317,7 @@ func TestSelect_高分Key被选中概率更高(t *testing.T) {
 	// 取 95% 硬水位，此时已越过软水位（soft/hard = 0.8/0.9），会叠加 SoftPenalty
 	fq.set("poor", quota.Snapshot{Used: hard * 95 / 100, Hard: hard, Soft: soft})
 
-	s := New(cfg, qcfg, fs, fq)
+	s := New(testConf(cfg), fs, fq)
 	s.SetClock(testTime)
 	s.SetRandSource(7)
 	if err := s.Reload(context.Background()); err != nil {
@@ -330,10 +358,10 @@ func TestSelect_配额维度不足以独自压制耗尽的Key(t *testing.T) {
 	qcfg := config.Default().Quota
 	hard, soft := qcfg.TokenHard(), qcfg.TokenSoft()
 
-	fs := &fakeStore{history: map[string]store.KeyDailyHistory{}}
+	fs := &fakeStore{history: map[store.HistoryKey]store.KeyDailyHistory{}}
 	for _, id := range []string{"rich", "thin"} {
-		fs.keys = append(fs.keys, store.VolcKey{
-			KeyID: id, Secret: "s", Status: store.VolcStatusActive, HealthScore: 100,
+		fs.keys = append(fs.keys, store.UpstreamKey{
+			KeyID: id, Secret: "s", Status: store.KeyStatusActive, HealthScore: 100,
 		})
 	}
 	fq := &fakeQuota{}
@@ -341,7 +369,7 @@ func TestSelect_配额维度不足以独自压制耗尽的Key(t *testing.T) {
 	// 剩余 15%，但 used 仍低于软水位 → 不触发 SoftPenalty
 	fq.set("thin", quota.Snapshot{Used: hard * 85 / 100, Hard: hard, Soft: soft})
 
-	s := New(cfg, qcfg, fs, fq)
+	s := New(testConf(cfg), fs, fq)
 	s.SetClock(testTime)
 	s.SetRandSource(11)
 	if err := s.Reload(context.Background()); err != nil {
@@ -456,7 +484,7 @@ func TestSelect_软水位扣分但仍可选(t *testing.T) {
 	if err != nil {
 		t.Fatalf("全池过软水位时应仍可调度: %v", err)
 	}
-	if c.Score.SoftPenalty != s.cfg.SoftPenalty {
+	if c.Score.SoftPenalty != s.conf.Scheduler().SoftPenalty {
 		t.Fatalf("软水位未扣分: %+v", c.Score)
 	}
 
@@ -524,7 +552,7 @@ func TestRefreshSnapshot_失败时保留上一轮值且不影响调度(t *testin
 
 func TestStart_后台周期刷新快照(t *testing.T) {
 	s, _, fq := newFixture(t, 5)
-	s.quotaC.SnapshotInterval = 10 * time.Millisecond
+	setQuotaInterval(t, s, 10*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -544,7 +572,7 @@ func TestStart_后台周期刷新快照(t *testing.T) {
 
 func TestStop_可重复调用(t *testing.T) {
 	s, _, _ := newFixture(t, 3)
-	s.quotaC.SnapshotInterval = 10 * time.Millisecond
+	setQuotaInterval(t, s, 10*time.Millisecond)
 	s.Start(context.Background())
 	s.Stop()
 	s.Stop() // 重复调用不应 panic
@@ -590,14 +618,13 @@ func TestSelect_关闭persona后不做时段过滤(t *testing.T) {
 
 func TestSelect_全部Key非活跃时报可诊断错误(t *testing.T) {
 	cfg := testCfg()
-	qcfg := config.Default().Quota
 	fs := &fakeStore{
-		history: map[string]store.KeyDailyHistory{},
-		keys: []store.VolcKey{
-			{KeyID: "k1", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
+		keys: []store.UpstreamKey{
+			{KeyID: "k1", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
 		},
 	}
-	s := New(cfg, qcfg, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatal(err)
@@ -633,15 +660,14 @@ func TestSelect_最小请求间隔约束(t *testing.T) {
 	cfg := testCfg()
 	cfg.EnablePersona = false
 	cfg.MinRequestInterval = 5 * time.Second
-	qcfg := config.Default().Quota
 
 	fs := &fakeStore{
-		history: map[string]store.KeyDailyHistory{},
-		keys: []store.VolcKey{
-			{KeyID: "only", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
+		keys: []store.UpstreamKey{
+			{KeyID: "only", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
 		},
 	}
-	s := New(cfg, qcfg, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatal(err)
@@ -708,15 +734,14 @@ func TestMarkFailure_连续429进入冷却(t *testing.T) {
 func TestSelect_冷却中的Key不被选中且到期自动恢复(t *testing.T) {
 	cfg := testCfg()
 	cfg.EnablePersona = false
-	qcfg := config.Default().Quota
 	fs := &fakeStore{
-		history: map[string]store.KeyDailyHistory{},
-		keys: []store.VolcKey{
-			{KeyID: "k1", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
+		keys: []store.UpstreamKey{
+			{KeyID: "k1", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
 		},
 	}
 	fq := &fakeQuota{}
-	s := New(cfg, qcfg, fs, fq)
+	s := New(testConf(cfg), fs, fq)
 
 	nowVal := testTime()
 	s.SetClock(func() time.Time { return nowVal })
@@ -850,14 +875,13 @@ func TestMarkFailure_健康度过低自动冷却(t *testing.T) {
 func TestSetKeyStatus_显式封禁与恢复(t *testing.T) {
 	cfg := testCfg()
 	cfg.EnablePersona = false
-	qcfg := config.Default().Quota
 	fs := &fakeStore{
-		history: map[string]store.KeyDailyHistory{},
-		keys: []store.VolcKey{
-			{KeyID: "k1", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
+		keys: []store.UpstreamKey{
+			{KeyID: "k1", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
 		},
 	}
-	s := New(cfg, qcfg, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatal(err)
@@ -945,6 +969,11 @@ func TestScoreHistory_昨日刷满受罚(t *testing.T) {
 		{"昨日消耗10%含3天连续", store.KeyDailyHistory{TokenRatio: 0.1, ConsecutiveLightDays: 3}, true, 31.5},
 		{"连续加分封顶15", store.KeyDailyHistory{TokenRatio: 0, ConsecutiveLightDays: 99}, true, 40},
 		{"ratio由used推导", store.KeyDailyHistory{TokenUsed: 500, TokenLimit: 1000}, true, 12.5},
+		// 按次计费上游（商汤公测）的 token_used 恒为 0，额度也是按次给的。
+		// 只看 TokenUsed 会让刷满次数的 Key 拿到满额历史分 —— 与「昨日刷满
+		// 必须让位」的反封禁规则正好相反，越危险的 Key 越优先被选中。
+		{"按次计费刷满同样受罚", store.KeyDailyHistory{CountUsed: 1300, TokenLimit: 1260}, true, -15},
+		{"按次计费半额正常打分", store.KeyDailyHistory{CountUsed: 630, TokenLimit: 1260}, true, 12.5},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1044,7 +1073,7 @@ func TestScoreAll_不改变状态(t *testing.T) {
 func TestReload_装载失败返回错误(t *testing.T) {
 	cfg := testCfg()
 	fs := &fakeStore{listErr: errors.New("库挂了")}
-	s := New(cfg, config.Default().Quota, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	if err := s.Reload(context.Background()); err == nil {
 		t.Fatal("装载失败应返回错误")
 	}
@@ -1056,11 +1085,11 @@ func TestReload_历史查询失败时降级为无历史而非整体失败(t *tes
 	cfg.EnablePersona = false
 	fs := &fakeStore{
 		histErr: errors.New("历史表挂了"),
-		keys: []store.VolcKey{
-			{KeyID: "k1", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
+		keys: []store.UpstreamKey{
+			{KeyID: "k1", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
 		},
 	}
-	s := New(cfg, config.Default().Quota, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatalf("历史查询失败不应导致 Reload 失败: %v", err)
@@ -1077,14 +1106,14 @@ func TestReload_历史查询失败时降级为无历史而非整体失败(t *tes
 func TestReload_只装载active状态的Key(t *testing.T) {
 	cfg := testCfg()
 	fs := &fakeStore{
-		history: map[string]store.KeyDailyHistory{},
-		keys: []store.VolcKey{
-			{KeyID: "ok", Secret: "s", Status: store.VolcStatusActive, HealthScore: 100},
-			{KeyID: "banned", Secret: "s", Status: store.VolcStatusBanned, HealthScore: 0},
-			{KeyID: "cool", Secret: "s", Status: store.VolcStatusCooldown, HealthScore: 50},
+		history: map[store.HistoryKey]store.KeyDailyHistory{},
+		keys: []store.UpstreamKey{
+			{KeyID: "ok", Secret: "s", Status: store.KeyStatusActive, HealthScore: 100},
+			{KeyID: "banned", Secret: "s", Status: store.KeyStatusBanned, HealthScore: 0},
+			{KeyID: "cool", Secret: "s", Status: store.KeyStatusCooldown, HealthScore: 50},
 		},
 	}
-	s := New(cfg, config.Default().Quota, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1229,19 +1258,19 @@ func BenchmarkSelect(b *testing.B) {
 	cfg.MinRequestInterval = 0
 	qcfg := config.Default().Quota
 
-	fs := &fakeStore{history: map[string]store.KeyDailyHistory{}}
+	fs := &fakeStore{history: map[store.HistoryKey]store.KeyDailyHistory{}}
 	fq := &fakeQuota{snaps: map[string]quota.Snapshot{}}
 	for i := 0; i < 100; i++ {
 		id := fmt.Sprintf("volc_%03d", i)
-		fs.keys = append(fs.keys, store.VolcKey{
-			KeyID: id, Secret: "s", Status: store.VolcStatusActive, HealthScore: 100,
+		fs.keys = append(fs.keys, store.UpstreamKey{
+			KeyID: id, Secret: "s", Status: store.KeyStatusActive, HealthScore: 100,
 		})
 		fq.snaps[id] = quota.Snapshot{
 			Used: int64(i) * 10_000, Hard: qcfg.TokenHard(), Soft: qcfg.TokenSoft(),
 		}
 	}
 
-	s := New(cfg, qcfg, fs, fq)
+	s := New(testConf(cfg), fs, fq)
 	s.SetClock(testTime)
 	if err := s.Reload(context.Background()); err != nil {
 		b.Fatal(err)
@@ -1296,14 +1325,14 @@ func newPooledFixture(t *testing.T, counts map[string]int,
 		o(&cfg)
 	}
 
-	fs := &fakeStore{history: map[string]store.KeyDailyHistory{}}
+	fs := &fakeStore{history: map[store.HistoryKey]store.KeyDailyHistory{}}
 	i := 0
 	// 固定档位顺序，保证 Key ID 与档位的对应关系可复现
 	for _, pool := range []string{PoolHot, PoolWarm, PoolCold} {
 		for n := 0; n < counts[pool]; n++ {
 			id := fmt.Sprintf("%s_%03d", pool, n)
-			fs.keys = append(fs.keys, store.VolcKey{
-				KeyID: id, Secret: "secret-" + id, Status: store.VolcStatusActive,
+			fs.keys = append(fs.keys, store.UpstreamKey{
+				KeyID: id, Secret: "secret-" + id, Status: store.KeyStatusActive,
 				Pool: pool, EgressIP: fmt.Sprintf("172.16.0.%d", i%250+2),
 				HealthScore: 100,
 			})
@@ -1311,7 +1340,7 @@ func newPooledFixture(t *testing.T, counts map[string]int,
 		}
 	}
 
-	s := New(cfg, config.Default().Quota, fs, &fakeQuota{})
+	s := New(testConf(cfg), fs, &fakeQuota{})
 	s.SetClock(testTime)
 	s.SetRandSource(42)
 	if err := s.Reload(context.Background()); err != nil {

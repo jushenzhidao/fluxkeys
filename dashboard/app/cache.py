@@ -2,12 +2,14 @@
 
 Key 命名与 Go 侧 ``internal/quota/manager.go`` 严格对应：
 
-- 配额热态：``volc:quota:{kind}:{key_id}:{quota_day}``（Hash）
+- 配额热态：``{provider}:quota:{kind}:{key_id}:{quota_day}``（Hash）
   字段 ``used`` / ``prededuct`` / ``hard_limit`` / ``soft_limit`` / ``last_updated``
-- 租约集合：``volc:lease:{quota_day}``（ZSET，score = 到期时间戳）
-- 租约明细：``volc:lease:data:{lease_id}``（Hash，字段 key_id / kind / amount）
+- 租约集合：``{provider}:lease:{quota_day}``（ZSET，score = 到期时间戳）
+- 租约明细：``{provider}:lease:data:{lease_id}``（Hash，字段 key_id / kind / amount）
 
-其中 ``{quota_day}`` 是配额日的 ``yyyyMMdd``，**不是自然日**。
+其中 ``{quota_day}`` 是配额日的 ``yyyyMMdd``，**不是自然日**；``{provider}``
+默认 ``volc`` —— 看板当前只展示火山池，但前缀必须走同一个常量而不是散落
+硬编码，Go 侧曾因 Lua 里写死 'volc:' 导致其他 provider 的租约回收静默失效。
 
 本模块只读：仅使用 HGETALL / ZRANGEBYSCORE / ZCARD 等读命令，不含任何写操作。
 """
@@ -28,19 +30,23 @@ from .quotaday import day_to_key
 KIND_TOKEN = "token"
 KIND_COUNT = "count"
 
+# 看板当前展示的上游。多 provider 展示时把它升级为查询参数即可，
+# 所有 key 构造函数都已接收 provider 形参。
+DEFAULT_PROVIDER = "volc"
 
-def quota_key(kind: str, key_id: str, day: date) -> str:
+
+def quota_key(kind: str, key_id: str, day: date, provider: str = DEFAULT_PROVIDER) -> str:
     """拼出配额热态的 Redis Key。"""
-    return f"volc:quota:{kind}:{key_id}:{day_to_key(day)}"
+    return f"{provider}:quota:{kind}:{key_id}:{day_to_key(day)}"
 
 
-def lease_zset(day: date) -> str:
+def lease_zset(day: date, provider: str = DEFAULT_PROVIDER) -> str:
     """拼出租约 ZSET 的 Redis Key。"""
-    return f"volc:lease:{day_to_key(day)}"
+    return f"{provider}:lease:{day_to_key(day)}"
 
 
-def lease_data_key(lease_id: str) -> str:
-    return f"volc:lease:data:{lease_id}"
+def lease_data_key(lease_id: str, provider: str = DEFAULT_PROVIDER) -> str:
+    return f"{provider}:lease:data:{lease_id}"
 
 
 def _to_int(value: Any) -> int:

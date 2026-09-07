@@ -14,6 +14,9 @@ from typing import Any, Final
 
 import httpx
 
+from .error_envelope import extract_error_extras, extract_gateway_error, redact
+from .provider_forward import ProviderForwardMixin
+
 # 分维度超时，不用单一总超时。
 #
 # connect 单独设短：网关不可达应当快速失败，而不是让运维等满整个读超时。
@@ -37,12 +40,19 @@ class GatewayError(Exception):
         detail: str,
         gateway_code: str = "",
         gateway_status: int = 0,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(detail)
         self.status = status
         self.detail = detail
         self.gateway_code = gateway_code
         self.gateway_status = gateway_status
+        # 网关错误响应里 error 信封之外的同级字段（failures / diff / warnings）。
+        #
+        # provider 校验失败逐字段回问题（admin_provider.go:686-702），跨量纲
+        # 变更被拒时附字段级差异（:708-721）。压平成一句 detail 会让运维在
+        # 十几个字段里靠猜定位，而这些结构正是为了免掉这一步才存在的。
+        self.extra: dict[str, Any] = extra or {}
 
     def to_payload(self) -> dict[str, Any]:
         """转成看板的错误结构。
@@ -50,13 +60,15 @@ class GatewayError(Exception):
         前端 fetchJSON 统一按 ``detail`` 取文案，所以必须转译成 ``{detail}``
         而不是裸传网关的 ``{"error": {...}}`` —— 后者会让前端对管理端点走
         一套解析、对报表端点走另一套，在原生 JS 里再分叉一条错误路径。
-        ``gateway_code`` 保留供排障，不参与前端展示决策。
+        ``gateway_code`` 保留，前端据它分派文案（同一状态码下有多种处置动作，
+        只看状态码只能给模糊提示）。
         """
         payload: dict[str, Any] = {"detail": self.detail}
         if self.gateway_code:
             payload["gateway_code"] = self.gateway_code
         if self.gateway_status:
             payload["gateway_status"] = self.gateway_status
+        payload.update(self.extra)
         return payload
 
 
@@ -68,7 +80,7 @@ class GatewayResponse:
     payload: Any
 
 
-class GatewayClient:
+class GatewayClient(ProviderForwardMixin):
     """管理接口转发客户端。
 
     持有**单个** ``AsyncClient``，由 FastAPI 的 lifespan 管理生命周期。
@@ -172,8 +184,7 @@ class GatewayClient:
             # 可能超时。正确的引导是先刷新列表确认实际状态。
             raise GatewayError(
                 504,
-                "请求已发出但未在超时内返回，操作可能已生效。"
-                "请刷新列表确认实际状态，不要直接重试",
+                "请求已发出但未在超时内返回，操作可能已生效。请刷新列表确认实际状态，不要直接重试",
             ) from exc
         except httpx.ConnectError as exc:
             raise GatewayError(502, "网关服务不可达，请检查 gateway 容器状态") from exc
@@ -182,9 +193,12 @@ class GatewayClient:
 
         return self._interpret(resp)
 
-    @staticmethod
-    def _interpret(resp: httpx.Response) -> GatewayResponse:
-        """把网关响应转成看板语义，必要时抛 GatewayError。"""
+    def _interpret(self, resp: httpx.Response) -> GatewayResponse:
+        """把网关响应转成看板语义，必要时抛 GatewayError。
+
+        改为实例方法（原为 staticmethod）以便拿到管理密钥做脱敏 —— 透传网关
+        文案的分支变多后，「网关文案里绝不含密钥」这个假设不再值得依赖。
+        """
         try:
             payload: Any = resp.json()
         except ValueError:
@@ -193,7 +207,9 @@ class GatewayClient:
         if resp.status_code < 400:
             return GatewayResponse(status=resp.status_code, payload=payload)
 
-        message, code = _extract_gateway_error(payload)
+        message, code = extract_gateway_error(payload)
+        message = redact(message, (self._admin_api_key,))
+        extra = extract_error_extras(payload)
 
         # 401 必须转成 500，绝不透传。
         #
@@ -214,26 +230,24 @@ class GatewayClient:
             raise GatewayError(500, "看板向网关发送了不被允许的方法", code, resp.status_code)
 
         # 400 / 404 / 409 是调用方真正需要看到的业务错误，透传网关文案。
-        if resp.status_code in {400, 404, 409, 413, 429, 503}:
-            raise GatewayError(resp.status_code, message, code, resp.status_code)
+        #
+        # 422 与 501 是 provider 配置端点引入的：
+        #
+        # - **422** 用于跨量纲变更被拒（admin_provider.go:704-721）。它与 409 的
+        #   区别是刻意的：409 意味着「别人先改了，刷新重试即可」，而跨量纲变更
+        #   重试一万次也不会成功，正确的补救是新建 provider。收敛成 502 会让这
+        #   条永久失败被显示成「网关返回异常」，运维于是去查网关而不是改做法。
+        # - **501** 表示该部署未启用配置管理（providerStore 类型断言失败）。压成
+        #   502 会让「这个部署没这功能」显示成「网关出错了」，运维会去重启一个
+        #   本来就正常的容器。
+        if resp.status_code in {400, 404, 409, 413, 422, 429, 501, 503}:
+            raise GatewayError(resp.status_code, message, code, resp.status_code, extra)
 
         # 其余 5xx 收敛为 502：语义上看板是网关的代理。
-        return _raise_bad_gateway(message, code, resp.status_code)
+        return _raise_bad_gateway(message, code, resp.status_code, extra)
 
 
-def _raise_bad_gateway(message: str, code: str, status: int) -> GatewayResponse:
-    raise GatewayError(502, message or "网关返回异常", code, status)
-
-
-def _extract_gateway_error(payload: Any) -> tuple[str, str]:
-    """从网关的 OpenAI 风格错误结构里取出文案与错误码。"""
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        if isinstance(err, dict):
-            message = err.get("message")
-            code = err.get("code")
-            return (
-                message if isinstance(message, str) else "",
-                code if isinstance(code, str) else "",
-            )
-    return "", ""
+def _raise_bad_gateway(
+    message: str, code: str, status: int, extra: dict[str, Any] | None = None
+) -> GatewayResponse:
+    raise GatewayError(502, message or "网关返回异常", code, status, extra)

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -115,12 +116,22 @@ class ReportService:
         now = self.now()
         day = quota_day(now)
 
-        usage = await q.overview_usage(self._db, day)
-        counts = await q.key_counts(self._db)
-        pools = await q.key_pool_distribution(self._db)
-        statuses = await q.key_status_distribution(self._db)
-        key_ids = await q.active_key_ids(self._db)
-        snaps = await self._cache.snapshots(key_ids, day, KIND_TOKEN)
+        # 六个数据源相互独立，gather 并发把首屏延迟从「各查询之和」
+        # 压到「最慢者」。看板与网关共用 Postgres，串行瀑布在库抖动时
+        # 会被逐项放大。
+        usage, counts, pools, statuses, key_ids = await asyncio.gather(
+            q.overview_usage(self._db, day),
+            q.key_counts(self._db),
+            q.key_pool_distribution(self._db),
+            q.key_status_distribution(self._db),
+            q.active_key_ids(self._db),
+        )
+        # snapshots 依赖 key_ids，quota_health 内部另拉全量，二者再并发一轮。
+        snaps, health = await asyncio.gather(
+            self._cache.snapshots(key_ids, day, KIND_TOKEN),
+            # 告警数与 quota/health 口径一致，避免两个页面数字打架。
+            self.quota_health(limit=200),
+        )
 
         ratios = [s.ratio for s in snaps.values()]
         capacity = sum(s.hard for s in snaps.values())
@@ -128,9 +139,6 @@ class ReportService:
 
         requests = _num(usage["requests"]) if usage else 0
         errors = _num(usage["errors"]) if usage else 0
-
-        # 告警数与 quota/health 口径一致，避免两个页面数字打架。
-        health = await self.quota_health(limit=200)
 
         return m.OverviewResp(
             quota_day=day,
@@ -204,8 +212,10 @@ class ReportService:
 
         total = await q.count_keys(self._db, status, pool)
         key_ids = [str(r["key_id"]) for r in rows]
-        token_snaps = await self._cache.snapshots(key_ids, day, KIND_TOKEN)
-        count_snaps = await self._cache.snapshots(key_ids, day, KIND_COUNT)
+        token_snaps, count_snaps = await asyncio.gather(
+            self._cache.snapshots(key_ids, day, KIND_TOKEN),
+            self._cache.snapshots(key_ids, day, KIND_COUNT),
+        )
 
         items = [self._key_row(r, token_snaps, count_snaps) for r in rows]
 
@@ -261,12 +271,21 @@ class ReportService:
             return None
 
         window = recent_quota_days(now, days)
-        token_snaps = await self._cache.snapshots([key_id], day, KIND_TOKEN)
-        count_snaps = await self._cache.snapshots([key_id], day, KIND_COUNT)
-        trend_rows = await q.key_trend(self._db, key_id, window)
-        model_rows = await q.key_model_usage(self._db, key_id, window)
-        error_rows = await q.key_error_buckets(self._db, key_id, window)
-        leases = await self._cache.lease_aggregate(day, int(now.timestamp()))
+        (
+            token_snaps,
+            count_snaps,
+            trend_rows,
+            model_rows,
+            error_rows,
+            leases,
+        ) = await asyncio.gather(
+            self._cache.snapshots([key_id], day, KIND_TOKEN),
+            self._cache.snapshots([key_id], day, KIND_COUNT),
+            q.key_trend(self._db, key_id, window),
+            q.key_model_usage(self._db, key_id, window),
+            q.key_error_buckets(self._db, key_id, window),
+            self._cache.lease_aggregate(day, int(now.timestamp())),
+        )
 
         by_day = {r["quota_day"]: r for r in trend_rows}
         trend = [
@@ -581,16 +600,19 @@ class ReportService:
         now = self.now()
         day = quota_day(now)
         key_ids = await q.active_key_ids(self._db)
-        snaps = await self._cache.snapshots(key_ids, day, KIND_TOKEN)
-        leases = await self._cache.lease_aggregate(day, int(now.timestamp()))
-        drift_rows = await q.recent_drifts(self._db, limit)
+        snaps, leases, drift_rows, key_rows = await asyncio.gather(
+            self._cache.snapshots(key_ids, day, KIND_TOKEN),
+            self._cache.lease_aggregate(day, int(now.timestamp())),
+            q.recent_drifts(self._db, limit),
+            q.all_key_rows(self._db),
+        )
 
         alerts: list[m.QuotaAlert] = []
         leaks: list[m.LeaseLeakRow] = []
         near_hard: list[m.NearHardRow] = []
         missing_hot: list[str] = []
 
-        pool_of = {str(r["key_id"]): str(r["pool"] or "") for r in await q.all_key_rows(self._db)}
+        pool_of = {str(r["key_id"]): str(r["pool"] or "") for r in key_rows}
 
         for key_id in key_ids:
             snap = snaps.get(key_id)

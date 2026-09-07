@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fluxkeys/fluxkeys/internal/config"
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/metrics"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
@@ -190,16 +192,24 @@ type fakeStore struct {
 	pingErr error
 	// recordErr 非 nil 时 RecordUsage 失败。
 	recordErr error
-	// upsertErr 非 nil 时 UpsertVolcKey 失败。
+	// upsertErr 非 nil 时 UpsertUpstreamKey 失败。
 	upsertErr error
 	// keyMeta 是 Key 的可 PATCH 元数据，以 key_id 为索引。
 	keyMeta map[string]keyMeta
-	// patchErr 非 nil 时 PatchVolcKeyState 失败，用于覆盖 500 分支。
+	// patchErr 非 nil 时 PatchUpstreamKeyState 失败，用于覆盖 500 分支。
 	patchErr error
 	// egressIPs 记录 SetVolcKeyEgressIP 落库的出口绑定，以 key_id 为索引。
 	egressIPs map[string]string
 	// setEgressErr 非 nil 时 SetVolcKeyEgressIP 失败，用于覆盖「迁移成功但落库失败」的降级分支。
 	setEgressErr error
+	// shardCalls 记录 AssignShard 的调用，供分片端点测试断言。
+	shardCalls []shardCall
+}
+
+// shardCall 是一次 AssignShard 调用的入参快照。
+type shardCall struct {
+	Shard  string
+	KeyIDs []string
 }
 
 // keyMeta 是 PATCH 端点可改的三个字段。
@@ -271,7 +281,23 @@ func (f *fakeStore) CreateUserAPIKey(ctx context.Context, userID int64, name str
 	return "fk-secret-plaintext", IssuedKey{ID: 42, Prefix: "fk-secre"}, nil
 }
 
-func (f *fakeStore) UpsertVolcKey(ctx context.Context, in NewVolcKey) (bool, error) {
+// RevokeUserAPIKey 按 (userID, keyID) 吊销。
+//
+// fake 以明文 token 为索引存用户，这里通过 APIKeyID + UserID 双匹配定位，
+// 复刻真实存储「归属校验在同一条语句内完成」的语义。
+func (f *fakeStore) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for token, uc := range f.users {
+		if uc.APIKeyID == keyID && uc.UserID == userID {
+			delete(f.users, token)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: key %d", ErrKeyNotFound, keyID)
+}
+
+func (f *fakeStore) UpsertUpstreamKey(ctx context.Context, in NewVolcKey) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.upsertErr != nil {
@@ -290,13 +316,31 @@ func (f *fakeStore) UpsertVolcKey(ctx context.Context, in NewVolcKey) (bool, err
 	return !existed, nil
 }
 
-// PatchVolcKeyState 在内存中复刻存储层的原子局部更新语义。
+// AssignShard 复刻「只改存在的 Key，返回真实命中数」的语义。
+//
+// 不无条件返回 len(keyIDs): 端点会把 affected < requested 作为
+// 「有 key_id 没匹配上」的信号透出，fake 若恒等于请求数，这个分支
+// 在测试里就永远走不到。
+func (f *fakeStore) AssignShard(ctx context.Context, shard string, keyIDs []string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shardCalls = append(f.shardCalls, shardCall{Shard: shard, KeyIDs: append([]string(nil), keyIDs...)})
+	var n int64
+	for _, id := range keyIDs {
+		if _, ok := f.volcKeys[id]; ok {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// PatchUpstreamKeyState 在内存中复刻存储层的原子局部更新语义。
 //
 // 刻意完整实现「nil 字段不改」「条件不匹配返回 ErrPreconditionFailed 且不写入」
 // 而非直接返回成功: 如果 fake 无条件成功，状态机与并发控制的测试就只是在
 // 断言 handler 把参数拼对了，而真正要防的「status 缺席时把状态改成空串」
 // 恰恰发生在写入这一步。fake 必须自己维护状态才能让这类断言有意义。
-func (f *fakeStore) PatchVolcKeyState(ctx context.Context, keyID string, p KeyPatch) (*KeyPatchResult, error) {
+func (f *fakeStore) PatchUpstreamKeyState(ctx context.Context, keyID string, p KeyPatch) (*KeyPatchResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -442,7 +486,7 @@ func newFakeQuota(hard int64) *fakeQuota {
 
 func qkey(keyID string, kind quota.Kind) string { return keyID + "|" + string(kind) }
 
-func (f *fakeQuota) Acquire(ctx context.Context, keyID string, kind quota.Kind, amount int64,
+func (f *fakeQuota) Acquire(ctx context.Context, provider, keyID string, kind quota.Kind, amount int64,
 	lim quota.Limits, ttl time.Duration) (quota.Decision, *quota.Lease, error) {
 
 	f.mu.Lock()
@@ -534,7 +578,7 @@ func (f *fakeQuota) Release(ctx context.Context, lease *quota.Lease) error {
 	return nil
 }
 
-func (f *fakeQuota) Get(ctx context.Context, keyID string, kind quota.Kind) (quota.Snapshot, error) {
+func (f *fakeQuota) Get(ctx context.Context, provider, keyID string, kind quota.Kind) (quota.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	k := qkey(keyID, kind)
@@ -597,6 +641,45 @@ func (e *testEnv) Close() {
 	e.upstream.Close()
 }
 
+// hotSwap 用改过的配置发布一份新快照，模拟管理端保存配置后的热生效。
+//
+// 传入的 mutate 拿到的是深拷贝而非 e.cfg 本身: 快照语义要求已发布的配置
+// 一律只读，就地改 e.cfg 会让旧快照的持有者（正在处理中的请求）看到新值，
+// 那恰好是这套机制要消灭的撕裂态，测试自己先破坏它就测不出问题了。
+func (e *testEnv) hotSwap(t *testing.T, version int64, mutate func(*config.Config)) *confsnap.Snapshot {
+	t.Helper()
+	next := cloneConfig(t, e.cfg)
+	mutate(next)
+	snap, err := confsnap.Build(next, version)
+	if err != nil {
+		t.Fatalf("构建快照 v%d: %v", version, err)
+	}
+	e.srv.snaps.Store(snap)
+	return snap
+}
+
+// cloneConfig 深拷贝配置中热加载会碰到的部分。
+//
+// 只深拷 Providers 这一层 map 及其内部 map: 浅拷贝下 next.Providers 与
+// 原配置共用同一个 map，改 next 会同时改到旧快照，热切前后就分不开了。
+func cloneConfig(t *testing.T, src *config.Config) *config.Config {
+	t.Helper()
+	out := *src
+	out.Providers = make(map[string]config.Provider, len(src.Providers))
+	for name, p := range src.Providers {
+		cp := p
+		if p.ModelMapping != nil {
+			cp.ModelMapping = make(map[string]string, len(p.ModelMapping))
+			for k, v := range p.ModelMapping {
+				cp.ModelMapping[k] = v
+			}
+		}
+		cp.CountModels = append([]string(nil), p.CountModels...)
+		out.Providers[name] = cp
+	}
+	return &out
+}
+
 // newTestEnv 搭起「假上游 + 网关」的完整链路。
 func newTestEnv(t *testing.T, opts ...func(*config.Config)) *testEnv {
 	t.Helper()
@@ -604,13 +687,15 @@ func newTestEnv(t *testing.T, opts ...func(*config.Config)) *testEnv {
 	up := newUpstreamStub()
 
 	cfg := config.Default()
-	cfg.Upstream.VolcBaseURL = up.URL()
 	cfg.Upstream.MaxRetries = 2
 	// 测试里把退避压到近零，否则重试测试会白等数秒
 	cfg.Upstream.RetryBaseDelay = time.Millisecond
 	cfg.Upstream.RetryJitter = time.Millisecond
-	cfg.Upstream.ModelMapping = map[string]string{"gpt-4o": "ep-test-4o"}
-	cfg.Upstream.CountModels = []string{"seedream-3.0"}
+	volc := cfg.Providers["volc"]
+	volc.BaseURL = up.URL()
+	volc.ModelMapping = map[string]string{"gpt-4o": "ep-test-4o"}
+	volc.CountModels = []string{"seedream-3.0"}
+	cfg.Providers["volc"] = volc
 	cfg.Quota.DefaultMaxTokens = 100
 	cfg.Quota.EstimateMultiplier = 1.2
 	cfg.Admin.APIKey = "admin-secret"
@@ -662,7 +747,14 @@ type upstreamStub struct {
 	script []stubResponse
 	// seenAuth 记录每次请求的 Authorization 头，用于验证换 Key 是否真的生效。
 	seenAuth []string
-	calls    int64
+	// seenModel 记录每次请求体里的 model 字段，即经 adapter 映射后真正发给
+	// 上游的模型名。热切 model_mapping 后同一请求的各次 attempt 必须一致，
+	// 否则就是「重试时换了配置」——这是不报错、只发错的那类缺陷。
+	seenModel []string
+	// onRequest 在每次请求进入时同步调用（参数为第几次调用，从 1 计）。
+	// 用于在请求处理途中执行热切，制造「攻击窗口」。
+	onRequest func(n int64)
+	calls     int64
 }
 
 // stubResponse 描述假上游的一次响应。
@@ -687,8 +779,22 @@ func newUpstreamStub() *upstreamStub {
 func (u *upstreamStub) serve(w http.ResponseWriter, r *http.Request) {
 	n := atomic.AddInt64(&u.calls, 1)
 
+	// 先读完请求体再取 hook: 记录必须发生在测试执行热切之前，否则记下的
+	// 是热切后的状态，就验证不出「本次 attempt 用的是哪份配置」。
+	var model string
+	if raw, err := io.ReadAll(r.Body); err == nil {
+		var probe struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(raw, &probe) == nil {
+			model = probe.Model
+		}
+	}
+
 	u.mu.Lock()
 	u.seenAuth = append(u.seenAuth, r.Header.Get("Authorization"))
+	u.seenModel = append(u.seenModel, model)
+	hook := u.onRequest
 	var resp stubResponse
 	switch {
 	case len(u.script) == 0:
@@ -699,6 +805,11 @@ func (u *upstreamStub) serve(w http.ResponseWriter, r *http.Request) {
 		resp = u.script[len(u.script)-1]
 	}
 	u.mu.Unlock()
+
+	// 在锁外调用: hook 里会执行热切并可能回读 stub 状态，持锁调用会死锁。
+	if hook != nil {
+		hook(n)
+	}
 
 	if len(resp.SSE) == 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -739,6 +850,21 @@ func (u *upstreamStub) setScript(rs ...stubResponse) {
 	u.script = rs
 	atomic.StoreInt64(&u.calls, 0)
 	u.seenAuth = nil
+	u.seenModel = nil
+}
+
+// setOnRequest 注册每次上游请求进入时的回调，用于在请求处理途中热切配置。
+func (u *upstreamStub) setOnRequest(fn func(n int64)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.onRequest = fn
+}
+
+// models 返回各次 attempt 实际发给上游的模型名。
+func (u *upstreamStub) models() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.seenModel...)
 }
 
 func (u *upstreamStub) callCount() int64 { return atomic.LoadInt64(&u.calls) }

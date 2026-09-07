@@ -65,7 +65,7 @@ func TestAcquire_NeverExceedsHardLimit_UnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start // 尽可能同时发起，最大化竞争
-			_, lease, err := m.Acquire(ctx, "key_hot", KindToken, amount, lim, time.Minute)
+			_, lease, err := m.Acquire(ctx, "volc", "key_hot", KindToken, amount, lim, time.Minute)
 			switch {
 			case err == nil && lease != nil:
 				granted.Add(1)
@@ -87,7 +87,7 @@ func TestAcquire_NeverExceedsHardLimit_UnderConcurrency(t *testing.T) {
 		t.Errorf("放行+拒绝 = %d, 期望 %d", granted.Load()+denied.Load(), goroutine)
 	}
 
-	snap, err := m.Get(ctx, "key_hot", KindToken)
+	snap, err := m.Get(ctx, "volc", "key_hot", KindToken)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestAcquireCommit_InvariantHolds(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			_, lease, err := m.Acquire(ctx, "key_mix", KindToken, 1000, lim, time.Minute)
+			_, lease, err := m.Acquire(ctx, "volc", "key_mix", KindToken, 1000, lim, time.Minute)
 			if err != nil {
 				return // 配额不足是预期结果
 			}
@@ -124,7 +124,7 @@ func TestAcquireCommit_InvariantHolds(t *testing.T) {
 	}
 	wg.Wait()
 
-	snap, err := m.Get(ctx, "key_mix", KindToken)
+	snap, err := m.Get(ctx, "volc", "key_mix", KindToken)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -144,13 +144,13 @@ func TestAcquire_SoftWatermarkSignalsDegrade(t *testing.T) {
 	m, ctx := newTestManager(t)
 	lim := Limits{Hard: 1000, Soft: 500}
 
-	d, lease, err := m.Acquire(ctx, "key_soft", KindToken, 400, lim, time.Minute)
+	d, lease, err := m.Acquire(ctx, "volc", "key_soft", KindToken, 400, lim, time.Minute)
 	if err != nil || d != Granted {
 		t.Fatalf("软水位以下应正常放行, got d=%v err=%v", d, err)
 	}
 	_ = m.Commit(ctx, lease, 400)
 
-	d, lease, err = m.Acquire(ctx, "key_soft", KindToken, 200, lim, time.Minute)
+	d, lease, err = m.Acquire(ctx, "volc", "key_soft", KindToken, 200, lim, time.Minute)
 	if err != nil {
 		t.Fatalf("软水位之上仍应放行: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestAcquire_SoftWatermarkSignalsDegrade(t *testing.T) {
 	}
 	_ = m.Commit(ctx, lease, 200)
 
-	if _, _, err := m.Acquire(ctx, "key_soft", KindToken, 500, lim, time.Minute); !errors.Is(err, ErrInsufficient) {
+	if _, _, err := m.Acquire(ctx, "volc", "key_soft", KindToken, 500, lim, time.Minute); !errors.Is(err, ErrInsufficient) {
 		t.Errorf("越过硬水位必须拒绝, got %v", err)
 	}
 }
@@ -177,25 +177,25 @@ func TestReap_ReclaimsLeakedPrededuct(t *testing.T) {
 
 	// 模拟 5 个请求预扣后客户端断开，Commit 永不到达
 	for i := 0; i < 5; i++ {
-		if _, _, err := m.Acquire(ctx, "key_leak", KindToken, 1000, lim, 60*time.Second); err != nil {
+		if _, _, err := m.Acquire(ctx, "volc", "key_leak", KindToken, 1000, lim, 60*time.Second); err != nil {
 			t.Fatalf("Acquire: %v", err)
 		}
 	}
 
-	snap, _ := m.Get(ctx, "key_leak", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_leak", KindToken)
 	if snap.Prededuct != 5000 {
 		t.Fatalf("回收前 prededuct = %d, 期望 5000", snap.Prededuct)
 	}
 
 	// 租约未到期时不应被回收
-	if n, err := m.Reap(ctx, 100); err != nil || n != 0 {
+	if n, err := m.Reap(ctx, "volc", 100); err != nil || n != 0 {
 		t.Fatalf("未到期租约不应回收, n=%d err=%v", n, err)
 	}
 
 	// 时间推进到租约过期之后
 	m.SetClock(func() time.Time { return base.Add(90 * time.Second) })
 
-	n, err := m.Reap(ctx, 100)
+	n, err := m.Reap(ctx, "volc", 100)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
@@ -203,13 +203,53 @@ func TestReap_ReclaimsLeakedPrededuct(t *testing.T) {
 		t.Errorf("回收 %d 条, 期望 5 条", n)
 	}
 
-	snap, _ = m.Get(ctx, "key_leak", KindToken)
+	snap, _ = m.Get(ctx, "volc", "key_leak", KindToken)
 	if snap.Prededuct != 0 {
 		t.Errorf("回收后 prededuct 应归零, got %d", snap.Prededuct)
 	}
 	// 泄漏的预扣不应计入实际用量
 	if snap.Used != 0 {
 		t.Errorf("回收不应计入 used, got %d", snap.Used)
+	}
+}
+
+// 非 volc provider 的租约回收必须真正还原 prededuct。
+//
+// 回归背景: luaReap 曾把租约数据前缀写死为 'volc:lease:data:'，对其他
+// provider 执行时 ZREM 成功但 prededuct 永不还原 —— 回收器每轮报成功，
+// 额度却持续泄漏。
+func TestReap_NonVolcProvider(t *testing.T) {
+	m, ctx := newTestManager(t)
+	lim := Limits{Hard: 1_000, Soft: 800}
+
+	base := time.Now()
+	m.SetClock(func() time.Time { return base })
+
+	if _, _, err := m.Acquire(ctx, "sensenova", "sn_key1", KindCount, 3, lim, 30*time.Second); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	snap, _ := m.Get(ctx, "sensenova", "sn_key1", KindCount)
+	if snap.Prededuct != 3 {
+		t.Fatalf("预扣未生效: %+v", snap)
+	}
+
+	m.SetClock(func() time.Time { return base.Add(60 * time.Second) })
+	n, err := m.Reap(ctx, "sensenova", 100)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("回收 %d 条, 期望 1", n)
+	}
+
+	snap, _ = m.Get(ctx, "sensenova", "sn_key1", KindCount)
+	if snap.Prededuct != 0 {
+		t.Errorf("非 volc provider 回收后 prededuct 应归零, got %d", snap.Prededuct)
+	}
+	// 租约数据 Hash 也必须被删除，而不是只从 ZSET 摘除
+	keys, _ := m.rdb.Keys(ctx, "sensenova:lease:data:*").Result()
+	if len(keys) != 0 {
+		t.Errorf("租约数据未清理: %v", keys)
 	}
 }
 
@@ -221,13 +261,13 @@ func TestCommit_AfterReap_StillRecordsUsage(t *testing.T) {
 	base := time.Now()
 	m.SetClock(func() time.Time { return base })
 
-	_, lease, err := m.Acquire(ctx, "key_late", KindToken, 1000, lim, 30*time.Second)
+	_, lease, err := m.Acquire(ctx, "volc", "key_late", KindToken, 1000, lim, 30*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 
 	m.SetClock(func() time.Time { return base.Add(60 * time.Second) })
-	if _, err := m.Reap(ctx, 100); err != nil {
+	if _, err := m.Reap(ctx, "volc", 100); err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 
@@ -236,7 +276,7 @@ func TestCommit_AfterReap_StillRecordsUsage(t *testing.T) {
 		t.Fatalf("迟到的 Commit: %v", err)
 	}
 
-	snap, _ := m.Get(ctx, "key_late", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_late", KindToken)
 	if snap.Used != 750 {
 		t.Errorf("used = %d, 期望补记 750", snap.Used)
 	}
@@ -250,7 +290,7 @@ func TestRelease_FreesPredeductWithoutUsage(t *testing.T) {
 	m, ctx := newTestManager(t)
 	lim := Limits{Hard: 10_000, Soft: 8_000}
 
-	_, lease, err := m.Acquire(ctx, "key_fail", KindToken, 2000, lim, time.Minute)
+	_, lease, err := m.Acquire(ctx, "volc", "key_fail", KindToken, 2000, lim, time.Minute)
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -258,7 +298,7 @@ func TestRelease_FreesPredeductWithoutUsage(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	snap, _ := m.Get(ctx, "key_fail", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_fail", KindToken)
 	if snap.Prededuct != 0 || snap.Used != 0 {
 		t.Errorf("释放后应全为 0, got used=%d prededuct=%d", snap.Used, snap.Prededuct)
 	}
@@ -269,26 +309,83 @@ func TestReconcile_CorrectsDrift(t *testing.T) {
 	m, ctx := newTestManager(t)
 	lim := Limits{Hard: 10_000, Soft: 8_000}
 
-	_, _, err := m.Acquire(ctx, "key_drift", KindToken, 1000, lim, time.Hour)
+	_, _, err := m.Acquire(ctx, "volc", "key_drift", KindToken, 1000, lim, time.Hour)
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 
 	// 人为注入漂移，模拟 Lua 之外的异常写入
 	day := QuotaDay(time.Now())
-	m.rdb.HSet(ctx, quotaKey(KindToken, "key_drift", day), "prededuct", 7777)
+	m.rdb.HSet(ctx, quotaKey("volc", KindToken, "key_drift", day), "prededuct", 7777)
 
-	drift, err := m.Reconcile(ctx, "key_drift", KindToken)
+	drifts, err := m.ReconcileProvider(ctx, "volc", []string{"key_drift"})
 	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
+		t.Fatalf("ReconcileProvider: %v", err)
 	}
-	if drift != 7777-1000 {
-		t.Errorf("检出漂移 %d, 期望 %d", drift, 7777-1000)
+	if len(drifts) != 1 {
+		t.Fatalf("期望 1 条修正, got %d: %+v", len(drifts), drifts)
+	}
+	if drifts[0].Amount != 7777-1000 {
+		t.Errorf("检出漂移 %d, 期望 %d", drifts[0].Amount, 7777-1000)
+	}
+	if drifts[0].KeyID != "key_drift" || drifts[0].Kind != KindToken {
+		t.Errorf("修正条目错位: %+v", drifts[0])
 	}
 
-	snap, _ := m.Get(ctx, "key_drift", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_drift", KindToken)
 	if snap.Prededuct != 1000 {
 		t.Errorf("对账后 prededuct = %d, 期望以租约之和 1000 为准", snap.Prededuct)
+	}
+}
+
+// 无漂移时对账不产生任何修正，也不动在途租约的预扣。
+func TestReconcile_NoDriftNoChange(t *testing.T) {
+	m, ctx := newTestManager(t)
+	lim := Limits{Hard: 10_000, Soft: 8_000}
+
+	_, _, err := m.Acquire(ctx, "volc", "key_clean", KindToken, 1500, lim, time.Hour)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	drifts, err := m.ReconcileProvider(ctx, "volc", []string{"key_clean"})
+	if err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	if len(drifts) != 0 {
+		t.Fatalf("无漂移时不应有修正, got %+v", drifts)
+	}
+
+	snap, _ := m.Get(ctx, "volc", "key_clean", KindToken)
+	if snap.Prededuct != 1500 {
+		t.Errorf("在途租约的预扣不应被动过, got %d", snap.Prededuct)
+	}
+}
+
+// 有泄漏但已无未过期租约的 Key 也必须被修正 —— 这是对账最核心的场景
+// （预扣悬置、租约记录又丢了），只扫租约集合的实现修不到它。
+func TestReconcile_OrphanPrededuct(t *testing.T) {
+	m, ctx := newTestManager(t)
+
+	// 直接向配额 Hash 注入孤儿 prededuct（无任何租约与之对应）
+	day := QuotaDay(time.Now())
+	qk := quotaKey("volc", KindToken, "key_orphan", day)
+	m.rdb.HSet(ctx, qk, "used", 100, "prededuct", 4321)
+
+	drifts, err := m.ReconcileProvider(ctx, "volc", []string{"key_orphan"})
+	if err != nil {
+		t.Fatalf("ReconcileProvider: %v", err)
+	}
+	if len(drifts) != 1 || drifts[0].Amount != 4321 {
+		t.Fatalf("孤儿预扣应被全额检出, got %+v", drifts)
+	}
+
+	snap, _ := m.Get(ctx, "volc", "key_orphan", KindToken)
+	if snap.Prededuct != 0 {
+		t.Errorf("孤儿预扣应清零, got %d", snap.Prededuct)
+	}
+	if snap.Used != 100 {
+		t.Errorf("used 不应被动, got %d", snap.Used)
 	}
 }
 
@@ -298,7 +395,7 @@ func TestAcquire_CountKind(t *testing.T) {
 	lim := Limits{Hard: 90, Soft: 80} // 100 次上限，留 10 次缓冲
 
 	for i := 0; i < 90; i++ {
-		_, lease, err := m.Acquire(ctx, "key_img", KindCount, 1, lim, time.Minute)
+		_, lease, err := m.Acquire(ctx, "volc", "key_img", KindCount, 1, lim, time.Minute)
 		if err != nil {
 			t.Fatalf("第 %d 次预扣失败: %v", i+1, err)
 		}
@@ -307,11 +404,11 @@ func TestAcquire_CountKind(t *testing.T) {
 		}
 	}
 
-	if _, _, err := m.Acquire(ctx, "key_img", KindCount, 1, lim, time.Minute); !errors.Is(err, ErrInsufficient) {
+	if _, _, err := m.Acquire(ctx, "volc", "key_img", KindCount, 1, lim, time.Minute); !errors.Is(err, ErrInsufficient) {
 		t.Errorf("达到硬水位后必须拒绝, got %v", err)
 	}
 
-	snap, _ := m.Get(ctx, "key_img", KindCount)
+	snap, _ := m.Get(ctx, "volc", "key_img", KindCount)
 	if snap.Used != 90 {
 		t.Errorf("used = %d, 期望 90", snap.Used)
 	}
@@ -322,14 +419,14 @@ func TestMarkRefreshed_ResetsCounters(t *testing.T) {
 	m, ctx := newTestManager(t)
 	lim := Limits{Hard: 10_000, Soft: 8_000}
 
-	_, lease, _ := m.Acquire(ctx, "key_rf", KindToken, 3000, lim, time.Minute)
+	_, lease, _ := m.Acquire(ctx, "volc", "key_rf", KindToken, 3000, lim, time.Minute)
 	_ = m.Commit(ctx, lease, 3000)
 
-	if err := m.MarkRefreshed(ctx, "key_rf", KindToken, lim); err != nil {
+	if err := m.MarkRefreshed(ctx, "volc", "key_rf", KindToken, lim); err != nil {
 		t.Fatalf("MarkRefreshed: %v", err)
 	}
 
-	snap, _ := m.Get(ctx, "key_rf", KindToken)
+	snap, _ := m.Get(ctx, "volc", "key_rf", KindToken)
 	if snap.Used != 0 || snap.Prededuct != 0 {
 		t.Errorf("刷新后应清零, got used=%d prededuct=%d", snap.Used, snap.Prededuct)
 	}
@@ -345,14 +442,14 @@ func TestGetMany(t *testing.T) {
 
 	ids := []string{"k1", "k2", "k3"}
 	for i, id := range ids {
-		_, lease, err := m.Acquire(ctx, id, KindToken, int64((i+1)*1000), lim, time.Minute)
+		_, lease, err := m.Acquire(ctx, "volc", id, KindToken, int64((i+1)*1000), lim, time.Minute)
 		if err != nil {
 			t.Fatalf("Acquire %s: %v", id, err)
 		}
 		_ = m.Commit(ctx, lease, int64((i+1)*1000))
 	}
 
-	snaps, err := m.GetMany(ctx, ids, KindToken)
+	snaps, err := m.GetMany(ctx, "volc", ids, KindToken)
 	if err != nil {
 		t.Fatalf("GetMany: %v", err)
 	}
@@ -388,7 +485,7 @@ func BenchmarkAcquireCommit(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, lease, err := m.Acquire(ctx, fmt.Sprintf("bench_%d", i%100), KindToken, 100, lim, time.Minute)
+		_, lease, err := m.Acquire(ctx, "volc", fmt.Sprintf("bench_%d", i%100), KindToken, 100, lim, time.Minute)
 		if err != nil {
 			b.Fatal(err)
 		}

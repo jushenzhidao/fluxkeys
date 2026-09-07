@@ -230,10 +230,17 @@ func (s *Store) CreateUserAPIKey(ctx context.Context, userID int64, name string)
 }
 
 // RevokeUserAPIKey 吊销一条 API Key。
-func (s *Store) RevokeUserAPIKey(ctx context.Context, keyID int64) error {
+//
+// 带 userID 做归属校验: 吊销入口暴露在管理接口的 /admin/users/{id}/keys/{key_id}
+// 路径上，不校验归属的话，拼错 user_id 也能吊掉别人的 Key —— 单条 WHERE
+// 在一次往返内完成校验与更新，不留 TOCTOU 窗口。
+//
+// 只吊销 active 状态的 Key: 重复吊销返回 ErrNotFound，让调用方能区分
+// 「这次真的吊销了」与「早就不是 active 了」—— 审计需要这个区分。
+func (s *Store) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE user_api_keys SET status = 'revoked', revoked_at = now()
-		WHERE id = $1 AND status = 'active'`, keyID)
+		WHERE id = $1 AND user_id = $2 AND status = 'active'`, keyID, userID)
 	if err != nil {
 		return fmt.Errorf("store: 吊销 API Key: %w", err)
 	}
