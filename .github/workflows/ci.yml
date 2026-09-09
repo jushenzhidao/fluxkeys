@@ -532,6 +532,9 @@ jobs:
           FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
           EGRESS_MODE=direct
           VOLC_BASE_URL=http://mockark:18080
+          # provider seed 回退依赖全局配额原始值（provider_configs 有
+          # quota_limit > 0 的 CHECK 约束），显式声明以免依赖 compose 默认值
+          QUOTA_TOKEN_LIMIT=5000000
           REFRESH_ENABLED=false
           COMPOSE_PROFILES=mock
           EOF

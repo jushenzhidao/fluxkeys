@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/store"
@@ -61,13 +62,40 @@ func seedProviderConfigs(ctx context.Context, st *store.Store, cfg *config.Confi
 	seeded := make([]string, 0, len(names))
 	for _, name := range names {
 		p := cfg.Providers[name]
+		// provider 声明允许 quota_limit 留 0 表示「跟随全局配额」
+		// （见 config.go 中 volc 的注释），但 schema 对该列有 > 0 的 CHECK
+		// 约束 —— 原样入库会撞约束、进程直接起不来。此处把回退显式化，
+		// 按配额类型取全局原始值。注意不是 LimitsFor 的返回值: 那是按
+		// 比率缩放后的水位，seed 要入库的是未被缩放的上限本身。
+		limit := p.QuotaLimit
+		if limit <= 0 {
+			if p.QuotaKind == "count" {
+				limit = cfg.Quota.CountLimit
+			} else {
+				limit = cfg.Quota.TokenLimit
+			}
+		}
+		if limit <= 0 {
+			return false, fmt.Errorf(
+				"导入 provider %q 配置: 配额上限为 0（provider 未设置且全局配额也为 0），"+
+					"无法满足库约束 quota_limit > 0。"+
+					"请在配置文件为该 provider 设置 quota_limit，"+
+					"或在 quota 段设置全局 token_limit / count_limit（token 亦可用环境变量 QUOTA_TOKEN_LIMIT）", name)
+		}
+		// quota_window 同样受 > 0 约束，且配置文件没有对应字段、也没有
+		// 环境变量可兜底。缺省 24h 对齐 admin API 的校验语义 —— 窗口为 0
+		// 会让配额分桶键恒定、额度永不刷新，且全程无任何报错。
+		window := p.QuotaWindow
+		if window <= 0 {
+			window = 24 * time.Hour
+		}
 		pc := store.ProviderConfig{
 			Name:            name,
 			Enabled:         true,
 			BaseURL:         p.BaseURL,
 			QuotaKind:       p.QuotaKind,
-			QuotaLimit:      p.QuotaLimit,
-			QuotaWindow:     p.QuotaWindow,
+			QuotaLimit:      limit,
+			QuotaWindow:     window,
 			RefreshHour:     p.RefreshHour,
 			ModelMapping:    p.ModelMapping,
 			CountModels:     p.CountModels,
