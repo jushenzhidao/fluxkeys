@@ -61,7 +61,7 @@ func (s *Store) RollbackProvider(ctx context.Context, name string, targetVersion
 			return fmt.Errorf("store: 版本 %d 属于 provider %q，不属于 %q",
 				targetVersionID, belongsTo, name)
 		}
-		if err := json.Unmarshal([]byte(raw), &target); err != nil {
+		if err = json.Unmarshal([]byte(raw), &target); err != nil {
 			return fmt.Errorf("store: 解析目标版本快照: %w", err)
 		}
 		if target.QuotaKind != cur.QuotaKind {

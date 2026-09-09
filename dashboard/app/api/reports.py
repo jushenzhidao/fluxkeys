@@ -172,5 +172,3 @@ async def api_similarity(
 async def healthz(service: ReportService = Depends(get_service)) -> m.HealthResp:
     """探活。Postgres / Redis 任一不可用时 status 为 degraded，但仍返回 200。"""
     return await service.health(__version__)
-
-

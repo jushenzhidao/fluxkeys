@@ -77,15 +77,15 @@ func translateProviderErr(err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, store.ErrNotFound):
-		return fmt.Errorf("%w: %v", gateway.ErrProviderNotFound, err)
+		return fmt.Errorf("%w: %w", gateway.ErrProviderNotFound, err)
 	case errors.Is(err, store.ErrProviderExists):
-		return fmt.Errorf("%w: %v", gateway.ErrProviderExists, err)
+		return fmt.Errorf("%w: %w", gateway.ErrProviderExists, err)
 	case errors.Is(err, store.ErrVersionConflict):
-		return fmt.Errorf("%w: %v", gateway.ErrProviderVersionConflict, err)
+		return fmt.Errorf("%w: %w", gateway.ErrProviderVersionConflict, err)
 	case errors.Is(err, store.ErrNameImmutable):
-		return fmt.Errorf("%w: %v", gateway.ErrProviderNameImmutable, err)
+		return fmt.Errorf("%w: %w", gateway.ErrProviderNameImmutable, err)
 	case errors.Is(err, store.ErrQuotaKindImmutable):
-		return fmt.Errorf("%w: %v", gateway.ErrProviderQuotaKindImmutable, err)
+		return fmt.Errorf("%w: %w", gateway.ErrProviderQuotaKindImmutable, err)
 	default:
 		return err
 	}

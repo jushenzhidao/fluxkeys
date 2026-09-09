@@ -94,7 +94,7 @@ func NewWithOptions(ctx context.Context, cfg config.Postgres, opt Options) (*Sto
 	}
 
 	s := &Store{pool: pool, cipher: c}
-	s.usage = newUsageWriter(s, opt)
+	s.usage = newUsageWriter(s, opt) //nolint:contextcheck // flush 刻意用 Background，理由见 usage.go 的 flush 注释
 
 	if cfg.AutoMigrate {
 		if err := s.Migrate(ctx); err != nil {

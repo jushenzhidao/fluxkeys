@@ -45,15 +45,15 @@ type AuthContext struct {
 // UpstreamKey 是上游 Key 池中的一个 Key。Secret 字段为解密后的明文，
 // 仅在显式调用带解密的读取方法时填充。
 type UpstreamKey struct {
-	ID                 int64
-	KeyID              string
-	SecretEnc          string
-	Secret             string // 解密后的明文，默认为空
-	Provider           string
-	Pool               string
-	Status             string
-	PersonaID          string
-	EgressIP           string
+	ID        int64
+	KeyID     string
+	SecretEnc string
+	Secret    string // 解密后的明文，默认为空
+	Provider  string
+	Pool      string
+	Status    string
+	PersonaID string
+	EgressIP  string
 	// Shard 是该 Key 的机器归属。空串表示未分片。语义见 schema.sql。
 	Shard              string
 	HealthScore        int
@@ -116,13 +116,12 @@ type UpstreamKeyState struct {
 	TouchLastUsed bool
 }
 
-
 // UsageRecord 是一条用量流水，计费与审计的事实来源。
 type UsageRecord struct {
 	RequestID        string
 	UserID           int64 // 0 表示无归属（如内部探测请求）
 	UserAPIKeyID     int64
-	UpstreamKeyID        string
+	UpstreamKeyID    string
 	EgressIP         string
 	Provider         string
 	Model            string

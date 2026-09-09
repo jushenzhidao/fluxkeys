@@ -76,7 +76,7 @@ func run() error {
 	}
 	// Validate 会拒绝自相矛盾的配置。这一步失败必须终止启动 ——
 	// 带着矛盾配置跑起来，故障会推迟到最坏的时刻才暴露。
-	if err := cfg.Validate(); err != nil {
+	if err = cfg.Validate(); err != nil {
 		return fmt.Errorf("配置校验: %w", err)
 	}
 
@@ -85,7 +85,7 @@ func run() error {
 	for name := range cfg.Providers {
 		providers = append(providers, name)
 	}
-	
+
 	log.Info("fluxkeys 启动",
 		"version", version,
 		"addr", cfg.Server.Addr,
@@ -114,7 +114,7 @@ func run() error {
 
 	pingCtx, cancelPing := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelPing()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
+	if err = rdb.Ping(pingCtx).Err(); err != nil {
 		return fmt.Errorf("连接 Redis %s: %w", cfg.Redis.Addr, err)
 	}
 	log.Info("Redis 已连接", "addr", cfg.Redis.Addr)
@@ -139,16 +139,16 @@ func run() error {
 		// 直接 Close 会丢掉这批数据，而它是计费依据。
 		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := st.FlushUsage(flushCtx); err != nil {
+		if err = st.FlushUsage(flushCtx); err != nil {
 			log.Error("关闭前刷写用量流水失败", "error", err)
 		}
-		if err := st.Close(); err != nil {
+		if err = st.Close(); err != nil {
 			log.Error("关闭 Postgres 失败", "error", err)
 		}
 	}()
 
 	if cfg.Postgres.AutoMigrate {
-		if err := st.Migrate(ctx); err != nil {
+		if err = st.Migrate(ctx); err != nil {
 			return fmt.Errorf("执行数据库迁移: %w", err)
 		}
 		log.Info("数据库迁移完成")
@@ -157,7 +157,7 @@ func run() error {
 	// provider 配置首次入库。必须在迁移之后、装配之前 ——
 	// 表空时若不 seed，进程会带着零个 provider 正常启动，
 	// healthz/readyz 全绿而所有业务请求失败。详见 provider_seed.go。
-	if _, err := seedProviderConfigs(ctx, st, cfg, log); err != nil {
+	if _, err = seedProviderConfigs(ctx, st, cfg, log); err != nil {
 		return fmt.Errorf("导入 provider 配置: %w", err)
 	}
 
@@ -171,14 +171,14 @@ func run() error {
 	// 为已有 Key 恢复绑定。Bind 用哈希做确定性分配，重启后同一 Key 仍落到
 	// 同一 IP —— 出口 IP 漂移会让火山侧看到「同一账号换了机器」。
 	if pool.Mode() == egress.ModeMultiIP {
-		if err := restoreBindings(ctx, st, pool, cfg.Server.ShardID, log); err != nil {
+		if err = restoreBindings(ctx, st, pool, cfg.Server.ShardID, log); err != nil {
 			return fmt.Errorf("恢复 Key-IP 绑定: %w", err)
 		}
 	}
 
 	// 出口自检必须在开始接流量之前。见文件头注释第 2 点。
 	if cfg.Egress.VerifyOnStart {
-		if err := verifyEgress(ctx, cfg, pool, log); err != nil {
+		if err = verifyEgress(ctx, cfg, pool, log); err != nil {
 			return err
 		}
 	}
@@ -224,7 +224,7 @@ func run() error {
 	//
 	// 装载失败不阻止启动: Key 表暂时读不到时仍应把服务拉起来，
 	// 让 /readyz 与后台重载去反映真实状态，比整个进程起不来更容易运维。
-	if err := sched.Reload(ctx); err != nil {
+	if err = sched.Reload(ctx); err != nil {
 		log.Error("启动装载 Key 池失败，将由后台重载重试", "error", err)
 	}
 
@@ -285,7 +285,7 @@ func run() error {
 		pool: pool, metrics: m, log: log,
 		shard: cfg.Server.ShardID,
 	})
-	if err := bg.start(ctx); err != nil {
+	if err = bg.start(ctx); err != nil {
 		return fmt.Errorf("启动后台任务: %w", err)
 	}
 
@@ -595,7 +595,7 @@ func newProbe(providerName string, ad adapter.Adapter, snap *confsnap.Snapshot,
 		// 守卫错配: 这个探测器只认自己那个 provider 的 Key。调度侧若因某种
 		// 原因把别家的 Key 传进来，宁可报错也不能拿错误的模型名去打上游。
 		if key.Provider != providerName {
-			return false, fmt.Errorf("Key %s 属于 provider %s，不能用 %s 的探测器",
+			return false, fmt.Errorf("key %s 属于 provider %s，不能用 %s 的探测器",
 				keyID, key.Provider, providerName)
 		}
 
@@ -607,7 +607,7 @@ func newProbe(providerName string, ad adapter.Adapter, snap *confsnap.Snapshot,
 		// 获取该 Key 所属 provider 的 BaseURL
 		provider, ok := cfg.Providers[key.Provider]
 		if !ok {
-			return false, fmt.Errorf("Key %s 的 provider %s 在配置中不存在", keyID, key.Provider)
+			return false, fmt.Errorf("key %s 的 provider %s 在配置中不存在", keyID, key.Provider)
 		}
 
 		// 必须用该 Key 自己的出口客户端 —— 探测请求走错 IP 等于

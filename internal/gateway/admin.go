@@ -303,7 +303,7 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 			failures = append(failures, failure{Reason: "key_id 不能为空"})
 			continue
 		}
-		
+
 		// 验证 provider 是否在配置中存在
 		if _, exists := snap.Cfg.Providers[it.Provider]; !exists {
 			failures = append(failures, failure{
@@ -312,7 +312,7 @@ func (s *Server) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-		
+
 		// 同一批内重复的 provider+key_id 组合直接报错
 		compositeKey := it.Provider + ":" + it.KeyID
 		if seen[compositeKey] {
@@ -480,7 +480,8 @@ func (s *Server) handleAdminUserByID(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 DELETE")
 			return
 		}
-		keyID, err := strconv.ParseInt(parts[2], 10, 64)
+		var keyID int64
+		keyID, err = strconv.ParseInt(parts[2], 10, 64)
 		if err != nil || keyID <= 0 {
 			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "Key ID 非法")
 			return

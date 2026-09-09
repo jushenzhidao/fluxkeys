@@ -37,7 +37,7 @@ SEED_NOW = datetime(2026, 8, 23, 20, 0, tzinfo=SH)
 class FixedClockSettings(Settings):
     """now() 固定在种子数据的配额日窗口内，让日期断言与真实时钟解耦。"""
 
-    def now(self) -> datetime:  # type: ignore[override]
+    def now(self) -> datetime:
         return SEED_NOW
 
 
@@ -115,16 +115,16 @@ class SeededDatabase(EmptyDatabase):
             ]
         if "COUNT(*) FILTER (WHERE status = 'active')" in text:
             return [FakeRecord(total=3, active=2, unconfirmed_refresh=1)]
-        if "FROM volc_keys GROUP BY pool" in text:
+        if "FROM upstream_keys GROUP BY pool" in text:
             return [FakeRecord(name="hot", count=1), FakeRecord(name="cold", count=2)]
-        if "FROM volc_keys GROUP BY status" in text:
+        if "FROM upstream_keys GROUP BY status" in text:
             return [FakeRecord(name="active", count=2), FakeRecord(name="banned", count=1)]
-        if "FROM volc_keys GROUP BY refresh_state" in text:
+        if "FROM upstream_keys GROUP BY refresh_state" in text:
             return [
                 FakeRecord(name="confirmed", count=2),
                 FakeRecord(name="probing", count=1),
             ]
-        if text.startswith("SELECT key_id FROM volc_keys WHERE status = 'active'"):
+        if text.startswith("SELECT key_id FROM upstream_keys WHERE status = 'active'"):
             return [FakeRecord(key_id="volc_001"), FakeRecord(key_id="volc_002")]
         if text.startswith("SELECT key_id, pool, status, egress_ip, refresh_state"):
             return [
@@ -147,7 +147,7 @@ class SeededDatabase(EmptyDatabase):
                     last_error="quota exhausted",
                 ),
             ]
-        if "FROM volc_keys k" in text and "LEFT JOIN today" in text:
+        if "FROM upstream_keys k" in text and "LEFT JOIN today" in text:
             return [
                 FakeRecord(
                     key_id="volc_001",
@@ -165,9 +165,9 @@ class SeededDatabase(EmptyDatabase):
                     today_errors=10,
                 )
             ]
-        if text.startswith("SELECT COUNT(*)::bigint FROM volc_keys WHERE ($1::text IS NULL"):
+        if text.startswith("SELECT COUNT(*)::bigint FROM upstream_keys WHERE ($1::text IS NULL"):
             return [FakeRecord(count=2)]
-        if "FROM volc_keys k CROSS JOIN today t" in text:
+        if "FROM upstream_keys k CROSS JOIN today t" in text:
             return [
                 FakeRecord(
                     key_id="volc_001",
@@ -256,20 +256,20 @@ class SeededDatabase(EmptyDatabase):
             ]
         if text.startswith("SELECT COUNT(*)::bigint AS requests"):
             return [FakeRecord(requests=1000, errors=50)]
-        if "GROUP BY volc_key_id, hour" in text:
+        if "GROUP BY upstream_key_id, hour" in text:
             # 两个 Key 时段分布完全一致 → 应触发相似度告警
             return [
-                FakeRecord(volc_key_id="volc_001", hour=9, requests=30),
-                FakeRecord(volc_key_id="volc_001", hour=10, requests=30),
-                FakeRecord(volc_key_id="volc_002", hour=9, requests=30),
-                FakeRecord(volc_key_id="volc_002", hour=10, requests=30),
+                FakeRecord(upstream_key_id="volc_001", hour=9, requests=30),
+                FakeRecord(upstream_key_id="volc_001", hour=10, requests=30),
+                FakeRecord(upstream_key_id="volc_002", hour=9, requests=30),
+                FakeRecord(upstream_key_id="volc_002", hour=10, requests=30),
             ]
-        if "GROUP BY volc_key_id, model" in text:
+        if "GROUP BY upstream_key_id, model" in text:
             return [
-                FakeRecord(volc_key_id="volc_001", model="deepseek-v3", requests=60),
-                FakeRecord(volc_key_id="volc_002", model="deepseek-v3", requests=60),
+                FakeRecord(upstream_key_id="volc_001", model="deepseek-v3", requests=60),
+                FakeRecord(upstream_key_id="volc_002", model="deepseek-v3", requests=60),
             ]
-        if text.startswith("SELECT key_id, egress_ip FROM volc_keys"):
+        if text.startswith("SELECT key_id, egress_ip FROM upstream_keys"):
             return [
                 FakeRecord(key_id="volc_001", egress_ip="172.16.0.2"),
                 FakeRecord(key_id="volc_002", egress_ip="172.16.0.2"),
@@ -558,7 +558,7 @@ class TestSeededData:
 class TestValidation:
     def test_invalid_sort_is_400(self, empty_client: TestClient) -> None:
         """排序字段走白名单，非法值返回 400 而不是拼进 SQL。"""
-        resp = empty_client.get("/api/keys?sort=key_id;DROP TABLE volc_keys")
+        resp = empty_client.get("/api/keys?sort=key_id;DROP TABLE upstream_keys")
         assert resp.status_code == 400
 
     def test_sql_injection_attempt_rejected(self, empty_client: TestClient) -> None:

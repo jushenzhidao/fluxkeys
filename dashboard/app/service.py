@@ -804,9 +804,9 @@ class ReportService:
         model_rows = await q.behavior_model_histogram(self._db, start_day, end_day, min_requests)
 
         vectors = build_vectors(
-            [(str(r["volc_key_id"]), _num(r["hour"]), _num(r["requests"])) for r in hour_rows],
+            [(str(r["upstream_key_id"]), _num(r["hour"]), _num(r["requests"])) for r in hour_rows],
             [
-                (str(r["volc_key_id"]), str(r["model"] or ""), _num(r["requests"]))
+                (str(r["upstream_key_id"]), str(r["model"] or ""), _num(r["requests"]))
                 for r in model_rows
             ],
         )

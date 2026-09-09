@@ -52,7 +52,9 @@ jobs:
           fi
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v6 不支持 golangci-lint v2（会在启动时直接报
+        # "invalid version string 'v2.1.6'"），必须用 v7。
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1.6
           # action 自带缓存，且会复用 setup-go 的构建缓存
@@ -384,6 +386,8 @@ jobs:
           POSTGRES_PASSWORD=ci-placeholder
           REDIS_PASSWORD=ci-placeholder
           ADMIN_API_KEY=ci-placeholder
+          DASHBOARD_PASSWORD=ci-placeholder-pass
+          DASHBOARD_SESSION_SECRET=ci-session-secret-0123456789abcdef0123456789abcdef
           FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
           EGRESS_MODE=multi_ip
           EGRESS_IPS=172.16.0.11=203.0.113.11
@@ -523,6 +527,8 @@ jobs:
           POSTGRES_PASSWORD=ci-postgres-pass
           REDIS_PASSWORD=ci-redis-pass
           ADMIN_API_KEY=ci-admin-key
+          DASHBOARD_PASSWORD=ci-dashboard-pass
+          DASHBOARD_SESSION_SECRET=ci-session-secret-0123456789abcdef0123456789abcdef
           FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
           EGRESS_MODE=direct
           VOLC_BASE_URL=http://mockark:18080

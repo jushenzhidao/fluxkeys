@@ -1267,7 +1267,7 @@ func TestCount_上游不回usage时流水仍记实扣量(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("流水条数 = %d, 期望 1", len(recs))
 	}
-	if got := int64(recs[0].CountUnits); got != used {
+	if got := recs[0].CountUnits; got != used {
 		t.Errorf("流水 count_units = %d, 实扣 = %d —— 账面与配额不一致", got, used)
 	}
 }

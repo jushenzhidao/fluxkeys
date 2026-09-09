@@ -152,14 +152,14 @@ type UserContext struct {
 
 // UsageRecord 是一条用量流水，写入 Postgres 作为计费与审计的事实来源。
 type UsageRecord struct {
-	RequestID    string
-	UserID       int64
-	UserAPIKeyID int64
-	UpstreamKeyID    string
-	EgressIP     string
-	Provider     string
-	Model        string
-	BillingKind  string
+	RequestID     string
+	UserID        int64
+	UserAPIKeyID  int64
+	UpstreamKeyID string
+	EgressIP      string
+	Provider      string
+	Model         string
+	BillingKind   string
 	// QuotaDay 是配额日（P0-3: 12:00 之前算作前一天），非自然日。
 	QuotaDay         time.Time
 	PromptTokens     int64
@@ -307,7 +307,7 @@ type NewUser struct {
 type NewVolcKey struct {
 	// Provider 是上游服务商标识（volc/sensenova/qwen 等），必填。
 	Provider string `json:"provider"`
-	
+
 	KeyID string `json:"key_id"`
 	// Secret 是明文密钥，由存储层加密后落库。
 	//

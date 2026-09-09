@@ -170,12 +170,6 @@ func (f *fakeSched) successCount(keyID string) int {
 	return f.successes[keyID]
 }
 
-func (f *fakeSched) selectCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.selectCalls)
-}
-
 // ===== 假存储 =====
 
 type fakeStore struct {

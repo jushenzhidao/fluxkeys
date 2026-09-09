@@ -191,7 +191,9 @@ return n
 // ARGV[1] now             只统计未过期租约（score >= now）
 // ARGV[2] data_prefix     租约数据 key 前缀（"{provider}:lease:data:"）
 // ARGV[3] quota_tmpl      配额 key 模板（"{provider}:quota:%s:%s:{day}"，
-//                         string.format 依次填入 kind、key_id）
+//
+//	string.format 依次填入 kind、key_id）
+//
 // ARGV[4..] key_id        参与对账的 Key 列表
 //
 // Key 列表必须由调用方传入而非只扫租约: 「有泄漏但已无未过期租约」的 Key

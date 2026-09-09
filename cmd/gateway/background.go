@@ -273,7 +273,7 @@ func (b *background) reapLeases(ctx context.Context) error {
 		}
 		totalReaped += n
 	}
-	
+
 	if totalReaped > 0 {
 		b.metrics.ObserveReap(totalReaped)
 		// 用 Info 而非 Debug: 持续有租约被超时回收，说明有请求路径没有
@@ -309,7 +309,9 @@ func (b *background) reconcile(ctx context.Context) error {
 	var checked, drifted int
 	for provider, ids := range byProvider {
 		if ctx.Err() != nil {
-			break
+			// 关停中的取消不是失败，但也不能谎报「对账完成」。
+			// every() 循环在 ctx 取消后不会把该错误记为告警。
+			return ctx.Err()
 		}
 		drifts, err := b.qm.ReconcileProvider(ctx, provider, ids)
 		if err != nil {
@@ -349,7 +351,7 @@ func (b *background) collectMetrics(ctx context.Context) error {
 	health := b.sched.HealthAll()
 	byStatus := make(map[string]int, 4)
 	byPool := make(map[string]int, 3)
-	
+
 	// 按 provider 分组 key IDs
 	keysByProvider := make(map[string][]string)
 	allIDs := make([]string, 0, len(keys))

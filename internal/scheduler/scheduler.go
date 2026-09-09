@@ -372,7 +372,7 @@ func (s *Scheduler) RefreshSnapshot(ctx context.Context) {
 	if len(keysByProvider) == 0 {
 		return
 	}
-	
+
 	for _, kind := range []quota.Kind{quota.KindToken, quota.KindCount} {
 		// 以上一轮快照为基底做增量覆盖: 某个 provider 读取失败时，它名下的
 		// Key 保留旧值，而不是被整体清空。快照本就允许陈旧且不参与准入（P0-1），

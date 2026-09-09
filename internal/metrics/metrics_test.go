@@ -263,7 +263,7 @@ func TestServer_独立端口暴露metrics(t *testing.T) {
 }
 
 func TestServer_空地址返回nil且方法安全(t *testing.T) {
-	var srv *Server = NewServer("", New())
+	srv := NewServer("", New())
 	if srv != nil {
 		t.Fatal("空地址应返回 nil")
 	}

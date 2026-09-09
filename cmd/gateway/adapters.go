@@ -81,7 +81,7 @@ func (a *schedulerAdapter) Select(ctx context.Context, req gateway.SelectRequest
 		// gateway 据此返回 503 service_busy 而非 500 —— 无可用 Key 是
 		// 容量问题，500 会让上游告警系统误判为程序缺陷。
 		if errors.Is(err, scheduler.ErrNoCandidate) {
-			return nil, fmt.Errorf("%w: %v", gateway.ErrNoCandidate, err)
+			return nil, fmt.Errorf("%w: %w", gateway.ErrNoCandidate, err)
 		}
 		return nil, err
 	}
@@ -163,7 +163,7 @@ func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, e
 	// 水位显示为 0 好过整个管理接口不可用。
 	tokenSnaps := make(map[string]quota.Snapshot)
 	countSnaps := make(map[string]quota.Snapshot)
-	
+
 	for provider, ids := range keysByProvider {
 		if ts, err := a.qm.GetMany(ctx, provider, ids, quota.KindToken); err == nil {
 			for k, v := range ts {
@@ -231,7 +231,7 @@ func (a *storeAdapter) AuthenticateUserKey(ctx context.Context, plaintext string
 		if errors.Is(err, store.ErrNotFound) ||
 			errors.Is(err, store.ErrKeyRevoked) ||
 			errors.Is(err, store.ErrUserSuspended) {
-			return nil, fmt.Errorf("%w: %v", gateway.ErrUnauthorized, err)
+			return nil, fmt.Errorf("%w: %w", gateway.ErrUnauthorized, err)
 		}
 		return nil, err
 	}
@@ -250,7 +250,7 @@ func (a *storeAdapter) RecordUsage(ctx context.Context, r gateway.UsageRecord) e
 		RequestID:        r.RequestID,
 		UserID:           r.UserID,
 		UserAPIKeyID:     r.UserAPIKeyID,
-		UpstreamKeyID:        r.UpstreamKeyID,
+		UpstreamKeyID:    r.UpstreamKeyID,
 		EgressIP:         r.EgressIP,
 		Provider:         r.Provider,
 		Model:            r.Model,
@@ -316,7 +316,7 @@ func (a *storeAdapter) CreateUserAPIKey(ctx context.Context, userID int64, name 
 func (a *storeAdapter) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) error {
 	if err := a.st.RevokeUserAPIKey(ctx, userID, keyID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("%w: %v", gateway.ErrKeyNotFound, err)
+			return fmt.Errorf("%w: %w", gateway.ErrKeyNotFound, err)
 		}
 		return err
 	}
@@ -378,11 +378,11 @@ func (a *storeAdapter) PatchUpstreamKeyState(ctx context.Context, keyID string, 
 
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		return nil, fmt.Errorf("%w: %v", gateway.ErrKeyNotFound, err)
+		return nil, fmt.Errorf("%w: %w", gateway.ErrKeyNotFound, err)
 	case errors.Is(err, store.ErrPreconditionFailed):
 		// 结果与错误一并返回: 409 的文案要能写出冲突的实际内容
 		// （当前状态是什么），只给错误值会让运维还得再查一次。
-		return out, fmt.Errorf("%w: %v", gateway.ErrPreconditionFailed, err)
+		return out, fmt.Errorf("%w: %w", gateway.ErrPreconditionFailed, err)
 	case err != nil:
 		return nil, err
 	}

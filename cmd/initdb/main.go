@@ -35,7 +35,7 @@ func main() {
 	if conn == nil {
 		log.Fatal("无法连接到 PostgreSQL，请确保 PostgreSQL 正在运行")
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }() // 工具命令，关闭失败无处理价值
 
 	// 创建数据库
 	_, err = conn.Exec(ctx, "CREATE DATABASE fluxkeys")
@@ -45,7 +45,7 @@ func main() {
 	} else {
 		fmt.Println("✓ 数据库创建成功")
 	}
-	conn.Close(ctx)
+	_ = conn.Close(ctx)
 
 	// 连接到 fluxkeys 数据库，使用之前成功的连接配置但替换数据库名
 	fluxkeysDSN := successDSN[:len(successDSN)-len("postgres?sslmode=disable")] + "fluxkeys?sslmode=disable"
@@ -53,7 +53,7 @@ func main() {
 	if err != nil {
 		log.Fatal("连接 fluxkeys 数据库失败:", err)
 	}
-	defer conn2.Close(ctx)
+	defer func() { _ = conn2.Close(ctx) }()
 
 	// 读取并执行 schema
 	schema, err := os.ReadFile("internal/store/schema.sql")

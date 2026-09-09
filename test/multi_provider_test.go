@@ -17,7 +17,7 @@ func TestAdapterRegistry(t *testing.T) {
 	senseAdapter := adapter.NewSenseNova(map[string]string{
 		"SenseChat-5": "SenseChat-5",
 	})
-	
+
 	registry := gateway.NewAdapterRegistry()
 	registry.Register("volc", volcAdapter)
 	registry.Register("sensenova", senseAdapter)
@@ -63,7 +63,7 @@ func TestProviderForModel(t *testing.T) {
 			},
 			"sensenova": {
 				ModelMapping: map[string]string{
-					"SenseChat-5": "SenseChat-5",
+					"SenseChat-5":     "SenseChat-5",
 					"SenseChat-Turbo": "SenseChat-Turbo",
 				},
 			},

@@ -143,12 +143,6 @@ func (m *memSched) SetKeyStatus(keyID, status string) {
 	m.disabled[keyID] = status
 }
 
-func (m *memSched) reloadCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.reloads
-}
-
 func (m *memSched) failuresOf(keyID string) []gateway.FailureKind {
 	m.mu.Lock()
 	defer m.mu.Unlock()

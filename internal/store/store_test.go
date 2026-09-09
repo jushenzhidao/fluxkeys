@@ -723,9 +723,9 @@ func TestInsertUsageRecord_并发投递不丢不错(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
 				_ = s.InsertUsageRecord(ctx, UsageRecord{
-					RequestID: fmt.Sprintf("r-%d-%d", g, i),
+					RequestID:     fmt.Sprintf("r-%d-%d", g, i),
 					UpstreamKeyID: fmt.Sprintf("volc_%03d", g%5),
-					QuotaDay:  day, TotalTokens: 10, StatusCode: 200,
+					QuotaDay:      day, TotalTokens: 10, StatusCode: 200,
 				})
 			}
 		}(g)

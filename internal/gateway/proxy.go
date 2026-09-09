@@ -53,7 +53,7 @@ type attemptResult struct {
 // requestPlan 描述一次用户请求的执行计划。
 type requestPlan struct {
 	Endpoint  adapter.Endpoint
-	Provider  string       // 上游服务商
+	Provider  string // 上游服务商
 	Model     string
 	Body      []byte
 	Stream    bool
@@ -302,25 +302,25 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	// 用 defer 而非在各分支手动调用: 本函数有十余条 return 路径，包含
 	// panic 与 ctx 取消，任何一条漏掉都会永久泄漏 prededuct。
 	commitActual := int64(-1)
-	defer func() {
+	defer func() { //nolint:contextcheck // 刻意脱离请求 ctx：客户端断连后仍要归还租约，理由见下方注释
 		// 用独立 ctx: 客户端断连时 r.Context() 已取消，用它会导致
 		// Release/Commit 立刻失败，租约只能等超时回收 —— 那正是要避免的泄漏。
 		endCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		if commitActual >= 0 {
-			if err := s.quota.Commit(endCtx, lease, commitActual); err != nil {
+			if cerr := s.quota.Commit(endCtx, lease, commitActual); cerr != nil {
 				s.log.ErrorContext(endCtx, "配额修正失败",
 					"request_id", plan.RequestID, "key_id", cand.KeyID,
-					"lease", lease.ID, "actual", commitActual, "err", err)
+					"lease", lease.ID, "actual", commitActual, "err", cerr)
 			}
 			s.metrics.ObserveEstimateError(plan.Estimated, commitActual)
 			return
 		}
-		if err := s.quota.Release(endCtx, lease); err != nil {
+		if rerr := s.quota.Release(endCtx, lease); rerr != nil {
 			s.log.ErrorContext(endCtx, "配额释放失败",
 				"request_id", plan.RequestID, "key_id", cand.KeyID,
-				"lease", lease.ID, "err", err)
+				"lease", lease.ID, "err", rerr)
 		}
 	}()
 
@@ -358,7 +358,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 		return attemptResult{KeyID: cand.KeyID, Err: adapter.NewClientError(
 			http.StatusInternalServerError, "provider_not_found", "provider 配置缺失: "+plan.Provider)}
 	}
-	
+
 	url := strings.TrimRight(provider.BaseURL, "/") + upstreamPath
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(upstreamBody))
 	if err != nil {
@@ -657,7 +657,6 @@ func (s *Server) limitsFor(snap *confsnap.Snapshot, provider string, kind quota.
 	hard, soft := snap.Cfg.LimitsFor(provider, kind == quota.KindCount)
 	return quota.Limits{Hard: hard, Soft: soft}
 }
-
 
 // copyResponseHeaders 透传上游的相关响应头，跳过逐跳头。
 func copyResponseHeaders(w http.ResponseWriter, upResp *http.Response) {

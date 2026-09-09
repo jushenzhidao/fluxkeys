@@ -53,16 +53,16 @@ class TestPostgresReadOnly:
         async with pool.acquire() as conn:
             for sql in (
                 "CREATE TABLE dashboard_should_not_write (id int)",
-                "INSERT INTO volc_keys (key_id, secret_enc) VALUES ('__probe__', 'x')",
-                "UPDATE volc_keys SET pool = 'hot' WHERE key_id = '__probe__'",
+                "INSERT INTO upstream_keys (key_id, secret_enc) VALUES ('__probe__', 'x')",
+                "UPDATE upstream_keys SET pool = 'hot' WHERE key_id = '__probe__'",
             ):
                 with pytest.raises(asyncpg.PostgresError) as excinfo:
                     await conn.execute(sql)
                 # 必须是只读事务拒绝，而不是「表不存在」之类的偶然失败 ——
                 # 后者会让这条测试在 schema 变化后变成假绿。
-                assert isinstance(
-                    excinfo.value, asyncpg.ReadOnlySQLTransactionError
-                ), f"SQL 未被只读约束拒绝，而是 {type(excinfo.value).__name__}: {sql}"
+                assert isinstance(excinfo.value, asyncpg.ReadOnlySQLTransactionError), (
+                    f"SQL 未被只读约束拒绝，而是 {type(excinfo.value).__name__}: {sql}"
+                )
 
     async def test_read_only_cannot_be_disabled_in_session(self, live_db: Database) -> None:
         """连接内改不回可写：只读由服务端强制，不是客户端自律。"""
@@ -208,7 +208,7 @@ class TestServiceAgainstLiveStores:
     async def test_key_detail_of_first_key(self, live_service: ReportService) -> None:
         listing = await live_service.list_keys(limit=1)
         if not listing.items:
-            pytest.skip("volc_keys 表为空，无法测试 Key 详情")
+            pytest.skip("upstream_keys 表为空，无法测试 Key 详情")
         detail = await live_service.key_detail(listing.items[0].key_id, 7)
         assert detail is not None
         assert len(detail.trend) == 7

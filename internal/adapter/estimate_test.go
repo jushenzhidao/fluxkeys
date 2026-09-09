@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -79,7 +80,8 @@ func TestParseChatMeta_非法JSON返回客户端错误(t *testing.T) {
 	if err == nil {
 		t.Fatal("期望报错")
 	}
-	if ue, ok := err.(*UpstreamError); !ok || ue.Class != ErrClassClient {
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Class != ErrClassClient {
 		t.Errorf("期望客户端错误, got %v", err)
 	}
 }

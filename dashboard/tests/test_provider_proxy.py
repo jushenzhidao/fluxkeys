@@ -290,11 +290,7 @@ class TestCapabilities:
         }
         # 按注册顺序取第一个完全匹配的，这就是 Starlette 实际会选中的那条。
         winner = next(
-            (
-                r
-                for r in app.routes
-                if r.matches(scope)[0] == Match.FULL  # type: ignore[attr-defined]
-            ),
+            (r for r in app.routes if r.matches(scope)[0] == Match.FULL),
             None,
         )
         endpoint = getattr(winner, "endpoint", None)

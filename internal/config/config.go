@@ -20,17 +20,17 @@ import (
 
 // Config 是网关的根配置。
 type Config struct {
-	Server    Server               `yaml:"server"`
-	Redis     Redis                `yaml:"redis"`
-	Postgres  Postgres             `yaml:"postgres"`
-	Quota     Quota                `yaml:"quota"`
-	Egress    Egress               `yaml:"egress"`
-	Providers map[string]Provider  `yaml:"providers"` // 多上游配置（替代 Upstream）
-	Upstream  UpstreamCommon       `yaml:"upstream"`  // 通用重试配置
-	Scheduler Scheduler            `yaml:"scheduler"`
-	Refresh   Refresh              `yaml:"refresh"`
-	Fallback  Fallback             `yaml:"fallback"`
-	Admin     Admin                `yaml:"admin"`
+	Server    Server              `yaml:"server"`
+	Redis     Redis               `yaml:"redis"`
+	Postgres  Postgres            `yaml:"postgres"`
+	Quota     Quota               `yaml:"quota"`
+	Egress    Egress              `yaml:"egress"`
+	Providers map[string]Provider `yaml:"providers"` // 多上游配置（替代 Upstream）
+	Upstream  UpstreamCommon      `yaml:"upstream"`  // 通用重试配置
+	Scheduler Scheduler           `yaml:"scheduler"`
+	Refresh   Refresh             `yaml:"refresh"`
+	Fallback  Fallback            `yaml:"fallback"`
+	Admin     Admin               `yaml:"admin"`
 
 	// DefaultProvider 是省略 provider 时的兜底上游。
 	//
@@ -188,7 +188,7 @@ type Quota struct {
 	SnapshotInterval time.Duration `yaml:"snapshot_interval"`
 }
 
-// TokenLimits 返回 Token 型配额的水位值。
+// TokenHard 返回 Token 型配额的硬水位。
 func (q Quota) TokenHard() int64 { return int64(float64(q.TokenLimit) * q.TokenHardRatio) }
 
 // TokenSoft 返回 Token 型软水位。
@@ -633,7 +633,7 @@ func Default() *Config {
 		Egress: Egress{
 			Mode:           "direct",
 			RequestTimeout: 300 * time.Second,
-			VerifyOnStart: true,
+			VerifyOnStart:  true,
 			// 刻意留空: 非空默认值会让 EgressVerifyTarget 永远命中
 			// 「显式配置」分支，从 provider base_url 推导的逻辑就成了死代码，
 			// 自检也就永远在拨一个与真实上游无关的域名。
@@ -656,12 +656,12 @@ func Default() *Config {
 		},
 		Providers: map[string]Provider{
 			"volc": {
-				BaseURL: "https://ark.cn-beijing.volces.com",
+				BaseURL:      "https://ark.cn-beijing.volces.com",
 				ModelMapping: map[string]string{},
 				CountModels:  []string{"seedream", "seedream-3.0"},
 				// 子串匹配，覆盖带版本后缀的实际模型名
 				ReasoningModels: []string{"deepseek", "doubao-1-5-thinking", "thinking", "-r1"},
-				QuotaKind: "token",
+				QuotaKind:       "token",
 				// 刻意不预设 QuotaLimit，留 0 让它回退到全局 quota.token_limit。
 				//
 				// 若在此填一个默认额度，运维调 quota.token_limit 会「配了没反应」——

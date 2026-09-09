@@ -160,10 +160,6 @@ func (l *RateLimiter) RefundTokens(ctx context.Context, userID int64, tpmLimit, 
 	if tpmLimit <= 0 || refund <= 0 {
 		return nil
 	}
-	capacity := tpmLimit / 6
-	if capacity < 1 {
-		capacity = 1
-	}
 	key := fmt.Sprintf("user:rl:tpm:%d", userID)
 	// HINCRBYFLOAT 后钳制到容量上限。轻微超出容量在下次 consume 时会被钳制，
 	// 故此处不额外加锁。

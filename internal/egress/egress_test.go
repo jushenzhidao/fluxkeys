@@ -132,7 +132,7 @@ func TestBind_RespectsMaxKeys(t *testing.T) {
 			t.Fatalf("第 %d 个 Key 应能绑定: %v", i, err)
 		}
 	}
-	if _, err := p.Bind("key_overflow"); err != ErrNoIP {
+	if _, err := p.Bind("key_overflow"); !errors.Is(err, ErrNoIP) {
 		t.Errorf("超出 MaxKeys 应返回 ErrNoIP, got %v", err)
 	}
 }

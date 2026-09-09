@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import httpx
 import pytest
@@ -423,7 +424,7 @@ def test_gateway_error_payload_omits_empty_fields() -> None:
 # 静默展示旧值或空值。
 
 
-def _egress_payload(*items: dict[str, object]) -> dict[str, object]:
+def _egress_payload(*items: dict[str, Any]) -> dict[str, object]:
     """构造网关 GET /admin/ips 的响应。字段名与 egress.Stats 一致。"""
     return {
         "mode": "multi_ip",
@@ -438,6 +439,7 @@ def test_出口状态取自网关而非库(settings: Settings) -> None:
 
     这是整条改动的核心: 旧实现从 egress_ips 表读，那里永远是 active。
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/admin/ips"
         return httpx.Response(
@@ -492,6 +494,7 @@ def test_网关不可达时明确降级(settings: Settings) -> None:
     静默返回空表或旧值都不可接受: 前者让运维以为「没有出口」，
     后者让他以为「一切正常」，两种误判都会延误处置。
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json=_gw_error("upstream unavailable"))
 
@@ -513,7 +516,9 @@ def test_网关不可达时明确降级(settings: Settings) -> None:
 
 def test_网关返回结构异常时降级(settings: Settings) -> None:
     """per_ip 缺失或类型不对时按降级处理，不得抛 500。"""
-    for payload in ({"mode": "multi_ip"}, {"per_ip": "not-a-list"}, []):
+    malformed: tuple[object, ...] = ({"mode": "multi_ip"}, {"per_ip": "not-a-list"}, [])
+    for payload in malformed:
+
         def handler(request: httpx.Request, p: object = payload) -> httpx.Response:
             return httpx.Response(200, json=p)
 
@@ -530,13 +535,20 @@ def test_网关返回结构异常时降级(settings: Settings) -> None:
 
 def test_出口缺少addr的条目被跳过(settings: Settings) -> None:
     """addr 是行标识，缺失的条目无法定位到具体出口，跳过而非渲染空行。"""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json=_egress_payload(
                 {"addr": "", "state": "active", "reputation": 100},
-                {"addr": "172.16.0.11", "state": "active", "reputation": 100,
-                 "bound_keys": 1, "max_keys": 10, "pool": "hot"},
+                {
+                    "addr": "172.16.0.11",
+                    "state": "active",
+                    "reputation": 100,
+                    "bound_keys": 1,
+                    "max_keys": 10,
+                    "pool": "hot",
+                },
             ),
         )
 

@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 )
@@ -58,8 +59,8 @@ func TestVolc_缺少model字段返回客户端错误(t *testing.T) {
 	if err == nil {
 		t.Fatal("期望报错")
 	}
-	ue, ok := err.(*UpstreamError)
-	if !ok {
+	var ue *UpstreamError
+	if !errors.As(err, &ue) {
 		t.Fatalf("错误类型 = %T, 期望 *UpstreamError", err)
 	}
 	if ue.Class != ErrClassClient {

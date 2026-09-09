@@ -198,7 +198,6 @@ func (r *Refresher) Tick(ctx context.Context) error {
 		// 进入窗口后先置为 pending，停止承接正常流量
 		if state == RefreshIdle {
 			r.setState(keyID, RefreshPending)
-			state = RefreshPending
 		}
 
 		// 未到该 Key 的错峰时刻则继续等待

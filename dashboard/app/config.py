@@ -136,8 +136,7 @@ def _require_secrets() -> tuple[str, str, str]:
         raise ConfigError("未配置看板口令 DASHBOARD_PASSWORD，管理控制台拒绝启动")
     if len(password) < _MIN_PASSWORD_LEN:
         raise ConfigError(
-            f"DASHBOARD_PASSWORD 长度不足 {_MIN_PASSWORD_LEN} 字符，"
-            "管理控制台是特权入口，拒绝启动"
+            f"DASHBOARD_PASSWORD 长度不足 {_MIN_PASSWORD_LEN} 字符，管理控制台是特权入口，拒绝启动"
         )
 
     secret = os.getenv("DASHBOARD_SESSION_SECRET", "")

@@ -77,7 +77,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, ep adap
 	// 从模型名推断 provider
 	provider := snap.Cfg.ProviderForModel(meta.Model)
 	if provider == "" {
-		s.writeError(w, r, http.StatusNotFound, "model_not_found", 
+		s.writeError(w, r, http.StatusNotFound, "model_not_found",
 			fmt.Sprintf("模型 %s 在所有上游中均不存在", meta.Model))
 		s.metrics.ObserveRequest(epLabel, meta.Model, "404", false, time.Since(start))
 		return
@@ -264,8 +264,8 @@ func (s *Server) recordUsage(ctx context.Context, plan *requestPlan, uc *UserCon
 		// 必须取本次请求实际路由到的 provider，而不是写死一个常量。
 		// 写死会让所有上游的流水都归到同一家名下: 归档、对账、按 provider
 		// 出账全部错位，而每一行看起来都「有值」，不会有任何报错提示。
-		Provider: plan.Provider,
-		Model:    plan.Model,
+		Provider:        plan.Provider,
+		Model:           plan.Model,
 		BillingKind:     string(plan.QuotaKind),
 		QuotaDay:        quota.QuotaDayTime(time.Now()),
 		EstimatedTokens: plan.Estimated,
@@ -334,7 +334,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"id": id, "object": "model", "created": created, "owned_by": ownedBy,
 		})
 	}
-	
+
 	// 遍历所有 providers，收集模型列表。
 	// 取一次快照即可: 本端点只读一处配置，不存在跨读不一致的风险。
 	for providerName, p := range s.snaps.Current().Cfg.Providers {

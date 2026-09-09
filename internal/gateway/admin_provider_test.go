@@ -729,7 +729,7 @@ func TestAdminProvider_capabilities返回受支持取值(t *testing.T) {
 	}
 }
 
-func TestAdminProvider_未实现配置存储时返回501(t *testing.T) {	// 装配层若忘了接上 ProviderConfigStore，必须明确报「未实现」，
+func TestAdminProvider_未实现配置存储时返回501(t *testing.T) { // 装配层若忘了接上 ProviderConfigStore，必须明确报「未实现」，
 	// 而不是 panic（进程挂掉）或 404（看起来像路径写错了，会把
 	// 排查方向引向路由配置）。
 	env := newTestEnv(t) // 普通 fakeStore，未实现 ProviderConfigStore

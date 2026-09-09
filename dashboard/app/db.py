@@ -141,8 +141,8 @@ async def overview_usage(db: Database, day: date) -> asyncpg.Record | None:
                 WHERE status_code >= 400 OR error_code <> ''
             )::bigint                                     AS errors,
             COALESCE(AVG(latency_ms), 0)::double precision AS avg_latency_ms,
-            COUNT(DISTINCT volc_key_id) FILTER (
-                WHERE volc_key_id <> ''
+            COUNT(DISTINCT upstream_key_id) FILTER (
+                WHERE upstream_key_id <> ''
             )::bigint                                     AS used_keys
         FROM usage_records
         WHERE quota_day = $1
@@ -153,14 +153,14 @@ async def overview_usage(db: Database, day: date) -> asyncpg.Record | None:
 
 async def key_pool_distribution(db: Database) -> list[asyncpg.Record]:
     return await db.fetch(
-        "SELECT pool AS name, COUNT(*)::bigint AS count FROM volc_keys "
+        "SELECT pool AS name, COUNT(*)::bigint AS count FROM upstream_keys "
         "GROUP BY pool ORDER BY count DESC"
     )
 
 
 async def key_status_distribution(db: Database) -> list[asyncpg.Record]:
     return await db.fetch(
-        "SELECT status AS name, COUNT(*)::bigint AS count FROM volc_keys "
+        "SELECT status AS name, COUNT(*)::bigint AS count FROM upstream_keys "
         "GROUP BY status ORDER BY count DESC"
     )
 
@@ -174,7 +174,7 @@ async def key_counts(db: Database) -> asyncpg.Record | None:
             COUNT(*) FILTER (
                 WHERE refresh_state <> 'confirmed'
             )::bigint AS unconfirmed_refresh
-        FROM volc_keys
+        FROM upstream_keys
         """
     )
 
@@ -200,7 +200,7 @@ async def list_keys(
     # column/direction 均来自白名单常量，不含外部输入。
     sql = f"""
         WITH today AS (
-            SELECT volc_key_id,
+            SELECT upstream_key_id,
                    COALESCE(SUM(total_tokens), 0)::bigint AS today_tokens,
                    COUNT(*)::bigint                        AS today_requests,
                    COUNT(*) FILTER (
@@ -208,7 +208,7 @@ async def list_keys(
                    )::bigint                               AS today_errors
             FROM usage_records
             WHERE quota_day = $1
-            GROUP BY volc_key_id
+            GROUP BY upstream_key_id
         )
         SELECT k.key_id, k.pool, k.status, k.persona_id, k.egress_ip,
                k.health_score, k.refresh_state, k.refresh_confirmed_at,
@@ -216,8 +216,8 @@ async def list_keys(
                COALESCE(t.today_tokens, 0)   AS today_tokens,
                COALESCE(t.today_requests, 0) AS today_requests,
                COALESCE(t.today_errors, 0)   AS today_errors
-        FROM volc_keys k
-        LEFT JOIN today t ON t.volc_key_id = k.key_id
+        FROM upstream_keys k
+        LEFT JOIN today t ON t.upstream_key_id = k.key_id
         WHERE ($2::text IS NULL OR k.status = $2)
           AND ($3::text IS NULL OR k.pool = $3)
         ORDER BY {column} {direction} NULLS LAST, k.key_id ASC
@@ -229,7 +229,7 @@ async def list_keys(
 async def count_keys(db: Database, status: str | None, pool: str | None) -> int:
     return int(
         await db.fetchval(
-            "SELECT COUNT(*)::bigint FROM volc_keys "
+            "SELECT COUNT(*)::bigint FROM upstream_keys "
             "WHERE ($1::text IS NULL OR status = $1) "
             "AND ($2::text IS NULL OR pool = $2)",
             status,
@@ -249,13 +249,13 @@ async def get_key(db: Database, key_id: str, day: date) -> asyncpg.Record | None
                        WHERE status_code >= 400 OR error_code <> ''
                    )::bigint                               AS today_errors
             FROM usage_records
-            WHERE quota_day = $2 AND volc_key_id = $1
+            WHERE quota_day = $2 AND upstream_key_id = $1
         )
         SELECT k.key_id, k.pool, k.status, k.persona_id, k.egress_ip,
                k.health_score, k.refresh_state, k.refresh_confirmed_at,
                k.last_error, k.last_used_at,
                t.today_tokens, t.today_requests, t.today_errors
-        FROM volc_keys k CROSS JOIN today t
+        FROM upstream_keys k CROSS JOIN today t
         WHERE k.key_id = $1
         """,
         key_id,
@@ -280,7 +280,7 @@ async def key_trend(db: Database, key_id: str, days: Sequence[date]) -> list[asy
                )::bigint                                    AS errors,
                COALESCE(AVG(latency_ms), 0)::double precision AS avg_latency_ms
         FROM usage_records
-        WHERE volc_key_id = $1 AND quota_day = ANY($2::date[])
+        WHERE upstream_key_id = $1 AND quota_day = ANY($2::date[])
         GROUP BY quota_day
         ORDER BY quota_day
         """,
@@ -300,7 +300,7 @@ async def key_model_usage(
                COUNT(*)::bigint                        AS requests,
                COALESCE(SUM(total_tokens), 0)::bigint  AS total_tokens
         FROM usage_records
-        WHERE volc_key_id = $1 AND quota_day = ANY($2::date[])
+        WHERE upstream_key_id = $1 AND quota_day = ANY($2::date[])
         GROUP BY model
         ORDER BY requests DESC
         LIMIT $3
@@ -321,7 +321,7 @@ async def key_error_buckets(
         SELECT COALESCE(NULLIF(error_code, ''), status_code::text) AS label,
                COUNT(*)::bigint AS count
         FROM usage_records
-        WHERE volc_key_id = $1 AND quota_day = ANY($2::date[])
+        WHERE upstream_key_id = $1 AND quota_day = ANY($2::date[])
           AND (status_code >= 400 OR error_code <> '')
         GROUP BY label
         ORDER BY count DESC
@@ -348,8 +348,8 @@ async def usage_trend(db: Database, days: Sequence[date]) -> list[asyncpg.Record
                COUNT(*) FILTER (
                    WHERE status_code >= 400 OR error_code <> ''
                )::bigint                                    AS errors,
-               COUNT(DISTINCT volc_key_id) FILTER (
-                   WHERE volc_key_id <> ''
+               COUNT(DISTINCT upstream_key_id) FILTER (
+                   WHERE upstream_key_id <> ''
                )::bigint                                    AS active_keys,
                COALESCE(AVG(latency_ms), 0)::double precision AS avg_latency_ms
         FROM usage_records
@@ -473,7 +473,7 @@ async def errors_by_status(db: Database, since: datetime, limit: int = 20) -> li
 async def errors_by_key(db: Database, since: datetime, limit: int = 20) -> list[asyncpg.Record]:
     return await db.fetch(
         """
-        SELECT r.volc_key_id AS key_id,
+        SELECT r.upstream_key_id AS key_id,
                COALESCE(k.pool, '')   AS pool,
                COALESCE(k.status, '') AS status,
                COUNT(*)::bigint       AS requests,
@@ -483,14 +483,14 @@ async def errors_by_key(db: Database, since: datetime, limit: int = 20) -> list[
                COALESCE((
                    SELECT COALESCE(NULLIF(e.error_code, ''), 'http_' || e.status_code::text)
                    FROM usage_records e
-                   WHERE e.volc_key_id = r.volc_key_id AND e.created_at >= $1
+                   WHERE e.upstream_key_id = r.upstream_key_id AND e.created_at >= $1
                      AND (e.status_code >= 400 OR e.error_code <> '')
                    GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1
                ), '') AS top_error
         FROM usage_records r
-        LEFT JOIN volc_keys k ON k.key_id = r.volc_key_id
-        WHERE r.created_at >= $1 AND r.volc_key_id <> ''
-        GROUP BY r.volc_key_id, k.pool, k.status
+        LEFT JOIN upstream_keys k ON k.key_id = r.upstream_key_id
+        WHERE r.created_at >= $1 AND r.upstream_key_id <> ''
+        GROUP BY r.upstream_key_id, k.pool, k.status
         HAVING COUNT(*) FILTER (WHERE r.status_code >= 400 OR r.error_code <> '') > 0
         ORDER BY errors DESC
         LIMIT $2
@@ -534,7 +534,7 @@ async def egress_usage(db: Database, day: date) -> dict[str, dict[str, int]]:
             SELECT egress_ip,
                    COUNT(*)::bigint AS db_bound_keys,
                    COUNT(*) FILTER (WHERE status = 'active')::bigint AS active_keys
-            FROM volc_keys
+            FROM upstream_keys
             WHERE egress_ip <> ''
             GROUP BY egress_ip
         ), today AS (
@@ -576,7 +576,7 @@ async def egress_usage(db: Database, day: date) -> dict[str, dict[str, int]]:
 async def unbound_key_count(db: Database) -> int:
     return int(
         await db.fetchval(
-            "SELECT COUNT(*)::bigint FROM volc_keys WHERE egress_ip = ''",
+            "SELECT COUNT(*)::bigint FROM upstream_keys WHERE egress_ip = ''",
             default=0,
         )
     )
@@ -589,7 +589,7 @@ async def unbound_key_count(db: Database) -> int:
 
 async def active_key_ids(db: Database, limit: int = 2000) -> list[str]:
     rows = await db.fetch(
-        "SELECT key_id FROM volc_keys WHERE status = 'active' ORDER BY key_id LIMIT $1",
+        "SELECT key_id FROM upstream_keys WHERE status = 'active' ORDER BY key_id LIMIT $1",
         limit,
     )
     return [str(r["key_id"]) for r in rows]
@@ -598,7 +598,7 @@ async def active_key_ids(db: Database, limit: int = 2000) -> list[str]:
 async def all_key_rows(db: Database, limit: int = 2000) -> list[asyncpg.Record]:
     return await db.fetch(
         "SELECT key_id, pool, status, egress_ip, refresh_state, refresh_confirmed_at, "
-        "last_error FROM volc_keys ORDER BY key_id LIMIT $1",
+        "last_error FROM upstream_keys ORDER BY key_id LIMIT $1",
         limit,
     )
 
@@ -606,7 +606,7 @@ async def all_key_rows(db: Database, limit: int = 2000) -> list[asyncpg.Record]:
 async def recent_drifts(db: Database, limit: int = 50) -> list[asyncpg.Record]:
     return await db.fetch(
         """
-        SELECT volc_key_id AS key_id, billing_kind, quota_day, drift, created_at
+        SELECT upstream_key_id AS key_id, billing_kind, quota_day, drift, created_at
         FROM quota_drift_logs
         ORDER BY created_at DESC
         LIMIT $1
@@ -617,19 +617,19 @@ async def recent_drifts(db: Database, limit: int = 50) -> list[asyncpg.Record]:
 
 async def refresh_state_distribution(db: Database) -> list[asyncpg.Record]:
     return await db.fetch(
-        "SELECT refresh_state AS name, COUNT(*)::bigint AS count FROM volc_keys "
+        "SELECT refresh_state AS name, COUNT(*)::bigint AS count FROM upstream_keys "
         "GROUP BY refresh_state ORDER BY count DESC"
     )
 
 
 async def key_used_on_day(db: Database, day: date) -> dict[str, int]:
     rows = await db.fetch(
-        "SELECT volc_key_id, COALESCE(SUM(total_tokens), 0)::bigint AS used "
-        "FROM usage_records WHERE quota_day = $1 AND volc_key_id <> '' "
-        "GROUP BY volc_key_id",
+        "SELECT upstream_key_id, COALESCE(SUM(total_tokens), 0)::bigint AS used "
+        "FROM usage_records WHERE quota_day = $1 AND upstream_key_id <> '' "
+        "GROUP BY upstream_key_id",
         day,
     )
-    return {str(r["volc_key_id"]): int(r["used"]) for r in rows}
+    return {str(r["upstream_key_id"]): int(r["used"]) for r in rows}
 
 
 async def behavior_hour_histogram(
@@ -641,17 +641,17 @@ async def behavior_hour_histogram(
     """
     return await db.fetch(
         """
-        SELECT volc_key_id,
+        SELECT upstream_key_id,
                EXTRACT(HOUR FROM created_at)::int AS hour,
                COUNT(*)::bigint AS requests
         FROM usage_records
-        WHERE quota_day BETWEEN $1 AND $2 AND volc_key_id <> ''
-          AND volc_key_id IN (
-              SELECT volc_key_id FROM usage_records
-              WHERE quota_day BETWEEN $1 AND $2 AND volc_key_id <> ''
-              GROUP BY volc_key_id HAVING COUNT(*) >= $3
+        WHERE quota_day BETWEEN $1 AND $2 AND upstream_key_id <> ''
+          AND upstream_key_id IN (
+              SELECT upstream_key_id FROM usage_records
+              WHERE quota_day BETWEEN $1 AND $2 AND upstream_key_id <> ''
+              GROUP BY upstream_key_id HAVING COUNT(*) >= $3
           )
-        GROUP BY volc_key_id, hour
+        GROUP BY upstream_key_id, hour
         """,
         start_day,
         end_day,
@@ -665,15 +665,15 @@ async def behavior_model_histogram(
     """按 Key × 模型聚合请求数，用于构造模型偏好分布向量。"""
     return await db.fetch(
         """
-        SELECT volc_key_id, model, COUNT(*)::bigint AS requests
+        SELECT upstream_key_id, model, COUNT(*)::bigint AS requests
         FROM usage_records
-        WHERE quota_day BETWEEN $1 AND $2 AND volc_key_id <> ''
-          AND volc_key_id IN (
-              SELECT volc_key_id FROM usage_records
-              WHERE quota_day BETWEEN $1 AND $2 AND volc_key_id <> ''
-              GROUP BY volc_key_id HAVING COUNT(*) >= $3
+        WHERE quota_day BETWEEN $1 AND $2 AND upstream_key_id <> ''
+          AND upstream_key_id IN (
+              SELECT upstream_key_id FROM usage_records
+              WHERE quota_day BETWEEN $1 AND $2 AND upstream_key_id <> ''
+              GROUP BY upstream_key_id HAVING COUNT(*) >= $3
           )
-        GROUP BY volc_key_id, model
+        GROUP BY upstream_key_id, model
         """,
         start_day,
         end_day,
@@ -682,5 +682,5 @@ async def behavior_model_histogram(
 
 
 async def key_egress_map(db: Database) -> dict[str, str]:
-    rows = await db.fetch("SELECT key_id, egress_ip FROM volc_keys")
+    rows = await db.fetch("SELECT key_id, egress_ip FROM upstream_keys")
     return {str(r["key_id"]): str(r["egress_ip"]) for r in rows}

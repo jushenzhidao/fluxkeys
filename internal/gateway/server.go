@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"github.com/fluxkeys/fluxkeys/internal/adapter"
-	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/config"
+	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/metrics"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
@@ -207,7 +207,7 @@ func New(d Deps) (*Server, error) {
 	if rl, ok := lim.(*RateLimiter); ok && rl == nil {
 		lim = nil
 	}
-	
+
 	// 快照是 config 与 adapter registry 的不可分割组合，故在此一次性构建
 	// 而非分别装配: 两者若能各自替换，热切 model_mapping 就会出现
 	// 「新 base_url 配旧 mapping」，请求被改写成错误的上游模型名且不报错。
@@ -389,7 +389,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.Handler {
 		// 请求上，写频率被钳到每 Key 每 TTL 一次，不会让该行成为热点。
 		if !fromCache && uc.APIKeyID > 0 {
 			if toucher, ok := s.store.(keyToucher); ok {
-				go func(keyID int64) {
+				go func(keyID int64) { //nolint:contextcheck // 异步留痕刻意脱离请求 ctx，断连后仍要更新 last_used_at
 					tctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 					defer cancel()
 					if err := toucher.TouchUserAPIKey(tctx, keyID); err != nil {
@@ -667,4 +667,3 @@ func newRequestID() string {
 	}
 	return "req_" + hex.EncodeToString(b[:])
 }
-

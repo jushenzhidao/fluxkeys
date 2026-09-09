@@ -12,9 +12,7 @@ from typing import Final
 
 # 与 app.css 的 :root 保持同名同值，避免登录页与主界面观感割裂。
 # 这里必须写死一份是因为登录页不加载外部 CSS。
-_LOGIN_HTML: Final[
-    str
-] = """<!DOCTYPE html>
+_LOGIN_HTML: Final[str] = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
