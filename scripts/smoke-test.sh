@@ -461,10 +461,13 @@ test_dashboard() {
     fail "GET 看板 /healthz -> $code"
   fi
 
-  local resp body
-  resp="$(curl -sS "${CURL_NOPROXY[@]}" -w '\n%{http_code}' --max-time 15 "${DASHBOARD_URL}/" 2>/dev/null || true)"
-  code="$(printf '%s' "$resp" | tail -1)"
+  local resp body code loc
+  # redirect_url 一并取出: 未登录访问首页时，鉴权中间件对页面请求是 302 到
+  # /login（API 请求才是 401 JSON），这是登录墙的正常形态，需与意外重定向区分。
+  resp="$(curl -sS "${CURL_NOPROXY[@]}" -w '\n%{http_code} %{redirect_url}' --max-time 15 "${DASHBOARD_URL}/" 2>/dev/null || true)"
+  code="$(printf '%s' "$resp" | tail -1 | awk '{print $1}')"
   code="${code:-000}"   # curl 完全失败时无输出，兜底为 000
+  loc="$(printf '%s' "$resp" | tail -1 | cut -sd' ' -f2-)"
   body="$(printf '%s' "$resp" | sed '$d')"
 
   if [[ "$code" == "200" ]]; then
@@ -474,10 +477,12 @@ test_dashboard() {
     else
       info "首页未返回 HTML（可能是 JSON API 形式，非错误）"
     fi
+  elif [[ "$code" == "302" && "$loc" == *"/login"* ]]; then
+    pass "GET 看板首页 -> 302（重定向到登录页，鉴权生效）"
   elif [[ "$code" == "401" || "$code" == "403" ]]; then
     pass "GET 看板首页 -> ${code}（已启用鉴权）"
   else
-    fail "GET 看板首页 -> $code"
+    fail "GET 看板首页 -> $code${loc:+（重定向到 $loc）}"
   fi
 }
 
