@@ -1,21 +1,44 @@
 name: Release
 
+# =============================================================================
+# 发版模型：混合式（日常零人工，tag 留给需要人判断的变更）
+#
+#   ① push 到 main   → 按上一个版本 tag 自增 patch，全自动发版（日常路径）
+#   ② 人工推版本 tag  → 以该 tag 为准发布，不递增（minor / major 与「对外契约
+#                        不向后兼容」的变更走这条路；tag 即承诺）
+#   ③ workflow_dispatch + tag → 补发：给一个**已存在**的 tag 重跑构建与发布
+#
+# 为什么自动递增必须放在本文件里，而不能单独开一个 workflow 去打 tag：
+# GITHUB_TOKEN 推送的 tag **不会触发**任何其他 workflow。所以「先打 tag 再让
+# tag 触发发布」这种拆法在本仓不成立，自增逻辑必须与发布逻辑同一次 run 内完成。
+#
+# 反过来说，本 workflow 在自动模式下自己 push 的 tag 也不会把自己再触发一遍，
+# 这是安全的；但仍保留 actor 兜底（将来若改用 PAT 推送，兜底即生效）。
+# =============================================================================
+
 on:
   push:
+    branches: [main]
     tags:
       # 只匹配 v 开头的语义化版本 tag，如 v1.0.0 / v1.0.0-rc1
       - "v*"
-  # 手动触发用于演练发布流程（不会真正推带版本号的镜像，见下方 tags 规则）
+  # 补发入口：给一个已存在的 tag 重跑。注意这是**真实发布**，不是演练 ——
+  # 它会覆盖该 tag 对应的镜像并更新 Release。演练请用本地干跑（见 docs/release-model.md）。
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建的版本号（如 v1.0.0）"
+        description: "要补发的已存在 tag（如 v0.1.0）；必须已存在，不会自动创建"
         required: true
         type: string
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false  # 发布不中断，避免推出半成品镜像
+  # 单一全局组，且不打断在跑的发布：
+  #  · 两次快速 push main 会被串行化，后一次能看到前一次刚打的 tag，版本号不会撞车
+  #  · 人工 tag 与自动 patch 不会并行抢版本线（否则可能出现 v0.1.1 晚于 v0.2.0 发布，
+  #    导致 Release 列表的 "Latest" 指错）
+  # 代价是一次发布（多架构，约十几分钟）会挡住后一次。发版频率下可以接受。
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -27,16 +50,133 @@ env:
 
 jobs:
   # =========================================================================
-  # 发布前门禁：tag 上的代码必须能过测试
+  # 版本解析：三入口的唯一分叉点，其余 job 全部依赖它的输出
+  #
+  # 必须独立成一个 job，因为 push 到 main 时没有 tag 可读，而 verify /
+  # build-push / release 三个 job 都需要同一份版本号 —— 分散推导必然漂移。
+  # =========================================================================
+  resolve:
+    name: 解析版本
+    runs-on: ubuntu-24.04
+    # 逃生阀：commit message 里带 [skip release] 即整条流水线跳过。
+    # workflow_dispatch 无 head_commit，用 || '' 兜底；tag 推送同样为 null。
+    if: ${{ github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message || '', '[skip release]') }}
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.ver.outputs.mode }}
+      version: ${{ steps.ver.outputs.version }}
+      image_version: ${{ steps.ver.outputs.image_version }}
+      image_minor: ${{ steps.ver.outputs.image_minor }}
+      is_prerelease: ${{ steps.ver.outputs.is_prerelease }}
+      commit: ${{ steps.ver.outputs.commit }}
+      short_commit: ${{ steps.ver.outputs.short_commit }}
+    steps:
+      # ref 必须显式指定：补发时默认检出的是**默认分支**，会用主干代码去构建旧 tag
+      # 对应的镜像，并把 :<version> 与 :latest 覆盖过去 —— 镜像与 tag 的承诺就脱钩了。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: 解析发布模式与版本号
+        id: ver
+        run: |
+          set -euo pipefail
+
+          INPUT_TAG='${{ inputs.tag }}'
+          REF='${{ github.ref }}'
+
+          if [ -n "$INPUT_TAG" ]; then
+            MODE=tag                                   # ③ 补发
+            TAG="$INPUT_TAG"
+          elif [ "${REF#refs/tags/}" != "$REF" ]; then
+            MODE=tag                                   # ② 人工 tag
+            TAG="${REF#refs/tags/}"
+          else
+            MODE=auto                                  # ① push 到 main
+          fi
+
+          if [ "$MODE" = auto ]; then
+            # 基线取「最新的稳定版本 tag」：--sort=-v:refname 而非 git describe --tags，
+            # 后者取的是「最近可达的 tag」，在有合并历史时会挑错版本（v1.9.0 会被
+            # 字典序判成早于 v1.10.0）。优先排除含 '-' 的预发布 tag，让补丁线跟在
+            # 稳定版之后（v1.0.0-rc1 已被手工发布时，基线仍是 v1.0.0 而非 rc）。
+            VERSION_GLOB='v[0-9]*.[0-9]*.[0-9]*'
+            PREV="$(git tag -l "$VERSION_GLOB" --sort=-v:refname | grep -v -- '-' | head -n1 || true)"
+            if [ -z "$PREV" ]; then
+              # 一个稳定 tag 都没有（例如只发过 v1.0.0-rc1）时回落到最新的预发布 tag。
+              # 若此时仍从 v0.0.0 起算会得到 v0.0.1 —— 低于已发布的 rc，版本号倒退，
+              # 还会把 Release 的 "Latest" 指到一个更旧的版本上。
+              PREV="$(git tag -l "$VERSION_GLOB" --sort=-v:refname | head -n1 || true)"
+            fi
+            PREV="${PREV:-v0.0.0}"                     # 冷启动：仓库零 tag 时从 v0.0.0 起算
+            CORE="${PREV#v}"
+            CORE="${CORE%%[-+]*}"                      # 剥预发布/构建后缀，否则 $(( )) 会报错
+            MAJOR="${CORE%%.*}"
+            REST="${CORE#*.}"
+            MINOR="${REST%%.*}"
+            PATCH="${REST#*.}"
+            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "基线 $PREV → 自增 patch → $TAG"
+          fi
+
+          # 格式校验：拦住 latest 之类的滚动指针被当成版本号解析
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::版本 tag 格式非法：${TAG}（期望 vX.Y.Z 或 vX.Y.Z-后缀）"
+            exit 1
+          fi
+
+          # 补发要求 tag 已存在，避免"以为在补发、实际在造新版本"
+          if [ "$MODE" = tag ]; then
+            if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+              echo "::error::tag $TAG 不存在。补发必须先有该 tag；要发新版本请直接 push 到 main。"
+              exit 1
+            fi
+          fi
+
+          # 自动模式下提前撞车检测：真撞了要在开多架构构建**之前**失败，
+          # 而不是等十几分钟构建完、推完镜像才发现 tag 已存在（release job 里还有一道）
+          if [ "$MODE" = auto ] && git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG 已存在 —— 并发运行或有人抢先打了同一版本"
+            exit 1
+          fi
+
+          IMGVER="${TAG#v}"                            # 镜像 tag 不带 v 前缀，git tag 带
+          PRECORE="${IMGVER%%[-+]*}"
+          MAJOR="${PRECORE%%.*}"
+          REST="${PRECORE#*.}"
+          MINOR="${REST%%.*}"
+          if [ "$IMGVER" != "$PRECORE" ]; then ISPRERELEASE=true; else ISPRERELEASE=false; fi
+
+          {
+            echo "mode=$MODE"
+            echo "version=$TAG"
+            echo "image_version=$IMGVER"
+            echo "image_minor=${MAJOR}.${MINOR}"
+            echo "is_prerelease=$ISPRERELEASE"
+            # 用检出后的 HEAD，而不是 github.sha：补发时 github.sha 是默认分支的提交，
+            # 拿它做 image.revision 标签与 GIT_COMMIT 构建参数会把镜像标错提交
+            echo "commit=$(git rev-parse HEAD)"
+            echo "short_commit=$(git rev-parse --short=7 HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  # =========================================================================
+  # 发布前门禁：要发布的 commit 必须能过测试
   #
   # 不复用 ci.yml 是刻意的：tag 可能打在任意 commit 上（包括未跑过 CI 的），
-  # 直接构建镜像会把没验证过的代码推成正式版本。
+  # 直接构建镜像会把没验证过的代码推成正式版本。自动模式虽然源自已过 CI 的
+  # main，但同理再验一次成本很低。
   # =========================================================================
   verify:
     name: 发布前验证
     runs-on: ubuntu-24.04
+    needs: [resolve]
     steps:
+      # 与最终构建同一个 ref：补发旧 tag 时要验的是那个 tag 的代码
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -58,7 +198,7 @@ jobs:
   build-push:
     name: 构建推送 ${{ matrix.target }}
     runs-on: ubuntu-24.04
-    needs: [verify]
+    needs: [resolve, verify]
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +213,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # 拉全部历史，让 git describe 能读到 tag 信息
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       # QEMU 提供跨架构模拟，让 amd64 runner 能构建 arm64 镜像。
@@ -93,24 +234,21 @@ jobs:
           # GITHUB_TOKEN 已由 permissions.packages: write 授权，无需额外 PAT
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 准备版本信息
+      - name: 准备构建元信息
         id: meta
         run: |
           set -euo pipefail
-          # tag 推送时用 ref 名；手动触发时用输入值
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.tag }}"
-          else
-            version="${GITHUB_REF#refs/tags/}"
-          fi
           # 仓库所有者转小写：ghcr.io 不接受大写路径，而 GitHub 用户名可能含大写
           owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
           {
-            echo "version=$version"
-            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "owner=$owner"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
+      # 镜像 tag 全部用显式 raw 值，不用 type=semver：
+      # semver 类型依赖 github.ref 本身是个 tag，而自动模式（push 到 main）与
+      # 补发（github.ref 是分支）都不满足 —— 那样会只落到 latest 一个 tag，
+      # 把 latest 用未编号的代码覆盖掉。raw 值与 ref 无关，三种入口一致。
       - name: 生成镜像标签与元数据
         id: docker_meta
         uses: docker/metadata-action@v5
@@ -118,16 +256,16 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ steps.meta.outputs.owner }}/${{ matrix.image }}
           tags: |
             # 完整版本号，如 v1.2.3 -> 1.2.3
-            type=semver,pattern={{version}}
+            type=raw,value=${{ needs.resolve.outputs.image_version }}
             # 主次版本，如 1.2 —— 便于跟随补丁更新
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.resolve.outputs.image_minor }}
             # 仅正式版本更新 latest；预发布（-rc1 等）不会污染 latest
-            type=raw,value=latest,enable=${{ !contains(steps.meta.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.is_prerelease == 'false' }}
           labels: |
             org.opencontainers.image.title=FluxKeys ${{ matrix.target }}
             org.opencontainers.image.description=OpenAI 兼容 API 网关（${{ matrix.target }}）
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.image_version }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
             org.opencontainers.image.created=${{ steps.meta.outputs.build_time }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
@@ -142,8 +280,8 @@ jobs:
           tags: ${{ steps.docker_meta.outputs.tags }}
           labels: ${{ steps.docker_meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            GIT_COMMIT=${{ github.sha }}
+            VERSION=${{ needs.resolve.outputs.image_version }}
+            GIT_COMMIT=${{ needs.resolve.outputs.commit }}
             BUILD_TIME=${{ steps.meta.outputs.build_time }}
           cache-from: type=gha,scope=release-${{ matrix.target }}
           cache-to: type=gha,scope=release-${{ matrix.target }},mode=max
@@ -180,7 +318,7 @@ jobs:
           {
             echo "### ${{ matrix.target }} 镜像已推送"
             echo ""
-            echo "版本: \`${{ steps.meta.outputs.version }}\`"
+            echo "版本: \`${{ needs.resolve.outputs.image_version }}\`"
             echo ""
             echo "镜像 digest: \`${{ steps.build.outputs.digest }}\`"
             echo ""
@@ -192,38 +330,58 @@ jobs:
 
   # =========================================================================
   # 创建 GitHub Release
+  #
+  # 自动模式下的 tag 在这一步打，且**排在镜像推送之后**：
+  # 镜像先推、tag 后打 ⇒ 构建失败不会留下「有 tag、没镜像」的半成品 ——
+  # tag 一旦存在就是对外承诺，不该被一次失败的构建兑现。
   # =========================================================================
   release:
     name: 创建 Release
     runs-on: ubuntu-24.04
-    needs: [build-push]
-    # 手动触发时不建 Release（那是演练，不该产生正式发布记录）
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [resolve, build-push]
     permissions:
-      contents: write   # 创建 Release 需要写权限
+      contents: write   # 打 tag 与创建 Release 都需要写权限
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+
+      - name: 自动模式：创建并推送版本 tag
+        if: needs.resolve.outputs.mode == 'auto'
+        run: |
+          set -euo pipefail
+          TAG='${{ needs.resolve.outputs.version }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG 已存在 —— 并发运行或有人抢先打了同一版本"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          # GITHUB_TOKEN 推送的 tag 不会再触发本 workflow，不会自激
+          git push origin "refs/tags/$TAG"
+          echo "已推送 tag ${TAG}（指向 ${{ needs.resolve.outputs.short_commit }}）"
 
       - name: 准备发布说明
         id: notes
         run: |
           set -euo pipefail
-          version="${GITHUB_REF#refs/tags/}"
+          version='${{ needs.resolve.outputs.version }}'
+          image_version='${{ needs.resolve.outputs.image_version }}'
           owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
           {
             echo "## 镜像"
             echo ""
             echo '```bash'
-            echo "docker pull ghcr.io/$owner/fluxkeys:${version#v}"
+            echo "docker pull ghcr.io/$owner/fluxkeys:${image_version}"
             echo '```'
             echo ""
             echo "支持架构：\`linux/amd64\`、\`linux/arm64\`"
             echo ""
             echo "## 部署"
             echo ""
-            echo "在 \`.env\` 中设置 \`FLUXKEYS_IMAGE_TAG=${version#v}\` 后："
+            echo "在 \`.env\` 中设置 \`FLUXKEYS_IMAGE_TAG=${image_version}\` 后："
             echo ""
             echo '```bash'
             echo "docker compose -f docker-compose.prod.yml up -d"
@@ -234,22 +392,31 @@ jobs:
             echo ""
             echo "## 变更"
             echo ""
-            # 从上一个 tag 到当前 tag 的提交列表
-            prev=$(git describe --tags --abbrev=0 "$version^" 2>/dev/null || true)
+            # 从上一个 tag 到当前版本的提交列表。
+            # 用 "$version^" 而不是 git describe --tags：注解 tag 会被 peel 到父提交，
+            # 因此不会取到自己。
+            prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$version^" 2>/dev/null || true)
             if [ -n "$prev" ]; then
-              echo "对比 \`$prev\`：" 
+              echo "对比 \`$prev\`："
               echo ""
-              git log --pretty=format:'- %s (%h)' "$prev..$version"
+              git log --pretty=format:'- %s (%h)' --no-merges "$prev..$version"
             else
-              echo "首个版本。"
+              echo "首个版本。以下为最近提交（限长，完整历史见仓库）："
+              echo ""
+              git log --max-count=50 --pretty=format:'- %s (%h)' --no-merges "$version"
             fi
+            echo ""
           } > release-notes.md
           cat release-notes.md
 
+      # 幂等：同一个 tag 重跑（失败重试、或改了 workflow 后补跑）时更新而不是报错。
+      # softprops v2 对已存在的 Release 走 update 路径，不会 "already exists" 变红。
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.resolve.outputs.version }}
+          name: ${{ needs.resolve.outputs.version }}
           body_path: release-notes.md
           # 含 - 的版本（如 v1.0.0-rc1）标记为预发布
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.resolve.outputs.is_prerelease == 'true' }}
           generate_release_notes: false
