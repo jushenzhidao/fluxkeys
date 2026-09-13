@@ -72,11 +72,16 @@ jobs:
       commit: ${{ steps.ver.outputs.commit }}
       short_commit: ${{ steps.ver.outputs.short_commit }}
     steps:
-      # ref 必须显式指定：补发时默认检出的是**默认分支**，会用主干代码去构建旧 tag
-      # 对应的镜像，并把 :<version> 与 :latest 覆盖过去 —— 镜像与 tag 的承诺就脱钩了。
+      # ref 必须显式指定，且三种入口各有来源：
+      #  · 补发：checkout 默认检出**默认分支**，会用主干代码去构建旧 tag 对应的镜像，
+      #    并把 :<version> 与 :latest 覆盖过去 —— 镜像与 tag 的承诺就脱钩了。
+      #  · push 到 main：必须用 github.sha（当次推送的提交），**不能**用
+      #    refs/heads/main。分支是移动指针，而本 job 要到几分钟后才跑，期间再有
+      #    push 就会检出那个更新的提交。实测踩过：v0.1.1 的 tag 落到了随后推送、
+      #    且本应被逃生阀跳过的文档提交上。
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
           fetch-depth: 0
 
       - name: 解析发布模式与版本号
@@ -173,10 +178,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [resolve]
     steps:
-      # 与最终构建同一个 ref：补发旧 tag 时要验的是那个 tag 的代码
+      # 验的就是 resolve 已确定的那个提交（SHA 固定，不受分支后续推进影响）
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - uses: actions/setup-go@v5
         with:
@@ -213,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # 拉全部历史，让 git describe 能读到 tag 信息
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.commit }}
           fetch-depth: 0
 
       # QEMU 提供跨架构模拟，让 amd64 runner 能构建 arm64 镜像。
@@ -344,7 +349,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.commit }}
           fetch-depth: 0
 
       - name: 自动模式：创建并推送版本 tag
