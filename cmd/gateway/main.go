@@ -289,6 +289,19 @@ func run() error {
 		return fmt.Errorf("启动后台任务: %w", err)
 	}
 
+	// 把配置热加载所需的依赖补进 storeAdapter。
+	//
+	// 必须在这里（bg 之后）而不是第 266 行就地构造：afterSwap 要指向
+	// bg.ReconcileRefreshers，而 bg 在那一行还不存在；少了它，热加载换入的新
+	// provider 不会有刷新探测器，被移除的探测器也不会停。
+	//
+	// 这四个字段为空时管理面的写操作会退回「reloaded=false 且不生效」的旧形态
+	// （ReloadProviderConfig 返回 errReloadUnavailable），不会 panic。
+	storeAdapter.snaps = snaps
+	storeAdapter.base = cfg
+	storeAdapter.afterSwap = bg.ReconcileRefreshers
+	storeAdapter.log = log
+
 	// ===== 8. HTTP 服务 =====
 	//
 	// adapter registry 不在这里建 —— 它由 confsnap.Build 与 config 绑成同一个

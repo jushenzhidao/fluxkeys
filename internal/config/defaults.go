@@ -77,7 +77,19 @@ func Default() *Config {
 			"volc": {
 				BaseURL:      "https://ark.cn-beijing.volces.com",
 				ModelMapping: map[string]string{},
-				CountModels:  []string{"seedream", "seedream-3.0"},
+				// 按次计费的模型 id。**必须是在册的真实 id**，且该字段是全等匹配
+				// （见 IsCountModel）：写错一个字符就等于「这条声明永不命中」——
+				// 不报错，只是生图模型悄悄按 token 计量。
+				//
+				// 这里曾写 ["seedream","seedream-3.0"]，而这两个 id 在上游在册的
+				// 133 个模型里都不存在（真实生图形如 doubao-seedream-5-0-260128），
+				// 等于出厂就带着一份空声明。取当前登记在 basics 上游清单里的两个 id；
+				// 版本号是 id 的一部分，上游发新版本时需要同步更新（与 ModelRatio
+				// 配价同性质：不在册 = 静默失效）。
+				CountModels: []string{
+					"doubao-seedream-5-0-pro-260628",
+					"doubao-seedream-5-0-260128",
+				},
 				// 子串匹配，覆盖带版本后缀的实际模型名
 				ReasoningModels: []string{"deepseek", "doubao-1-5-thinking", "thinking", "-r1"},
 				QuotaKind:       "token",

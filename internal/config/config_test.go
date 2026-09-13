@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -203,12 +204,33 @@ func TestLoad_EmptyPathUsesDefaults(t *testing.T) {
 
 func TestIsCountModel(t *testing.T) {
 	cfg := Default()
-	if !cfg.IsCountModel("volc", "seedream") {
-		t.Error("seedream 应为次数型")
+
+	// 默认列表里的每个 id 都必须能被自己命中（自一致性）。
+	// 这条替代了原先写死 "seedream" 的断言 —— 那条断言把「出厂默认带一份
+	// 永不命中的占位声明」这个缺陷固化成了期望值。见 KI-029。
+	def := cfg.Providers["volc"].CountModels
+	if len(def) == 0 {
+		t.Fatal("volc 出厂默认应有按次计费模型；空列表同样是静默失效")
 	}
-	if !cfg.IsCountModel("volc", "SeeDream") {
-		t.Error("模型名匹配应忽略大小写")
+	for _, id := range def {
+		if !cfg.IsCountModel("volc", id) {
+			t.Errorf("默认 count_models 里的 %q 应被判为次数型", id)
+		}
 	}
+
+	// 大小写不敏感：拿真实 id 的大写形式验，而不是拿占位名。
+	upper := strings.ToUpper(def[0])
+	if !cfg.IsCountModel("volc", upper) {
+		t.Errorf("模型名匹配应忽略大小写: %q 应命中", upper)
+	}
+
+	// 反向断言：写错的 id 不会命中 —— 全等匹配下它只会静默失效。
+	for _, wrong := range []string{"seedream", "seedream-3.0", "doubao-seedream"} {
+		if cfg.IsCountModel("volc", wrong) {
+			t.Errorf("%q 不在默认 count_models 里，不应命中（全等匹配）", wrong)
+		}
+	}
+
 	if cfg.IsCountModel("volc", "deepseek-v3") {
 		t.Error("deepseek-v3 应为 Token 型")
 	}

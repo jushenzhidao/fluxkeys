@@ -525,6 +525,17 @@ func (b *background) archiveDaily(ctx context.Context) error {
 	return nil
 }
 
+// ReconcileRefreshers 把刷新探测器对齐到当前快照，供配置热加载换入新快照后调用。
+//
+// 不做这一步的后果是单向的**静默偏差**：新增的 provider 永远没有探测器（它的 Key
+// 在 12:00 之后不会被确认刷新，额度恢复也无从得知），而被移除的 provider 的探测器
+// 会继续按旧配置跑，对一个「配置上已经不存在」的上游持续产生副作用。
+//
+// 它是幂等的（内部按快照里的 provider 集合求差集），因此重复调用安全。
+func (b *background) ReconcileRefreshers(ctx context.Context) error {
+	return b.reconcileRefreshers(ctx)
+}
+
 // reconcileRefreshers 把运行中的刷新探测器对齐到当前快照（P0-4）。
 //
 // 这是本文件唯一需要副作用编排的点。其他任务都是「每轮重新读一次配置」，

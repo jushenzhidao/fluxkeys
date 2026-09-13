@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/gateway"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
@@ -221,7 +223,21 @@ func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, e
 // ===== 存储适配 =====
 
 // storeAdapter 把 store.Store 适配为 gateway.Store。
-type storeAdapter struct{ st *store.Store }
+//
+// 后三个字段是为 adminapi.ProviderReloader 准备的：热加载要「读库 → 装配快照 →
+// 换入」，而装配层里同时握有存储、快照持有者与常驻协程的只有这里。
+// 它们全为空时 ReloadProviderConfig 返回 errReloadUnavailable —— 这是刻意保留的
+// **降级路径**（未装配就如实说不支持），而不是崩溃或静默 no-op。
+type storeAdapter struct {
+	st *store.Store
+	// snaps 是运行期热配置的唯一来源，换入即生效。
+	snaps *confsnap.Holder
+	// base 是启动期配置。热加载只替换 providers 段，其余冷配置原样继承。
+	base *config.Config
+	// afterSwap 在快照换入之后调用，把依赖快照的常驻协程（刷新探测器）对齐到新配置。
+	afterSwap func(context.Context) error
+	log       *slog.Logger
+}
 
 func (a *storeAdapter) AuthenticateUserKey(ctx context.Context, plaintext string) (*gateway.UserContext, error) {
 	ac, err := a.st.AuthenticateUserKey(ctx, plaintext)
