@@ -14,7 +14,9 @@ redis:
 
 # 多 Provider 配置示例
 #
-# 平台辨析（实测结论，见 livetest-ai/real_upstream_test/TEST_REPORT.md）：商汤有两个互不相通
+# 平台辨析（实测结论；原始证据文件 real_upstream_test/TEST_REPORT.md 已于 2026-09-13 移除，
+# 该上游的现役登记改由 livetest-ai/basics/upstreams.yml 的 id=sensenova 承担）：
+# 商汤有两个互不相通
 # 的平台，凭据形态与域名必须配套，混用一律 403：
 #   - 日日新公测平台  token.sensenova.cn        sk- 形态 Key   ← 用这个
 #   - 商汤大装置 AIDC  api.sensenova.cn/compatible-mode  AK|SK 形态

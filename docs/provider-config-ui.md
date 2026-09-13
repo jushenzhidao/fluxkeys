@@ -785,7 +785,7 @@ detail：
 
 > 版本 #129，变更 quota_limit、model_mapping 共 2 项。网关已重新加载，无需重启。
 
-**成功即确定性成功，不做"可能部分生效"的暗示。** 部署拓扑是单实例（已核实：`livetest-ai/real_upstream_test/deploy_remote.sh` 的 `systemctl enable/restart fluxkeys` + host 网络，`docker-compose.prod.yml` 的 gateway 无 `replicas` / `scale` 指令），热加载 API 同步返回已生效与新版本号。因此不存在"多实例部分生效"这一状态，界面不为它预留文案——预留一段永远不会触发的警告，只会让运维怀疑每次成功是否真的成功。
+**成功即确定性成功，不做"可能部分生效"的暗示。** 部署拓扑是单实例（已核实：`docker-compose.prod.yml` 的 gateway 无 `replicas` / `scale` 指令，主机侧由 systemd 单实例托管），热加载 API 同步返回已生效与新版本号。因此不存在"多实例部分生效"这一状态，界面不为它预留文案——预留一段永远不会触发的警告，只会让运维怀疑每次成功是否真的成功。
 
 若将来改为多实例部署，这里需要同步补回一个 `notify('warn', ...)` 分支，且**前提是热加载 API 能返回各实例的重载确认**。在接口给不出这个信息之前，界面无法如实区分"全部生效"与"部分生效"，写出来就是空头承诺。
 
@@ -929,7 +929,7 @@ detail：
 
 **③ 跨量纲回滚：由「打字确认后放行」改为直接拒绝**（设计师判断，team-lead 授权自行定夺）。②使 quota_kind 在编辑路径上禁改后，回滚成为它唯一的旁路入口。选择拒绝而非加摩擦的三条理由见 §7.4：policy 自相矛盾会让运维对界面其他警告一并打折扣；回滚动线上运维的心理模型是"撤销"而非"变更"，注意力最低，把最危险的字段放这里拦是拦错了位置；拒绝的同时已把替代路径铺到可直接执行（列出差异字段与具体值 + 指向新建 provider）。同时明确不做「部分回滚」——它会产出与任何历史版本都不同的新版本而运维以为回到了 #124，正是本项目要消灭的那类"操作成功但状态与心智模型不符"的缺陷。
 
-**④ 热加载无多实例语义，「部分生效」文案删除**。已独立核实部署拓扑：`livetest-ai/real_upstream_test/deploy_remote.sh` 用 `systemctl enable/restart fluxkeys` + host 网络，`docker-compose.prod.yml` 的 gateway 无 `replicas` / `scale` 指令，生产是单实例。热加载 API 同步返回已生效与新版本号，界面按确定性成功处理。→ §8.4 删去 warn 分支，并留下改为多实例时需要补回的前提条件（接口须能返回各实例重载确认，否则界面无法如实区分）。
+**④ 热加载无多实例语义，「部分生效」文案删除**。已独立核实部署拓扑：`docker-compose.prod.yml` 的 gateway 无 `replicas` / `scale` 指令，主机侧由 systemd 单实例托管，生产是单实例。热加载 API 同步返回已生效与新版本号，界面按确定性成功处理。→ §8.4 删去 warn 分支，并留下改为多实例时需要补回的前提条件（接口须能返回各实例重载确认，否则界面无法如实区分）。
 
 **⑤ 疑似密钥原文按 error 拒绝，不按 warning 放行**（架构师定，比初稿更严，界面已跟进）。网关侧判据是长度 > 40 或含小写字母，dry-run 直接拒绝提交。界面不提供"我知道风险，继续提交"的旁路——密钥一旦进版本历史就无法收回（历史只读且被 `audit_logs` 二次留存），这类不可逆错误不该由一次勾选把关。→ §4.2 字段 3 hint 与其后的说明段、成品拒绝文案。
 
@@ -990,9 +990,9 @@ hint 里的 provider 说明**写成条件式，不写成"必填"**：「配置�
 - `internal/store/schema.sql`：`key_id TEXT NOT NULL UNIQUE` —— **key_id 单列唯一**，无 `(provider, key_id)` 复合约束
 - `internal/store/upstreamkeys.go`：`ON CONFLICT (key_id) DO UPDATE SET ... provider = EXCLUDED.provider` —— 冲突目标是 key_id 单列，且命中后**无条件覆盖 provider 列**
 
-这两处是同一份 schema 在跑：`docker-compose.test.yml` 把 `internal/store/schema.sql` 挂到 `docker-entrypoint-initdb.d`，`livetest-ai/real_upstream_test/deploy.sh`、`deploy_auto.sh`、`deploy_remote.sh` 三个部署脚本也都打包这一份。
+这两处是同一份 schema 在跑：`docker-compose.test.yml` 把 `internal/store/schema.sql` 挂到 `docker-entrypoint-initdb.d`。（原先另有三个部署脚本打包这一份，它们已于 2026-09-13 随 real_upstream_test/ 移除，现在在跑的只有这一份。）
 
-`deploy/init.sql` 里确实有 `CONSTRAINT uq_provider_key UNIQUE (provider, key_id)`，看着支持你的说法，但那份**不是在跑的那份**：它没有 key_id 单列 UNIQUE，列结构也对不上（`secret_enc BYTEA` 而非 `TEXT`，缺 `persona_id` / `health_score` / `refresh_state` / `last_error` / `refresh_confirmed_at`），只被 `test_local.sh:62` 和 `deploy_test.sh:33` 引用。两份 schema 对同一张表的唯一性给了相反答案，这本身要请 architect 定夺哪份是准的。
+`deploy/init.sql` 里确实有 `CONSTRAINT uq_provider_key UNIQUE (provider, key_id)`，看着支持你的说法，但那份**不是在跑的那份**：它没有 key_id 单列 UNIQUE，列结构也对不上（`secret_enc BYTEA` 而非 `TEXT`，缺 `persona_id` / `health_score` / `refresh_state` / `last_error` / `refresh_confirmed_at`），现已无任何消费者（原先只被两个遗留脚本手工调用，二者已于 2026-09-13 移除）。两份 schema 对同一张表的唯一性给了相反答案，这本身要请 architect 定夺哪份是准的。
 
 **按现行实现，实际会发生的事**：在 sensenova 下导入一个 key_id 已存在于 volc 的 Key，不会得到两条记录，而是那条 volc 记录的 provider 被改写成 sensenova。它的 `egress_ip`、`health_score`、`persona_id`、封禁状态全部原样留着——**只是换了 provider**。volc 侧从此少一把可用 Key，而导入结果会报告"成功"。
 
@@ -1013,7 +1013,7 @@ hint 里的 provider 说明**写成条件式，不写成"必填"**：「配置�
 
 **所以 provider 归属值得在 handler 层用 409 硬堵 + 交付一份排查 SQL，而不是写一句提醒。** 判据不是"数据整洁"——如果只是整洁问题，一句 hint 就够了。它是一条**已经出过事的链路的第二个入口**，而第一个入口（quota_kind）我们的处置是物理禁止编辑。同一条链路的两个入口用两种严格度，弱的那个就是实际防线。排查 SQL 给运维用于确认现存数据里有没有已经被搬走过的 Key（历史遗留的静默改写不会有任何记录，只能靠 `key_daily_history` 里同一 key_id 出现过多个 provider 反查），这部分请 be-api 出，属于交付物而非启动期自动执行的迁移——检测是人工的，迁移是自动的，两者不能混在一起。
 
-`deploy/init.sql` 是死文件这点已确认（只被 `test_local.sh:63`、`deploy_test.sh:33,77` 引用；在跑的是 `store.go:26` 的 `//go:embed schema.sql` 与 `ci.yml:167`），team-lead 已要求记进「有意不做」并注明正确处置是删除而非同步维护。这条现在有**双重实证**：一是我核实唯一性时先读到了 `deploy/init.sql` 的 `uq_provider_key` 并因此得出相反结论；二是 team-lead 据同一处分歧作出了第二版裁决，最后要靠 architect 从 `upstreamkeys.go:90` 的 `ON CONFLICT` 反推运行事实才纠正回来。同一份错文件连续误导了两个人，这比"容易混淆"具体得多。
+`deploy/init.sql` 是死文件这点已确认（现已无任何消费者 —— 原先只被两个遗留脚本手工调用，二者已于 2026-09-13 移除；在跑的是 `store.go:26` 的 `//go:embed schema.sql` 与 `ci.yml:167`），team-lead 已要求记进「有意不做」并注明正确处置是删除而非同步维护。这条现在有**双重实证**：一是我核实唯一性时先读到了 `deploy/init.sql` 的 `uq_provider_key` 并因此得出相反结论；二是 team-lead 据同一处分歧作出了第二版裁决，最后要靠 architect 从 `upstreamkeys.go:90` 的 `ON CONFLICT` 反推运行事实才纠正回来。同一份错文件连续误导了两个人，这比"容易混淆"具体得多。
 
 **落地顺序对界面有约束（标的已更新）**：handler 层的 provider 不可变检查到位之前，界面不能照定稿文案推荐「重新导入」，也不能把 hint 里那句"会被拒绝"上线。§5.1 / §5.2 / §7.4 / §8.5 四处替代路径都依赖"重新导入不会伤到旧 provider"这个前提，而现在这个前提由 handler 检查提供，不再由 SQL 约束提供。fe-provider 的文案与 be-api 的 409 检查要同版本上线。
 

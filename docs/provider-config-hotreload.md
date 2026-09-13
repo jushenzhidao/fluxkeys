@@ -1131,7 +1131,7 @@ func BuildRegistry(specs []Spec) (*Registry, error)
 
 1. `go build ./...` + `go vet ./...`
 2. `go test ./internal/config/... ./internal/confsnap/... ./internal/scheduler/...`
-3. **空库首次启动**：清空 `provider_configs`，用现有 `livetest-ai/real_upstream_test/config.prod.yaml` 启动，确认 seed 出 `sensenova` 且版本号为 1，`GET /admin/providers` 返回内容与 YAML 完全一致
+3. **空库首次启动**：清空 `provider_configs`，用现有生产配置启动（`config.prod.yaml` 原在 real_upstream_test/，已于 2026-09-13 移除且本仓内无副本；重跑本步需先按 `deploy/README.md` 重建该配置），确认 seed 出 `sensenova` 且版本号为 1，`GET /admin/providers` 返回内容与 YAML 完全一致
 4. **热加载生效**：`PATCH` 改 `quota_limit`，不重启，确认 `/admin/providers` 的 `version` 与 `loaded_version` 同步推进，且**调度打分使用了新上限**（这一步专门验 D5，`quota_limit` 改了但调度不认是最容易残留的缺陷）
 5. **model_mapping 热加载**：改一条 mapping，确认新请求的上游 model 名按新映射改写（这一步专门验 D4；若 adapter 没跟着重建，此处会静默用旧映射，是本次最难发现的失效）
 6. **请求内一致性**：在 `attempt` 之间人为触发一次热加载（可临时加日志或用 debugger），确认同一请求的多次重试用的是同一 base_url + 同一 adapter
@@ -1222,7 +1222,7 @@ designer 报告的两条事实**核实全部为真**，且两者的交互比他�
 
 **裁决一：`internal/store/schema.sql` 是唯一真相来源，`deploy/init.sql` 的复合唯一约束作废。**
 
-判据不是"哪个设计更好"，而是**哪个实际在跑**。`schema.sql` 经 `//go:embed`（`store.go:26`）+ 启动 `auto_migrate`（`store.go:99`）执行，是网关自己维护的 schema；`init.sql` 只被 `deploy_test.sh:33,77` 和 `test_local.sh:62-63` 手工调用。而 `upstreamkeys.go:90` 的 `ON CONFLICT (key_id)` 只在单列唯一下成立 —— 若按 `init.sql` 的复合唯一建表，这条 upsert 会直接报 `there is no unique or exclusion constraint matching the ON CONFLICT specification`，导入功能整体不可用。也就是说**生产跑的一定是单列唯一**，否则现有导入早就炸了。`init.sql` 是过期副本，不是候选设计。
+判据不是"哪个设计更好"，而是**哪个实际在跑**。`schema.sql` 经 `//go:embed`（`store.go:26`）+ 启动 `auto_migrate`（`store.go:99`）执行，是网关自己维护的 schema；`init.sql` 现已无任何消费者（原先只被两个遗留脚本手工调用，二者已于 2026-09-13 移除）。而 `upstreamkeys.go:90` 的 `ON CONFLICT (key_id)` 只在单列唯一下成立 —— 若按 `init.sql` 的复合唯一建表，这条 upsert 会直接报 `there is no unique or exclusion constraint matching the ON CONFLICT specification`，导入功能整体不可用。也就是说**生产跑的一定是单列唯一**，否则现有导入早就炸了。`init.sql` 是过期副本，不是候选设计。
 
 #### 已撤回的裁决：把 `upstream_keys` 改为 `(provider, key_id)` 复合唯一
 
