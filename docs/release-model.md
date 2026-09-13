@@ -54,10 +54,35 @@ commit message 里含 `[skip release]` 即整条流水线跳过（`resolve` job 
 - 输入的 tag **必须已存在**，不存在会直接失败，不会替你造新版本 ——
   避免"以为在补发、实际在发新版本"。
 - 补发是**真实发布**：会覆盖该 tag 对应的镜像并更新 Release。它**不是演练**。
-- checkout 显式指定 `ref: ${{ inputs.tag || github.ref }}`。少了这一行，默认检出的是
-  默认分支，会用主干代码去构建旧 tag 的镜像，并把 `:<version>` 与 `:latest` 覆盖过去 ——
-  镜像与 tag 的承诺就脱钩了。
+- **ref 必须显式指定，且来源按入口区分。** 少了显式 ref，checkout 默认检出的是默认分支，
+  会用主干代码去构建旧 tag 的镜像，并把 `:<version>` 与 `:latest` 覆盖过去 ——
+  镜像与 tag 的承诺就脱钩了。但**不能**因此无脑写 `ref: github.ref`，理由见下一节。
 - 同一个 tag 重跑是幂等的：镜像同 tag 覆盖推，Release 走更新而非报错。
+
+## 一个已实测的坑：tag 漂移
+
+**分支名是移动指针。** `push` 到 `main` 时 `github.ref` 是 `refs/heads/main`，
+而 checkout 解引用的是分支**当时**的尖端；`release` job 又要等 `verify` 与多架构构建
+（数分钟）才跑。期间只要再有 push，检出的就是那个更新的提交 —— 于是 tag 打在了一个
+**不是本次触发发布的**提交上。
+
+实测发生过：`v0.1.1` 的 tag 落到了随后推送的文档提交上，而那次提交的 message 本就让
+逃生阀把它跳过了 —— 即「被声明为不发版」的提交反而成了被发布的那一个。
+
+正确写法是两层：
+
+```yaml
+# resolve job：按入口取 ref —— 补发用输入 tag、tag 推送用 github.ref、
+# push main 用 github.sha（当次推送的提交，不随分支推进而变）
+ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+
+# 其余 job：一律用 resolve 算出的 SHA，不再各自解析 ref
+ref: ${{ needs.resolve.outputs.commit }}
+```
+
+`resolve` 是唯一解析 ref 的地方，下游全部消费它输出的 SHA，这样漂移在结构上不可能发生。
+注意这也是**回归**：checkout 的默认值本来就是 `github.sha`，是为了修「补发检出默认分支」
+才换成了 `github.ref`，换完引入了这个新问题。两处都得钉死。
 
 ## 并发
 
