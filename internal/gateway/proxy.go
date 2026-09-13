@@ -579,6 +579,25 @@ func (s *Server) detectEgressBan(ctx context.Context, keyID string) {
 		return
 	}
 
+	// 护栏：不许把最后一个可用出口封掉。
+	//
+	// 阈值判据只说明「这个出口有问题」，不说明「还有别的出口可用」。两者都成立
+	// 才能撤离 —— 否则 EvacuateIP 会先把本出口标记封禁、再把 Key 往外迁，而外面
+	// 没有接收方：实测（2026-09-14）两出口同时达阈值时得到 active=0 +
+	// moved=0 / failed=3，整池不可用，且日志里只留下一句 WARN。
+	//
+	// 这里选择「拒绝封禁 + 报错」而不是「封禁但迁到任意出口」：后者会把一批
+	// 本该低密度的 Key 压到同一个出口上（正是分层的反面），而且并没有解决
+	// 「上游认为我们的出口都有问题」这个根因。宁可保留一个已知有问题的出口
+	// 继续试，也不要进入一个必然全量失败的状态。
+	if !s.egress.OtherAssignable(ip.Addr) {
+		s.log.ErrorContext(ctx, "判定该出口应被封禁，但它是最后一个可用出口，拒绝撤离",
+			"egress_ip", ip.Addr, "public_ip", ip.PublicIP,
+			"auth_failed_keys", n, "threshold", threshold, "window", window,
+			"hint", "需要扩容出口 IP，或人工确认上游是否整体不可用（此时封禁无意义）")
+		return
+	}
+
 	// 撤离目标取被封出口自身的档位: 其上的 Key 都是该档位的，
 	// 迁到同档位才能维持分层。通用出口（PoolAny）则不限档位。
 	res, err := s.egress.EvacuateIP(ip.Addr, ip.Pool)

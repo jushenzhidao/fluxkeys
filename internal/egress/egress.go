@@ -224,6 +224,33 @@ func (ip *IP) MarkFailure() {
 	}
 }
 
+// OtherAssignable 报告除 addr 之外是否还有**可继续承接新 Key** 的出口。
+//
+// 这是「封禁/撤离前」的护栏判据。把最后一个可用出口封掉等于把整池打空：
+// 其上全部 Key 失去出口，业务请求全量失败（`egress: no assignable ip`），
+// 而进程、/healthz、/readyz 一切正常 —— 比误判便宜得多的是漏判一次。
+//
+// 为什么需要它（实测，2026-09-14）：两个出口同时被判封禁时，`EvacuateIP`
+// 会照样先 `MarkBanned` 再迁移，而那时已经没有别的出口可迁 —— 结果
+// `active=0` + `moved=0 / failed=3`，整池不可用。判定的调用方应先用本方法
+// 问一句「封了它还有退路吗」，没有就拒绝封禁并告警。
+//
+// 注意判据用的是 `Assignable()`（active 且信誉达线），而不是「状态非 banned」：
+// 一个信誉已跌破线的出口同样接不住被迁过来的 Key。
+func (p *Pool) OtherAssignable(addr string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, ip := range p.ips {
+		if ip.Addr == addr {
+			continue
+		}
+		if ip.Assignable() {
+			return true
+		}
+	}
+	return false
+}
+
 // MarkAuthFailure 记录某个 Key 从本出口发出的请求遭到鉴权拒绝（401/403）。
 //
 // 返回窗口内发生过 auth 失败的**不同 Key 数**，供调用方判断是否达到
