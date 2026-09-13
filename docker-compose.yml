@@ -141,6 +141,11 @@ services:
       retries: 5
       # initdb + 建表需要时间，给足 30s 再开始判失败
       start_period: 30s
+    # /dev/shm 不加限制时默认只有 64MB。Postgres 16 的并行查询用 POSIX 共享
+    # 内存放中间结果 —— dashboard 的 GROUP BY 统计很容易触发 parallel scan，
+    # 超限时报 "could not resize shared memory segment ... No space left on
+    # device"。256MB 覆盖 100 连接下的并行聚合需求，内存代价可忽略。
+    shm_size: 256mb
     # 同 Redis，默认不对外暴露。调试用: docker compose exec postgres psql -U fluxkeys
     # ports:
     #   - "127.0.0.1:5432:5432"
@@ -221,6 +226,12 @@ services:
       # ---- 以下变量名严格对齐 internal/config/config.go 的 applyEnv ----
       FLUXKEYS_ADDR: ${FLUXKEYS_ADDR:-:8080}
       FLUXKEYS_METRICS_ADDR: ${FLUXKEYS_METRICS_ADDR:-:9090}
+      # 日志级别: debug / info（默认）/ warn / error。留空即 info。
+      # 之前未透传 —— 写进 .env 也不生效（applyEnv 读它，但容器收不到）。
+      FLUXKEYS_LOG_LEVEL: ${FLUXKEYS_LOG_LEVEL:-}
+      # 多机部署的本实例分片标识。留空 = 单机模式，全量装载 Key。
+      # 同样必须透传，否则多机部署无法只靠 .env 区分机器。
+      FLUXKEYS_SHARD_ID: ${FLUXKEYS_SHARD_ID:-}
       # 注意是 host:port，不带 redis:// 前缀（go-redis 的 Addr 语义）
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
@@ -234,6 +245,17 @@ services:
       ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY 未设置，管理接口需要它}
       REFRESH_ENABLED: ${REFRESH_ENABLED:-false}
       QUOTA_TOKEN_LIMIT: ${QUOTA_TOKEN_LIMIT:-5000000}
+      # ---- 运行期调优旋钮（internal/config/config.go 的 applyEnv 已支持，
+      # ---- 这里透传后才能在不重建镜像的前提下调整；留空走代码默认值）。
+      # 推理模型预扣：真实输出倍率随模型版本漂移，默认 3.0 / 1024。
+      QUOTA_REASONING_OUTPUT_MULTIPLIER: ${QUOTA_REASONING_OUTPUT_MULTIPLIER:-}
+      QUOTA_REASONING_FLOOR_TOKENS: ${QUOTA_REASONING_FLOOR_TOKENS:-}
+      # 出口封禁自动判定：默认关闭（0）。开启必须 >=3，且需配观察窗口，
+      # 否则 Validate 直接拒绝启动（详见 config.go）。
+      EGRESS_BAN_DETECT_KEYS: ${EGRESS_BAN_DETECT_KEYS:-}
+      EGRESS_BAN_DETECT_WINDOW: ${EGRESS_BAN_DETECT_WINDOW:-}
+      EGRESS_BAN_COOLDOWN: ${EGRESS_BAN_COOLDOWN:-}
+      EGRESS_BAN_COOLDOWN_MAX: ${EGRESS_BAN_COOLDOWN_MAX:-}
       # 火山 Key 密文的加密主密钥（internal/store/crypto.go 强制要求，缺失即启动失败）
       FLUXKEYS_ENCRYPTION_KEY: ${FLUXKEYS_ENCRYPTION_KEY:?FLUXKEYS_ENCRYPTION_KEY 未设置，需 32 字节 hex}
     ports:
@@ -290,8 +312,11 @@ services:
       DASHBOARD_TZ: Asia/Shanghai
       # 水位默认值需与网关侧一致，否则看板显示的「接近水位」判断会和实际调度不符。
       # 网关是 token_limit × hard_ratio(0.90)，这里给出计算后的绝对值。
-      QUOTA_TOKEN_HARD: "4500000"
-      QUOTA_COUNT_HARD: "90"
+      # compose 不支持算术 —— 改 .env 里的 QUOTA_TOKEN_LIMIT 时必须按
+      # limit × 0.90 手工同步 QUOTA_TOKEN_HARD（次数型同理），否则看板
+      # 的「接近水位」判断全部失真。
+      QUOTA_TOKEN_HARD: ${QUOTA_TOKEN_HARD:-4500000}
+      QUOTA_COUNT_HARD: ${QUOTA_COUNT_HARD:-90}
       # ---- 管理控制台 ----
       # 用 :? 语法与 POSTGRES_PASSWORD 保持一致，让 compose 在启动前就报错，
       # 而不是等容器起来后才由应用抛配置错误。
@@ -304,7 +329,10 @@ services:
       GATEWAY_BASE_URL: http://gateway:8080
       # 多副本部署时所有副本必须共享同一个 SESSION_SECRET，
       # 否则用户在副本间跳转会反复掉登录，且现象随负载均衡落点随机出现。
-      DASHBOARD_SESSION_TTL: "28800"
+      # TTL 可从 .env 覆盖，默认 7200 与 .env.example 一致。不要硬编码：
+      # 一是硬编码会绕过 .env（改了不生效），二是该值同时是登出后 token
+      # 可被重放的最长窗口 —— 之前写死的 28800（8h）恰好放大了这个窗口。
+      DASHBOARD_SESSION_TTL: ${DASHBOARD_SESSION_TTL:-7200}
       # 当前经 SSH 隧道以 HTTP 访问，置 true 会导致 Cookie 不回传而无法登录。
       # 将来若在前面挂了 HTTPS 反向代理，这里要改成 true。
       DASHBOARD_COOKIE_SECURE: "false"
@@ -378,6 +406,9 @@ services:
         condition: service_healthy
     environment:
       GF_SECURITY_ADMIN_USER: admin
+      # 注意: 该密码只在 Grafana 首次初始化 grafana-data 卷时生效，之后改
+      # .env 不会更新密码 —— 重置需删卷重建或进 UI 修改。端口只绑回环，
+      # 本地留默认 admin 可接受；对外暴露前必须改掉。
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       # 关闭匿名访问与注册，运维面不对外开放
       GF_AUTH_ANONYMOUS_ENABLED: "false"
@@ -429,25 +460,26 @@ volumes:
 # 切换到生产形态
 # ===========================================================================
 #
-# 生产与本地的差异不止环境变量，还有网络模式，因此单独提供 override 文件：
+# 生产是独立形态，使用自包含的 docker-compose.prod.yml（不与本文件叠加）:
 #
 #   1. 宿主机先配好多 EIP 的策略路由（必做，否则源 IP 绑定静默失效）:
-#        sudo bash scripts/setup-egress.sh
+#        sudo bash scripts/setup-egress.sh --persist --ips '...'
 #      脚本会用 curl --interface 逐 IP 打印真实出口公网地址，必须逐条核对。
 #
-#   2. 编辑 .env:
-#        COMPOSE_PROFILES=monitoring          # 去掉 mock，不启动假上游
-#        EGRESS_MODE=multi_ip
+#   2. 生成 .env（正式部署推荐一条命令；生产 compose 所有参数都有开箱默认值，
+#      唯一必须人工填的是 EGRESS_IPS）:
+#        bash scripts/gen-prod-env.sh && 编辑 .env 填 EGRESS_IPS
+#      需要覆盖的常见项:
+#        COMPOSE_PROFILES=monitoring,backup
 #        EGRESS_IPS=172.16.0.11=203.0.113.11,172.16.0.12=203.0.113.12
-#        EGRESS_VERIFY_ON_START=true
-#        VOLC_BASE_URL=https://ark.cn-beijing.volces.com
-#        REFRESH_ENABLED=true                 # 生产必开，否则 00:00-12:00 会超刷
-#        FLUXKEYS_IMAGE_TAG=v1.0.0            # 用具体 tag，不用 latest
+#        FLUXKEYS_IMAGE_TAG=v1.0.0            # 升级时用具体 tag，首跑默认本地构建
 #
-#   3. 带 override 启动:
-#        docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#   3. 同机切换时先下架本形态的容器（数据卷保留），再启动生产文件:
+#        docker compose down
+#        docker compose -f docker-compose.prod.yml up -d
 #
-# 为什么生产必须用 override：multi_ip 模式要把 TCP 源地址绑到宿主机网卡上的
+# 为什么 gateway 必须走 host 网络：multi_ip 模式要把 TCP 源地址绑到宿主机网卡上的
 # 辅助 IP。bridge 网络里容器只有 172.x 的内部地址，看不到宿主机的辅助 IP，
-# 绑定会直接失败或退回主 IP。docker-compose.prod.yml 里 gateway 改为
-# network_mode: host 正是为此。
+# 绑定会直接失败或退回主 IP —— 即 P1-6 描述的「静默失效」，请求照常成功
+# 但反作弊隔离完全失效。其余生产差异（管理面全回环、监控抓取目标、
+# 可选 tls/backup profile）见 docker-compose.prod.yml 文件头说明。

@@ -413,7 +413,9 @@ func (p *Pool) Mode() Mode { return p.mode }
 
 // Bind 为 Key 分配（或返回已有的）出口 IP，不限定池归属。
 //
-// 等价于 BindInPool(keyID, PoolAny)。保留此签名以兼容未启用分层的调用方。
+// 等价于 BindInPool(keyID, PoolAny)，供不关心档位的调用方使用（测试与
+// 一次性工具）。生产路径一律走 BindInPool —— 档位是池化隔离的一部分，
+// 不声明档位等于放弃该 Key 的画像归属。
 func (p *Pool) Bind(keyID string) (string, error) {
 	return p.BindInPool(keyID, PoolAny)
 }

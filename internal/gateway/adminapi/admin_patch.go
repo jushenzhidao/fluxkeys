@@ -1,13 +1,14 @@
-package gateway
+package adminapi
 
 import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 
 	"github.com/fluxkeys/fluxkeys/internal/egress"
+	"github.com/fluxkeys/fluxkeys/internal/httpcore"
+	"slices"
 )
 
 // PATCH /admin/keys/{key_id}: 调整 Key 的状态、池与画像。
@@ -60,18 +61,18 @@ type patchKeyRequest struct {
 }
 
 // handleAdminKeyPatch 处理 PATCH /admin/keys/{key_id}。
-func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 	// 路径参数由 ServeMux 的增强模式解析，不再手工切路径。
 	// 手工切的话这个 handler 就得挂在 /admin/keys/ 上，与既有的
 	// handleAdminKeyByID 争夺同一个模式。
 	keyID := strings.TrimSpace(r.PathValue("key_id"))
 	if keyID == "" {
-		s.writeError(w, r, http.StatusNotFound, "invalid_request",
+		a.writeError(w, r, http.StatusNotFound, "invalid_request",
 			"路径格式应为 /admin/keys/{key_id}")
 		return
 	}
 
-	req, ok := s.decodePatchKeyRequest(w, r)
+	req, ok := a.decodePatchKeyRequest(w, r)
 	if !ok {
 		return
 	}
@@ -92,20 +93,20 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		patch.RejectStatusFrom = terminalKeyStatuses
 	}
 
-	res, err := s.store.PatchUpstreamKeyState(r.Context(), keyID, patch)
+	res, err := a.deps.Store().PatchUpstreamKeyState(r.Context(), keyID, patch)
 	switch {
 	case errors.Is(err, ErrKeyNotFound):
-		s.writeError(w, r, http.StatusNotFound, "invalid_request", "Key 不存在: "+keyID)
+		a.writeError(w, r, http.StatusNotFound, "invalid_request", "Key 不存在: "+keyID)
 		return
 	case errors.Is(err, ErrPreconditionFailed):
-		s.writeError(w, r, http.StatusConflict, "invalid_request",
+		a.writeError(w, r, http.StatusConflict, "invalid_request",
 			patchConflictMessage(req, res))
 		return
 	case err != nil:
-		s.log.ErrorContext(r.Context(), "更新 Key 元数据失败",
-			"request_id", RequestIDFromContext(r.Context()),
+		a.deps.Log().ErrorContext(r.Context(), "更新 Key 元数据失败",
+			"request_id", httpcore.RequestIDFromContext(r.Context()),
 			"key_id", keyID, "err", err)
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "更新 Key 失败")
+		a.writeError(w, r, http.StatusInternalServerError, "internal_error", "更新 Key 失败")
 		return
 	}
 
@@ -116,14 +117,14 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 	// 而 seed 对已存在的 Key 不覆盖，所以这里必须显式 SetKeyStatus，
 	// 不能指望 Reload 把新状态带进内存。
 	if req.Status != nil {
-		s.sched.SetKeyStatus(keyID, res.NewStatus)
+		a.deps.Scheduler().SetKeyStatus(keyID, res.NewStatus)
 	}
 
 	changed := patchChangedFields(res)
 	forced := req.Force && slices.Contains(terminalKeyStatuses, res.PrevStatus)
 
 	// 池归属变了就必须换出口，否则分层形同虚设。
-	migration := s.migrateEgressForPool(r, keyID, res)
+	migration := a.migrateEgressForPool(r, keyID, res)
 
 	// 审计只记元数据与新旧值，绝不记 secret。
 	// 本端点的请求体本就不含 secret，这条注释是为了钉住将来扩展字段时
@@ -136,7 +137,7 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		// forced 单独成字段，便于日后筛出所有「强制复活终态 Key」的操作。
 		"forced":     forced,
 		"reason":     req.Reason,
-		"request_id": RequestIDFromContext(r.Context()),
+		"request_id": httpcore.RequestIDFromContext(r.Context()),
 	}
 	if req.ExpectedStatus != nil {
 		detail["expected_status"] = *req.ExpectedStatus
@@ -154,9 +155,9 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		}
 		detail["egress_migration"] = m
 	}
-	s.audit(r, "patch_volc_key", keyID, detail)
+	a.audit(r, "patch_volc_key", keyID, detail)
 
-	s.log.InfoContext(r.Context(), "Key 元数据已更新",
+	a.deps.Log().InfoContext(r.Context(), "Key 元数据已更新",
 		"key_id", keyID, "changed", changed,
 		"status_from", res.PrevStatus, "status_to", res.NewStatus,
 		"forced", forced, "actor", adminActor(r))
@@ -184,43 +185,43 @@ func (s *Server) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		}
 		resp["egress_migration"] = m
 	}
-	writeJSON(w, http.StatusOK, resp)
+	httpcore.WriteJSON(w, http.StatusOK, resp)
 }
 
 // decodePatchKeyRequest 解析并校验请求体。校验失败时已写出 400。
-func (s *Server) decodePatchKeyRequest(w http.ResponseWriter, r *http.Request) (patchKeyRequest, bool) {
+func (a *API) decodePatchKeyRequest(w http.ResponseWriter, r *http.Request) (patchKeyRequest, bool) {
 	var req patchKeyRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	// 拒绝未知字段。放过 egress_ip / health_score 这类被刻意排除的字段会让
 	// 调用方以为改动生效了，而服务端其实完全忽略 —— 静默无效比明确报错糟。
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
 		return req, false
 	}
 
 	// 三个可改字段全部缺席时返回 400 而非 200:
 	// 否则调用方无法区分「改了」和「什么都没改」。
 	if !(KeyPatch{Status: req.Status, Pool: req.Pool, PersonaID: req.PersonaID}).HasFieldUpdate() {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"没有需要变更的字段，status / pool / persona_id 至少提供一个")
 		return req, false
 	}
 
 	if req.Status != nil && !slices.Contains(validKeyStatuses, *req.Status) {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"status 取值非法，应为 "+strings.Join(validKeyStatuses, " / "))
 		return req, false
 	}
 	if req.Pool != nil && !slices.Contains(validKeyPools, *req.Pool) {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"pool 取值非法，应为 "+strings.Join(validKeyPools, " / "))
 		return req, false
 	}
 	// expected_status 也要校验枚举: 写错成 "actve" 时若不校验，条件永远
 	// 匹配不上，运维只会看到一个无法解释的 409。
 	if req.ExpectedStatus != nil && !slices.Contains(validKeyStatuses, *req.ExpectedStatus) {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request",
 			"expected_status 取值非法，应为 "+strings.Join(validKeyStatuses, " / "))
 		return req, false
 	}
@@ -256,19 +257,19 @@ type egressMigration struct {
 //	但重试时 pool 已是新值、patchChangedFields 判定无变更，于是不再触发迁移
 //	—— 反而永久卡在「池改了、出口没换」且无人知晓的状态。返回 200 并在
 //	响应与审计里标出 egress_migration.applied=false，运维才能据此手动处理。
-func (s *Server) migrateEgressForPool(r *http.Request, keyID string, res *KeyPatchResult) *egressMigration {
+func (a *API) migrateEgressForPool(r *http.Request, keyID string, res *KeyPatchResult) *egressMigration {
 	if res == nil || res.PrevPool == res.NewPool {
 		return nil
 	}
 	// direct 模式下没有出口可迁移。
-	if s.egress.Mode() == egress.ModeDirect {
+	if a.deps.Egress().Mode() == egress.ModeDirect {
 		return nil
 	}
 
-	from := s.egress.BoundIP(keyID)
-	to, err := s.egress.Migrate(keyID, res.NewPool)
+	from := a.deps.Egress().BoundIP(keyID)
+	to, err := a.deps.Egress().Migrate(keyID, res.NewPool)
 	if err != nil {
-		s.log.WarnContext(r.Context(), "池归属已变更但出口迁移失败",
+		a.deps.Log().WarnContext(r.Context(), "池归属已变更但出口迁移失败",
 			"key_id", keyID, "pool_from", res.PrevPool, "pool_to", res.NewPool,
 			"egress_ip", from, "err", err)
 		return &egressMigration{FromIP: from, Error: err.Error()}
@@ -276,14 +277,14 @@ func (s *Server) migrateEgressForPool(r *http.Request, keyID string, res *KeyPat
 
 	// 落库，否则重启后 restoreBindings 会读到旧出口并把 Key 换回去。
 	// 写库失败只降级告警: 内存中的迁移已生效，本次运行是正确的。
-	if err := s.store.SetVolcKeyEgressIP(r.Context(), keyID, to); err != nil {
-		s.log.WarnContext(r.Context(), "出口迁移已生效但落库失败，重启后可能回退",
+	if err := a.deps.Store().SetVolcKeyEgressIP(r.Context(), keyID, to); err != nil {
+		a.deps.Log().WarnContext(r.Context(), "出口迁移已生效但落库失败，重启后可能回退",
 			"key_id", keyID, "egress_ip", to, "err", err)
 		return &egressMigration{Applied: true, FromIP: from, ToIP: to,
 			Error: "落库失败: " + err.Error()}
 	}
 
-	s.log.InfoContext(r.Context(), "Key 已随池归属迁移出口",
+	a.deps.Log().InfoContext(r.Context(), "Key 已随池归属迁移出口",
 		"key_id", keyID, "pool_from", res.PrevPool, "pool_to", res.NewPool,
 		"ip_from", from, "ip_to", to)
 	return &egressMigration{Applied: true, FromIP: from, ToIP: to}

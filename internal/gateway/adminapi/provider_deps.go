@@ -1,4 +1,4 @@
-package gateway
+package adminapi
 
 import (
 	"context"
@@ -97,7 +97,7 @@ type ProviderWriteInput struct {
 // 单独成接口而不并入 deps.go 的 Store: 那个接口是请求热路径的依赖，
 // 每个实现方（含测试 fake）都必须实现全部方法。配置管理是低频管理面，
 // 把它塞进去会让所有只关心热路径的 fake 平白多实现 9 个方法。
-// Server 在处理配置端点时对 s.store 做一次类型断言，未实现即返回 501。
+// API 在处理配置端点时对 Store() 做一次类型断言，未实现即返回 501。
 type ProviderConfigStore interface {
 	// ListProvidersWithUsage 返回当前生效态 + 本配额日用量与请求数。
 	ListProvidersWithUsage(ctx context.Context, now time.Time) ([]ProviderListEntry, error)

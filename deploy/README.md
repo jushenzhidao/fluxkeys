@@ -117,18 +117,32 @@ sudo bash scripts/setup-egress.sh --persist --ips '172.16.0.11=203.0.113.11,172.
 
 脚本幂等，可反复执行。验证失败返回非零退出码，可直接用于部署门禁。
 
-### 第 2 步：改 `.env`
+### 第 2 步：生成 `.env`
+
+生产 compose 的**所有参数都有开箱默认值**（无 `.env` 也能一条命令起栈），
+但占位默认密钥只可用于验证。正式部署一条命令生成强随机密钥：
 
 ```bash
-COMPOSE_PROFILES=monitoring     # 去掉 mock，不启动假上游
-EGRESS_MODE=multi_ip
-EGRESS_IPS=172.16.0.11=203.0.113.11,172.16.0.12=203.0.113.12
-EGRESS_VERIFY_ON_START=true     # 宁可启动失败，也不要带着失效的绑定跑
-VOLC_BASE_URL=https://ark.cn-beijing.volces.com
-REFRESH_ENABLED=true            # 必开，见下方说明
-REDIS_PASSWORD=<openssl rand -hex 24>
-FLUXKEYS_IMAGE_TAG=v1.0.0       # 用具体版本，不用 latest
+bash scripts/gen-prod-env.sh
 ```
+
+脚本幂等（已有 `.env` 拒绝覆盖），生成后唯一要人工填的是 `EGRESS_IPS`
+（与机器网卡绑定，无法代填）。手工编辑可参考 `.env.example` 的「生产专用」段：
+
+```bash
+COMPOSE_PROFILES=monitoring,backup  # tls profile 见第 5 步
+EGRESS_IPS=172.16.0.11=203.0.113.11,172.16.0.12=203.0.113.12
+FLUXKEYS_IMAGE_TAG=v1.0.0       # 升级时用具体版本；首跑默认本地构建即可
+```
+
+其余关键项的默认行为都写死在生产 compose 文件里，无需配置：
+
+- `EGRESS_MODE=multi_ip`（可显式改 direct 过渡）、`EGRESS_VERIFY_ON_START=true`、
+  `REFRESH_ENABLED=true`
+- `VOLC_BASE_URL` 默认即真实火山地址 `https://ark.cn-beijing.volces.com`
+- `ADMIN_API_KEY` 默认为空 = 管理接口与看板管理操作禁用（刻意不给仓库内置的
+  已知密钥），由 gen 脚本生成；裸跑时可内联传递：
+  `ADMIN_API_KEY=$(openssl rand -hex 32) docker compose -f docker-compose.prod.yml up -d`
 
 > **`REFRESH_ENABLED=true` 是硬要求。**
 > 火山 12:00 刷新配额，而配额日边界也在 12:00（P0-3）。关闭刷新探测后，
@@ -393,42 +407,57 @@ EGRESS_BAN_COOLDOWN_MAX=24h  # 指数退避的上限
 
 ### 第 3 步：启动
 
+`docker-compose.prod.yml` 是**独立形态**（自包含，不与 `docker-compose.yml` 叠加）。
+与旧形态共用项目名和卷名，同机切换时先下架旧容器（保留数据卷）：
+
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker compose down   # 若之前用本地形态跑过；数据卷不会删
+docker compose -f docker-compose.prod.yml up -d
 bash scripts/smoke-test.sh
 ```
 
-### 第 4 步：调整 Prometheus 抓取目标
-
-生产形态下 gateway 走 host 网络，bridge 网络里的 Prometheus **无法再用服务名解析**。
-改 `deploy/prometheus.yml`：
-
-```yaml
-    static_configs:
-      - targets: ["host.docker.internal:9090"]   # 原为 gateway:9090
-```
-
-`docker-compose.prod.yml` 已为 Prometheus 配好 `extra_hosts: host.docker.internal:host-gateway`。
-
-改完热加载：
+优先拉 CI 发布的版本化镜像，拉不到时 `up` 会自动退回本地构建：
 
 ```bash
-curl -X POST http://127.0.0.1:9091/-/reload
-# 确认目标为 up
+docker compose -f docker-compose.prod.yml pull gateway
+```
+
+`EGRESS_MODE=multi_ip`、`EGRESS_VERIFY_ON_START=true`、`REFRESH_ENABLED=true`
+已在生产文件中硬编码，不依赖 `.env` 是否记得设置。
+
+### 第 4 步：确认 Prometheus 抓取
+
+生产形态下抓取目标无需手工调整 —— compose 挂载的是
+`deploy/prometheus.prod.yml`（target 已是 `127.0.0.1:9090`，网关与 Prometheus
+同在 host 网络直连回环），不存在「忘了改 target 导致所有告警静默失效」的坑。
+
+启动后确认目标全部 `up`：
+
+```bash
 curl -s http://127.0.0.1:9091/api/v1/targets | jq '.data.activeTargets[]|{job:.labels.job,health}'
 ```
 
-> 忘了这步的后果是**所有业务告警静默失效** —— PromQL 查不到样本时返回空向量，
-> 不会触发告警，也不会报错。`FluxKeysTargetDown` 就是为覆盖这个盲区而存在的。
+改抓取配置后热加载：
+
+```bash
+curl -X POST http://127.0.0.1:9091/-/reload
+```
 
 ### 第 5 步：对外暴露
 
-网关默认监听 `0.0.0.0:8080`，**没有 TLS**。生产必须在前面加一层 TLS 终止
-（Nginx / Caddy），并确认：
+网关默认监听 `0.0.0.0:8080`，**没有 TLS**。两种做法二选一：
+
+1. **开 `tls` profile**（生产文件内置 Caddy，自动签发/续期证书）：
+   `.env` 设置 `CADDY_DOMAIN` 与 `ACME_EMAIL` 后，
+   `COMPOSE_PROFILES=monitoring,backup,tls`，Caddy 会反代 gateway 并把
+   80/443 暴露公网。
+2. **自建 Nginx/Caddy**（宿主机进程或自管容器）做 TLS 终止。
+
+无论哪种，都需确认：
 
 - 已创建用户 API Key。`user_api_keys` 为空时若还开放了公网入口，等于开放代理
 - 防火墙只放通 TLS 端口，不直接暴露 8080
-- 看板、Prometheus、Grafana 保持仅绑回环，远程访问走 SSH 隧道：
+- 看板、Prometheus、Grafana 只绑回环（生产文件已保证），远程访问走 SSH 隧道：
   `ssh -L 3000:127.0.0.1:3000 user@host`
 
 ---
@@ -442,14 +471,15 @@ curl -s http://127.0.0.1:9091/api/v1/targets | jq '.data.activeTargets[]|{job:.l
 - [ ] `sysctl net.ipv4.conf.all.rp_filter` 为 `2`（严格模式会丢回包）
 - [ ] `.env` 中 `EGRESS_MODE=multi_ip`、`EGRESS_VERIFY_ON_START=true`
 - [ ] `.env` 中 `REFRESH_ENABLED=true`
-- [ ] `.env` 中 `VOLC_BASE_URL` 指向真实火山地址，**不是 mockark**
+- [ ] 密钥已用 `scripts/gen-prod-env.sh` 生成（或已轮换 compose 里的占位默认值），
+      且 `FLUXKEYS_ENCRYPTION_KEY` 已备份到密钥管理系统（丢失不可恢复）
+- [ ] `.env` 中 `VOLC_BASE_URL` 指向真实火山地址，**不是 mockark**（生产默认值已是真实地址，核对未被覆盖）
 - [ ] `COMPOSE_PROFILES` 已去掉 `mock`
-- [ ] `FLUXKEYS_IMAGE_TAG` 是具体版本号，不是 `latest` / `dev`
-- [ ] `FLUXKEYS_ENCRYPTION_KEY` 已备份到密钥管理系统（丢失不可恢复）
-- [ ] `REDIS_PASSWORD` 已设置
+- [ ] `FLUXKEYS_IMAGE_TAG` 是具体版本号，不是 `latest` / `dev`（首跑本地构建的 `dev` 除外）
+- [ ] `REDIS_PASSWORD` 已设置（非 compose 占位默认值）
 - [ ] `.env` 未被提交（`git check-ignore .env` 应有输出）
 - [ ] Redis `appendonly=yes`、`appendfsync=everysec`、`maxmemory-policy=noeviction`
-- [ ] `deploy/prometheus.yml` 抓取目标已改为 `host.docker.internal:9090`
+- [ ] `deploy/prometheus.prod.yml` 随生产文件挂载，抓取目标 `127.0.0.1:9090`
 - [ ] Prometheus targets 全部 `up`
 - [ ] 已创建至少一个用户 API Key
 - [ ] 网关前已有 TLS 终止层
@@ -689,8 +719,10 @@ docker compose exec postgres psql -U fluxkeys -d fluxkeys \
 curl -s http://127.0.0.1:9091/api/v1/targets | jq '.data.activeTargets[]|{scrapeUrl,health,lastError}'
 ```
 
-生产形态下最常见的原因是 gateway 切了 host 网络但 `prometheus.yml` 的 target
-还是 `gateway:9090`。见[第 4 步](#第-4-步调整-prometheus-抓取目标)。
+生产形态下抓取目标固定为 `127.0.0.1:9090`（gateway 与 Prometheus 同在 host
+网络直连回环，配置由 `deploy/prometheus.prod.yml` 挂载）。若 target 仍 down，
+按顺序排查：gateway 是否健康、9090 是否被其它进程占用、
+`FLUXKEYS_METRICS_ADDR` 是否被环境覆盖。
 
 ### Grafana 面板全是 No data
 
@@ -733,6 +765,9 @@ GRAFANA_HOST_PORT=13000
 
 Redis 的 AOF 与 Postgres 的数据都在命名卷里。`docker compose down` 不会删（需 `-v`）。
 
+生产文件内置 `backup` profile（每日 `pg_dump -Fc` 到 `backup-data` 卷，默认保留 14 天，
+`COMPOSE_PROFILES` 加 `backup` 或 `--profile backup` 启用）。手工备份：
+
 ```bash
 # Postgres 逻辑备份
 docker compose exec -T postgres pg_dump -U fluxkeys fluxkeys | gzip > backup-$(date +%F).sql.gz
@@ -750,8 +785,9 @@ docker run --rm -v fluxkeys_redis-data:/data -v "$PWD:/backup" alpine:3.20.3 \
 
 ```bash
 # 改 .env 里的 FLUXKEYS_IMAGE_TAG，然后
-docker compose pull gateway dashboard
-docker compose up -d gateway dashboard
+docker compose -f docker-compose.prod.yml pull gateway
+docker compose -f docker-compose.prod.yml build dashboard   # dashboard 无 CI 镜像，本地构建
+docker compose -f docker-compose.prod.yml up -d
 bash scripts/smoke-test.sh
 ```
 
@@ -908,12 +944,15 @@ CI 的 `deploy-lint` job 会自动执行这些测试。
 |---|---|
 | `Dockerfile` | Go 侧多阶段构建，`--target gateway` / `--target mockark` |
 | `docker-compose.yml` | 本地/演示形态，默认离线可跑 |
-| `docker-compose.prod.yml` | 生产 override，gateway 切 host 网络 |
+| `docker-compose.prod.yml` | 生产形态（独立自包含），全参数默认化，一条命令部署 |
 | `docker-compose.test.yml` | CI/本地集成测试的最小依赖栈 |
-| `.env.example` | 环境变量模板 |
-| `deploy/prometheus.yml` | 抓取配置 |
-| `deploy/alerts.yml` | 14 条告警规则 |
+| `../.env.example` | 环境变量模板（仓库根目录，全项目唯一一份） |
+| `deploy/prometheus.yml` | 抓取配置（本地形态） |
+| `deploy/prometheus.prod.yml` | 抓取配置（生产形态，target 127.0.0.1:9090） |
+| `deploy/alerts.yml` | 告警规则 |
 | `deploy/alerts_test.yml` | 告警规则单元测试 |
-| `deploy/grafana/` | 数据源与 dashboard 自动装载 |
+| `deploy/grafana/` | 数据源与 dashboard 自动装载（本地形态） |
+| `deploy/grafana/provisioning.prod/` | Grafana 生产 provisioning（数据源指向回环） |
+| `scripts/gen-prod-env.sh` | 一键生成生产 `.env`（强随机密钥，幂等防覆盖） |
 | `scripts/setup-egress.sh` | 多 EIP 策略路由配置与验证 |
 | `scripts/smoke-test.sh` | 端到端冒烟测试 |

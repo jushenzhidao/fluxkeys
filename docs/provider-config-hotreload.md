@@ -204,7 +204,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_config_versions_current_uniq
 2. `UPDATE config_versions SET is_current = FALSE WHERE is_current` 然后把新行置 `TRUE`
 3. `INSERT ... ON CONFLICT (name) DO UPDATE` 写 `provider_configs`，并把该行 `version` 设为新版本号
 
-`audit_logs` 的写入放在**事务提交之后**，沿用 `s.audit()` 现有的"失败只告警不阻断"语义（`internal/gateway/admin.go:34`）。理由：`config_versions` 已经是不可抵赖的变更记录，`audit_logs` 是统一检索入口而非唯一凭据，让审计写失败去回滚一次已生效的配置变更是本末倒置。
+`audit_logs` 的写入放在**事务提交之后**，沿用 `s.audit()` 现有的"失败只告警不阻断"语义（`internal/gateway/adminapi/admin.go` 的 `audit`）。理由：`config_versions` 已经是不可抵赖的变更记录，`audit_logs` 是统一检索入口而非唯一凭据，让审计写失败去回滚一次已生效的配置变更是本末倒置。
 
 ### 1.4 回滚的具体动作
 
@@ -340,7 +340,7 @@ type requestPlan struct {
 
 **这条的落点不在 `reconcileRefreshers`，而在 DB→config 的桥。**这一点我早期表述得不准确，读代码后修正如下：
 
-`config.Provider`（`internal/config/config.go:315-332`）**没有 `Enabled` 字段**，`Enabled` 只存在于 `store.ProviderConfig`(`internal/store/providers.go:57`) 与 `gateway.ProviderConfigView`(`internal/gateway/provider_deps.go:23`) 两层。所以 `reconcileRefreshers` 里 `for provider := range cfg.Providers` 物理上**读不到** `enabled` —— 它没法做这个判断，也不该做。
+`config.Provider`（`internal/config/config.go:315-332`）**没有 `Enabled` 字段**，`Enabled` 只存在于 `store.ProviderConfig`(`internal/store/providers.go:57`) 与 `gateway.ProviderConfigView`(`internal/gateway/adminapi/provider_deps.go`) 两层。所以 `reconcileRefreshers` 里 `for provider := range cfg.Providers` 物理上**读不到** `enabled` —— 它没法做这个判断，也不该做。
 
 正确分工：**DB→config 的桥必须把 `enabled: false` 的 provider 整个排除在 `cfg.Providers` 之外**，让"停用"在快照层就等价于"不存在"。这样 `reconcileRefreshers` 现有的键集合比对（`background.go:542`、`background.go:603`）自动正确，无需改动。
 
@@ -1075,7 +1075,7 @@ func BuildRegistry(specs []Spec) (*Registry, error)
 | `proxy.go:75-83`（`execute`） | [改] 循环外持有快照，**循环内严禁重新取**（A7 注释） |
 | `proxy.go:307`、`330`、`617` | [改] A4、A5、A6 |
 | `admin.go:287`、`302` | [改] A10、A11（同一批次复用同一 snap，并拒绝向停用 provider 导 Key） |
-| [新] `internal/gateway/admin_provider.go` | §4 全部 handler（**11 个**，含 `PATCH /admin/config/default-provider`）。**与 `admin.go` 分文件** —— `admin.go` 已 504 行，合进去会突破单文件可维护规模。<br>**错误码务必按 §4.1.1 细化**：三种 409 分别用 `version_conflict` / `immutable_field` / `quota_kind_mismatch` / `invalid_state_transition`，不要图省事全填 `invalid_request`（现有代码的泛化用法不是本期的标准） |
+| [新] `internal/gateway/adminapi/admin_provider.go` | §4 全部 handler（**11 个**，含 `PATCH /admin/config/default-provider`）。**与 `adminapi/admin.go` 分文件**，合进去会突破单文件可维护规模。<br>**错误码务必按 §4.1.1 细化**：三种 409 分别用 `version_conflict` / `immutable_field` / `quota_kind_mismatch` / `invalid_state_transition`，不要图省事全填 `invalid_request`（现有代码的泛化用法不是本期的标准） |
 
 ### 7.7 [改] `cmd/gateway/background.go` 与 `adapters.go`
 
@@ -1095,7 +1095,7 @@ func BuildRegistry(specs []Spec) (*Registry, error)
 | [新] `background.go` 新 tick | 10s 轮询 `ActiveConfigVersion` 比对本地版本，不等则重载（§4.9） |
 | `adapters.go:43-54`（`quotaLimits`） | [改] B6，持有 `Holder` 替代 `*config.Config` |
 
-### 7.6.1 [改] `internal/gateway/admin.go` —— Key 导入的跨 provider 前置检查
+### 7.6.1 [改] `internal/gateway/adminapi/admin.go` —— Key 导入的跨 provider 前置检查
 
 | 位置 | 改动 |
 |---|---|
@@ -1131,7 +1131,7 @@ func BuildRegistry(specs []Spec) (*Registry, error)
 
 1. `go build ./...` + `go vet ./...`
 2. `go test ./internal/config/... ./internal/confsnap/... ./internal/scheduler/...`
-3. **空库首次启动**：清空 `provider_configs`，用现有 `real_upstream_test/config.prod.yaml` 启动，确认 seed 出 `sensenova` 且版本号为 1，`GET /admin/providers` 返回内容与 YAML 完全一致
+3. **空库首次启动**：清空 `provider_configs`，用现有 `livetest-ai/real_upstream_test/config.prod.yaml` 启动，确认 seed 出 `sensenova` 且版本号为 1，`GET /admin/providers` 返回内容与 YAML 完全一致
 4. **热加载生效**：`PATCH` 改 `quota_limit`，不重启，确认 `/admin/providers` 的 `version` 与 `loaded_version` 同步推进，且**调度打分使用了新上限**（这一步专门验 D5，`quota_limit` 改了但调度不认是最容易残留的缺陷）
 5. **model_mapping 热加载**：改一条 mapping，确认新请求的上游 model 名按新映射改写（这一步专门验 D4；若 adapter 没跟着重建，此处会静默用旧映射，是本次最难发现的失效）
 6. **请求内一致性**：在 `attempt` 之间人为触发一次热加载（可临时加日志或用 debugger），确认同一请求的多次重试用的是同一 base_url + 同一 adapter

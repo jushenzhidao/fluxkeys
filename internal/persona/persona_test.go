@@ -304,42 +304,6 @@ func TestPaceFactor_按节奏区分(t *testing.T) {
 	}
 }
 
-func TestStaggerOffset_确定性且均匀分布(t *testing.T) {
-	const span = time.Hour
-	day := "20260823"
-
-	// 确定性
-	a := StaggerOffset("volc_001", day, span)
-	b := StaggerOffset("volc_001", day, span)
-	if a != b {
-		t.Fatalf("同 Key 同日偏移不一致: %v vs %v", a, b)
-	}
-	// 换日应该变化，避免每天都是同一批 Key 抢在最前面
-	if StaggerOffset("volc_001", "20260824", span) == a {
-		t.Log("提示: 换日偏移相同（哈希碰撞，可接受）")
-	}
-
-	// 分布检查: 1000 个 Key 在 1 小时内应铺开到各个 6 分钟桶
-	buckets := make([]int, 10)
-	for i := 0; i < 1000; i++ {
-		off := StaggerOffset(fmt.Sprintf("volc_%04d", i), day, span)
-		if off < 0 || off >= span {
-			t.Fatalf("偏移越界: %v", off)
-		}
-		buckets[int(off/(span/10))]++
-	}
-	for i, c := range buckets {
-		if c == 0 {
-			t.Fatalf("第 %d 个桶为空，错峰不均匀: %v", i, buckets)
-		}
-	}
-	t.Logf("错峰分布: %v", buckets)
-
-	if StaggerOffset("volc_001", day, 0) != 0 {
-		t.Fatal("span<=0 应返回 0")
-	}
-}
-
 func TestFor_并发安全(t *testing.T) {
 	// For 是纯函数，必须能在请求热路径上无锁并发调用
 	var wg sync.WaitGroup

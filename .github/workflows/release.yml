@@ -226,7 +226,7 @@ jobs:
             echo "在 \`.env\` 中设置 \`FLUXKEYS_IMAGE_TAG=${version#v}\` 后："
             echo ""
             echo '```bash'
-            echo "docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d"
+            echo "docker compose -f docker-compose.prod.yml up -d"
             echo '```'
             echo ""
             echo "> 生产环境必须先执行 \`sudo bash scripts/setup-egress.sh\` 配置出口策略路由，"

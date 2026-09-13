@@ -28,7 +28,7 @@
 默认配置指向内置的 Mock 火山服务，**无需任何真实 Key 即可跑通全链路**：
 
 ```bash
-cp deploy/.env.example .env      # 按提示填入随机密钥
+cp .env.example .env      # 按提示填入随机密钥
 docker compose up -d
 ./scripts/smoke-test.sh          # 冒烟测试
 ```

@@ -303,15 +303,3 @@ func (p *Persona) PaceFactor() float64 {
 		return 2.0
 	}
 }
-
-// StaggerOffset 返回该 Key 在刷新窗口内的错峰偏移（0 ~ span）。
-//
-// P0-4 语义澄清: 这个偏移作用于"恢复调度的时刻"，不是"火山何时刷新"。
-// 1000 个 Key 在 12:00 同时恢复流量，是比任何单 Key 行为都更强的关联信号。
-func StaggerOffset(keyID string, day string, span time.Duration) time.Duration {
-	if span <= 0 {
-		return 0
-	}
-	h := hashSeed(keyID+"@"+day, "stagger")
-	return time.Duration(h % uint64(span))
-}

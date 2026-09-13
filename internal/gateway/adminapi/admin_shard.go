@@ -1,9 +1,11 @@
-package gateway
+package adminapi
 
 import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/fluxkeys/fluxkeys/internal/httpcore"
 )
 
 // POST /admin/keys/shard: 批量指派 Key 的机器归属（多机部署分片）。
@@ -33,9 +35,9 @@ type shardAssignRequest struct {
 }
 
 // handleAdminKeyShard 处理 POST /admin/keys/shard。
-func (s *Server) handleAdminKeyShard(w http.ResponseWriter, r *http.Request) {
+func (a *API) handleAdminKeyShard(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		s.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 POST")
+		a.writeError(w, r, http.StatusMethodNotAllowed, "invalid_request", "该端点只接受 POST")
 		return
 	}
 
@@ -43,7 +45,7 @@ func (s *Server) handleAdminKeyShard(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
 		return
 	}
 
@@ -54,7 +56,7 @@ func (s *Server) handleAdminKeyShard(w http.ResponseWriter, r *http.Request) {
 	for _, id := range req.KeyIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
-			s.writeError(w, r, http.StatusBadRequest, "invalid_request",
+			a.writeError(w, r, http.StatusBadRequest, "invalid_request",
 				"key_ids 含空白项")
 			return
 		}
@@ -65,35 +67,35 @@ func (s *Server) handleAdminKeyShard(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 	if len(ids) == 0 {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "key_ids 不能为空")
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "key_ids 不能为空")
 		return
 	}
 
-	affected, err := s.store.AssignShard(r.Context(), req.Shard, ids)
+	affected, err := a.deps.Store().AssignShard(r.Context(), req.Shard, ids)
 	if err != nil {
-		s.log.ErrorContext(r.Context(), "指派机器归属失败",
-			"request_id", RequestIDFromContext(r.Context()),
+		a.deps.Log().ErrorContext(r.Context(), "指派机器归属失败",
+			"request_id", httpcore.RequestIDFromContext(r.Context()),
 			"shard", req.Shard, "count", len(ids), "err", err)
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error", "指派失败")
+		a.writeError(w, r, http.StatusInternalServerError, "internal_error", "指派失败")
 		return
 	}
 
 	// affected < len(ids) 说明有 key_id 没匹配上（拼错或已删除）。
 	// 不算失败但必须让调用方看见 —— 漏指派的 Key 会静默地不被任何
 	// 实例装载。
-	s.audit(r, "assign_key_shard", req.Shard, map[string]any{
+	a.audit(r, "assign_key_shard", req.Shard, map[string]any{
 		"shard":      req.Shard,
 		"requested":  len(ids),
 		"affected":   affected,
 		"key_ids":    ids,
 		"reason":     req.Reason,
-		"request_id": RequestIDFromContext(r.Context()),
+		"request_id": httpcore.RequestIDFromContext(r.Context()),
 	})
-	s.log.InfoContext(r.Context(), "已指派 Key 机器归属",
+	a.deps.Log().InfoContext(r.Context(), "已指派 Key 机器归属",
 		"shard", req.Shard, "requested", len(ids), "affected", affected,
 		"actor", adminActor(r))
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"shard":     req.Shard,
 		"requested": len(ids),
 		"affected":  affected,

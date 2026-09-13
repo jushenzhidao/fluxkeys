@@ -167,7 +167,7 @@ type memStore struct {
 	users  map[string]*gateway.UserContext
 	usage  []gateway.UsageRecord
 	audits int
-	keys   map[string]gateway.NewVolcKey
+	keys   map[string]gateway.NewUpstreamKey
 }
 
 func newMemStore() *memStore {
@@ -175,7 +175,7 @@ func newMemStore() *memStore {
 		users: map[string]*gateway.UserContext{
 			"itest-key": {UserID: 1, APIKeyID: 11, Name: "itest"},
 		},
-		keys: map[string]gateway.NewVolcKey{},
+		keys: map[string]gateway.NewUpstreamKey{},
 	}
 }
 
@@ -222,7 +222,7 @@ func (s *memStore) AssignShard(ctx context.Context, shard string, keyIDs []strin
 	return 0, nil
 }
 
-func (s *memStore) UpsertUpstreamKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
+func (s *memStore) UpsertUpstreamKey(ctx context.Context, in gateway.NewUpstreamKey) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, existed := s.keys[in.KeyID]

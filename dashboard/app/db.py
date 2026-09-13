@@ -34,6 +34,26 @@ KEY_SORT_FIELDS: Final[dict[str, str]] = {
 }
 
 
+# 「一次错误」的唯一定义。所有报表（总览/趋势/按 Key/按用户/按出口）都必须
+# 引用本片段，禁止再手写谓词 —— 否则各处错误率口径会各自漂移，
+# 而「总数对得上、分项加不上」这类不一致极难排查。
+#
+# 口径：HTTP 4xx/5xx（status_code >= 400）或携带非空 error_code。
+# usage_records.status_code / error_code 均为 NOT NULL
+# （schema.sql 中 DEFAULT 0 / DEFAULT ''），因此不存在 SQL 三值逻辑把 NULL
+# 判成「非错误」的情形，无需再加 IS NOT NULL 兜底。
+_ERROR_CONDITION: Final[str] = "({alias}status_code >= 400 OR {alias}error_code <> '')"
+
+
+def error_condition(alias: str = "") -> str:
+    """返回「该行算一次错误」的 SQL 片段，已带外层括号。
+
+    ``alias`` 是表别名前缀（含结尾的点，如 ``"r."``）；单表查询传空串。
+    可直接嵌入 ``FILTER (WHERE ...)`` / ``WHERE`` / ``HAVING``。
+    """
+    return _ERROR_CONDITION.format(alias=alias)
+
+
 class Database:
     """asyncpg 连接池的薄封装。"""
 
@@ -130,7 +150,7 @@ class Database:
 async def overview_usage(db: Database, day: date) -> asyncpg.Record | None:
     """某配额日的全局用量汇总。"""
     return await db.fetchrow(
-        """
+        f"""
         SELECT
             COALESCE(SUM(total_tokens), 0)::bigint       AS total_tokens,
             COALESCE(SUM(prompt_tokens), 0)::bigint      AS prompt_tokens,
@@ -138,7 +158,7 @@ async def overview_usage(db: Database, day: date) -> asyncpg.Record | None:
             COALESCE(SUM(count_units), 0)::bigint        AS count_units,
             COUNT(*)::bigint                              AS requests,
             COUNT(*) FILTER (
-                WHERE status_code >= 400 OR error_code <> ''
+                WHERE {error_condition()}
             )::bigint                                     AS errors,
             COALESCE(AVG(latency_ms), 0)::double precision AS avg_latency_ms,
             COUNT(DISTINCT upstream_key_id) FILTER (
@@ -204,7 +224,7 @@ async def list_keys(
                    COALESCE(SUM(total_tokens), 0)::bigint AS today_tokens,
                    COUNT(*)::bigint                        AS today_requests,
                    COUNT(*) FILTER (
-                       WHERE status_code >= 400 OR error_code <> ''
+                       WHERE {error_condition()}
                    )::bigint                               AS today_errors
             FROM usage_records
             WHERE quota_day = $1
@@ -241,12 +261,12 @@ async def count_keys(db: Database, status: str | None, pool: str | None) -> int:
 
 async def get_key(db: Database, key_id: str, day: date) -> asyncpg.Record | None:
     return await db.fetchrow(
-        """
+        f"""
         WITH today AS (
             SELECT COALESCE(SUM(total_tokens), 0)::bigint AS today_tokens,
                    COUNT(*)::bigint                        AS today_requests,
                    COUNT(*) FILTER (
-                       WHERE status_code >= 400 OR error_code <> ''
+                       WHERE {error_condition()}
                    )::bigint                               AS today_errors
             FROM usage_records
             WHERE quota_day = $2 AND upstream_key_id = $1
@@ -268,7 +288,7 @@ async def key_trend(db: Database, key_id: str, days: Sequence[date]) -> list[asy
     if not days:
         return []
     return await db.fetch(
-        """
+        f"""
         SELECT quota_day,
                COALESCE(SUM(total_tokens), 0)::bigint      AS total_tokens,
                COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
@@ -276,7 +296,7 @@ async def key_trend(db: Database, key_id: str, days: Sequence[date]) -> list[asy
                COALESCE(SUM(count_units), 0)::bigint       AS count_units,
                COUNT(*)::bigint                             AS requests,
                COUNT(*) FILTER (
-                   WHERE status_code >= 400 OR error_code <> ''
+                   WHERE {error_condition()}
                )::bigint                                    AS errors,
                COALESCE(AVG(latency_ms), 0)::double precision AS avg_latency_ms
         FROM usage_records
@@ -317,12 +337,12 @@ async def key_error_buckets(
     if not days:
         return []
     return await db.fetch(
-        """
+        f"""
         SELECT COALESCE(NULLIF(error_code, ''), status_code::text) AS label,
                COUNT(*)::bigint AS count
         FROM usage_records
         WHERE upstream_key_id = $1 AND quota_day = ANY($2::date[])
-          AND (status_code >= 400 OR error_code <> '')
+          AND {error_condition()}
         GROUP BY label
         ORDER BY count DESC
         LIMIT $3
@@ -338,7 +358,7 @@ async def usage_trend(db: Database, days: Sequence[date]) -> list[asyncpg.Record
     if not days:
         return []
     return await db.fetch(
-        """
+        f"""
         SELECT quota_day,
                COALESCE(SUM(total_tokens), 0)::bigint      AS total_tokens,
                COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
@@ -346,7 +366,7 @@ async def usage_trend(db: Database, days: Sequence[date]) -> list[asyncpg.Record
                COALESCE(SUM(count_units), 0)::bigint       AS count_units,
                COUNT(*)::bigint                             AS requests,
                COUNT(*) FILTER (
-                   WHERE status_code >= 400 OR error_code <> ''
+                   WHERE {error_condition()}
                )::bigint                                    AS errors,
                COUNT(DISTINCT upstream_key_id) FILTER (
                    WHERE upstream_key_id <> ''
@@ -370,7 +390,7 @@ async def usage_by_user(
     这些流量归到「未归属」而不是被丢掉——计费对账必须能看到全量。
     """
     return await db.fetch(
-        """
+        f"""
         SELECT u.id                                        AS user_id,
                COALESCE(u.name, '(未归属)')                AS user_name,
                u.email,
@@ -382,7 +402,7 @@ async def usage_by_user(
                COALESCE(SUM(r.count_units), 0)::bigint       AS count_units,
                COUNT(*)::bigint                              AS requests,
                COUNT(*) FILTER (
-                   WHERE r.status_code >= 400 OR r.error_code <> ''
+                   WHERE {error_condition("r.")}
                )::bigint                                     AS errors,
                COALESCE(AVG(r.latency_ms), 0)::double precision AS avg_latency_ms,
                COUNT(DISTINCT r.quota_day)::bigint           AS active_days,
@@ -406,12 +426,12 @@ async def usage_by_user_daily(
 ) -> list[asyncpg.Record]:
     """给定用户集合的逐配额日用量。``user_ids`` 为空则只查未归属流量。"""
     return await db.fetch(
-        """
+        f"""
         SELECT r.user_id, r.quota_day,
                COALESCE(SUM(r.total_tokens), 0)::bigint AS total_tokens,
                COUNT(*)::bigint                          AS requests,
                COUNT(*) FILTER (
-                   WHERE r.status_code >= 400 OR r.error_code <> ''
+                   WHERE {error_condition("r.")}
                )::bigint                                 AS errors
         FROM usage_records r
         WHERE r.quota_day BETWEEN $1 AND $2
@@ -427,10 +447,10 @@ async def usage_by_user_daily(
 
 async def error_summary(db: Database, since: datetime) -> asyncpg.Record | None:
     return await db.fetchrow(
-        """
+        f"""
         SELECT COUNT(*)::bigint AS requests,
                COUNT(*) FILTER (
-                   WHERE status_code >= 400 OR error_code <> ''
+                   WHERE {error_condition()}
                )::bigint AS errors
         FROM usage_records
         WHERE created_at >= $1
@@ -441,11 +461,11 @@ async def error_summary(db: Database, since: datetime) -> asyncpg.Record | None:
 
 async def errors_by_code(db: Database, since: datetime, limit: int = 20) -> list[asyncpg.Record]:
     return await db.fetch(
-        """
+        f"""
         SELECT COALESCE(NULLIF(error_code, ''), 'http_' || status_code::text) AS label,
                COUNT(*)::bigint AS count
         FROM usage_records
-        WHERE created_at >= $1 AND (status_code >= 400 OR error_code <> '')
+        WHERE created_at >= $1 AND {error_condition()}
         GROUP BY label
         ORDER BY count DESC
         LIMIT $2
@@ -457,10 +477,10 @@ async def errors_by_code(db: Database, since: datetime, limit: int = 20) -> list
 
 async def errors_by_status(db: Database, since: datetime, limit: int = 20) -> list[asyncpg.Record]:
     return await db.fetch(
-        """
+        f"""
         SELECT status_code::text AS label, COUNT(*)::bigint AS count
         FROM usage_records
-        WHERE created_at >= $1 AND (status_code >= 400 OR error_code <> '')
+        WHERE created_at >= $1 AND {error_condition()}
         GROUP BY status_code
         ORDER BY count DESC
         LIMIT $2
@@ -472,26 +492,26 @@ async def errors_by_status(db: Database, since: datetime, limit: int = 20) -> li
 
 async def errors_by_key(db: Database, since: datetime, limit: int = 20) -> list[asyncpg.Record]:
     return await db.fetch(
-        """
+        f"""
         SELECT r.upstream_key_id AS key_id,
                COALESCE(k.pool, '')   AS pool,
                COALESCE(k.status, '') AS status,
                COUNT(*)::bigint       AS requests,
                COUNT(*) FILTER (
-                   WHERE r.status_code >= 400 OR r.error_code <> ''
+                   WHERE {error_condition("r.")}
                )::bigint              AS errors,
                COALESCE((
                    SELECT COALESCE(NULLIF(e.error_code, ''), 'http_' || e.status_code::text)
                    FROM usage_records e
                    WHERE e.upstream_key_id = r.upstream_key_id AND e.created_at >= $1
-                     AND (e.status_code >= 400 OR e.error_code <> '')
+                     AND {error_condition("e.")}
                    GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1
                ), '') AS top_error
         FROM usage_records r
         LEFT JOIN upstream_keys k ON k.key_id = r.upstream_key_id
         WHERE r.created_at >= $1 AND r.upstream_key_id <> ''
         GROUP BY r.upstream_key_id, k.pool, k.status
-        HAVING COUNT(*) FILTER (WHERE r.status_code >= 400 OR r.error_code <> '') > 0
+        HAVING COUNT(*) FILTER (WHERE {error_condition("r.")}) > 0
         ORDER BY errors DESC
         LIMIT $2
         """,
@@ -502,11 +522,11 @@ async def errors_by_key(db: Database, since: datetime, limit: int = 20) -> list[
 
 async def errors_timeline(db: Database, since: datetime) -> list[asyncpg.Record]:
     return await db.fetch(
-        """
+        f"""
         SELECT date_trunc('hour', created_at) AS hour,
                COUNT(*)::bigint AS requests,
                COUNT(*) FILTER (
-                   WHERE status_code >= 400 OR error_code <> ''
+                   WHERE {error_condition()}
                )::bigint AS errors
         FROM usage_records
         WHERE created_at >= $1
@@ -529,7 +549,7 @@ async def egress_usage(db: Database, day: date) -> dict[str, dict[str, int]]:
     的 Key 数，是需要清理的对象。
     """
     rows = await db.fetch(
-        """
+        f"""
         WITH bound AS (
             SELECT egress_ip,
                    COUNT(*)::bigint AS db_bound_keys,
@@ -542,7 +562,7 @@ async def egress_usage(db: Database, day: date) -> dict[str, dict[str, int]]:
                    COALESCE(SUM(total_tokens), 0)::bigint AS today_tokens,
                    COUNT(*)::bigint                        AS today_requests,
                    COUNT(*) FILTER (
-                       WHERE status_code >= 400 OR error_code <> ''
+                       WHERE {error_condition()}
                    )::bigint                               AS today_errors
             FROM usage_records
             WHERE quota_day = $1 AND egress_ip <> ''

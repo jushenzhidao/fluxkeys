@@ -3,7 +3,7 @@
 
 server:
   addr: "0.0.0.0:8080"
-  
+
 postgres:
   dsn: "host=localhost port=5432 user=fluxkeys password=fluxkeys dbname=fluxkeys sslmode=disable"
 
@@ -13,21 +13,32 @@ redis:
   db: 0
 
 # 多 Provider 配置示例
+#
+# 平台辨析（实测结论，见 livetest-ai/real_upstream_test/TEST_REPORT.md）：商汤有两个互不相通
+# 的平台，凭据形态与域名必须配套，混用一律 403：
+#   - 日日新公测平台  token.sensenova.cn        sk- 形态 Key   ← 用这个
+#   - 商汤大装置 AIDC  api.sensenova.cn/compatible-mode  AK|SK 形态
+# 旧配置写的 api.sensenova.cn/v1 + SenseChat-5 是上述两个平台的错配。
 providers:
   sensenova:
-    base_url: "https://api.sensenova.cn/v1"
-    quota_kind: "token"
-    quota_limit: 1000000  # 100万 tokens
-    quota_window: 24h
-    refresh_hour: null  # 商汤无固定刷新点
+    base_url: "https://token.sensenova.cn"
+    quota_kind: "count"
+    # 公测期 flash-lite 每 5 小时 1500 次，留余量按 1400 记
+    quota_limit: 1400
+    quota_window: 5h
+    refresh_hour: null  # 滚动窗口，无固定刷新点
     model_mapping:
-      # 将常见模型名映射到商汤模型
-      "gpt-4": "SenseChat-5"
-      "gpt-4-turbo": "SenseChat-5"
-      "gpt-3.5-turbo": "SenseChat-Turbo"
-      "claude-3-5-sonnet": "SenseChat-5"
-    count_models: []
+      "gpt-4": "sensenova-6.8-flash-lite"
+      "gpt-4-turbo": "sensenova-6.8-flash-lite"
+      "gpt-3.5-turbo": "sensenova-6.7-flash-lite"
+      "glm-4": "glm-5.2"
+    count_models:
+      - "sensenova-6.8-flash-lite"
+      - "sensenova-6.7-flash-lite"
+      - "glm-5.2"
     reasoning_models: []
+
+default_provider: "sensenova"
 
 # 跨渠道通用配置
 upstream:
@@ -37,11 +48,13 @@ upstream:
 
 # 调度器配置
 scheduler:
-  weight_quota: 0.35
-  weight_history: 0.25
-  weight_persona: 0.20
-  weight_health: 0.20
-  soft_penalty: 0.3
+  # 五维权重是 0-100 标度（打分公式为 Weight*Score/100 等），不是 0-1 标度。
+  # 写成 0.35 不会报错，只会让权重整体缩水两个数量级、相对比例失真。
+  weight_quota: 35
+  weight_history: 25
+  weight_persona: 20
+  weight_health: 15
+  soft_penalty: 20
   active_pool_size: 10
   enable_persona: false
   min_request_interval: 5s
@@ -55,12 +68,18 @@ refresh:
   window_start: "12:00"
   window_end: "14:00"
   probe_interval: 30s
-  probe_model: "SenseChat-Turbo"
+  probe_model: "sensenova-6.8-flash-lite"
   post_refresh_ramp_minutes: 15
 
 # 出口 IP 配置
 egress:
-  default_max_keys: 5
+  # 配了 ips 就必须显式声明 multi_ip。缺了 mode 会静默回落到默认的 direct，
+  # 两个出口都不会被绑定，多出口测试退化成单出口而不报任何错。
+  mode: "multi_ip"
+  # 目标留空 = 从 provider 的 base_url 推导（token.sensenova.cn:443）。
+  # 写死厂商域名会让自检在真实上游拉黑该出口时依然全绿。
+  verify_target: ""
+  verify_on_start: true
   ban_detect_window: 5m
   ban_cooldown: 1h
   ban_cooldown_max: 24h

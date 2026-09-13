@@ -289,15 +289,17 @@ func (s *Server) recordUsage(ctx context.Context, plan *requestPlan, uc *UserCon
 	}
 	// 落库的计费量必须与真正从配额里扣掉的量同源。
 	//
-	// 直接抄 usage.CountUnits 会让 chat 端点的按次计费流水恒为 0（上游只在
-	// 图片类响应里返回张数），而 Redis 侧按预扣量实扣了 1 —— 账面对不平，
-	// 且偏差方向是「少记」，对账时看起来像是网关白送了额度。
-	if status == http.StatusOK && plan.QuotaKind == quota.KindCount {
-		var u adapter.Usage
-		if plan.finalUsage != nil {
-			u = *plan.finalUsage
-		}
-		rec.CountUnits = actualFor(u, plan.Estimated, quota.KindCount)
+	// 判据是「本次是否真的 Commit 过」而非「对外状态码是不是 200」。两者并不
+	// 等价: attempt 在「已收到响应头、但读响应体失败」与「响应体超限」两条路径上
+	// 会按预扣量显式 Commit（上游确实消耗了额度），而对外的状态码是 502。
+	// 只认 200 会让这两条路径出现「Redis 实扣 1、流水记 0」—— 偏差方向是少记，
+	// 与真实环境暴露过的按次流水恒为 0 属同一类，只是换了一条路径。
+	//
+	// plan.committedAmount 由 attempt 在结束租约处累加回填，是唯一权威来源。
+	// 累加语义同时覆盖了「一次请求换 Key 重试、其中若干次真实消耗额度」的情形，
+	// 使流水合计与 Redis 实扣合计严格相等。
+	if plan.QuotaKind == quota.KindCount && plan.committed {
+		rec.CountUnits = plan.committedAmount
 	}
 	rec.UpstreamKeyID = plan.finalKeyID
 	rec.EgressIP = plan.finalEgressIP

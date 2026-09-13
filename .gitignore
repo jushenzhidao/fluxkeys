@@ -31,8 +31,11 @@ config.local.yaml
 config.local.yml
 docker-compose.override.yml
 
-# 真实上游测试目录：keys.txt 含真实商汤密钥、deploy 脚本含服务器 IP 与
-# SSH 凭据、config.prod.yaml 含生产拓扑。整目录不入库。
+# 真实上游测试目录已于 2026-09-13 迁出本仓，现位于同级的 livetest-ai 项目：
+#   ../livetest-ai/real_upstream_test/
+# 该目录含真实商汤密钥（keys.txt）、服务器 IP 与生产拓扑，忽略规则改由
+# livetest-ai 自己的 .gitignore 承担。本行保留为安全网：万一该目录被误建回
+# 本仓，含真实凭据的内容仍不会入库。
 /real_upstream_test/
 # 同理：根目录部署脚本含明文 root SSH 密码与服务器 IP。
 /deploy_test.sh

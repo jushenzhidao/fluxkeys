@@ -1,4 +1,4 @@
-package gateway
+package adminapi
 
 import (
 	"encoding/json"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fluxkeys/fluxkeys/internal/confsnap"
+	"github.com/fluxkeys/fluxkeys/internal/httpcore"
 )
 
 // provider 配置管理端点。
@@ -30,29 +31,31 @@ import (
 // 类型断言而非在 Deps 里多加一个字段: 热路径的 Store 实现（含测试 fake）
 // 不该被迫实现这 13 个低频管理方法。未实现时返回 501 而非 panic ——
 // 配置管理不可用不该让整个网关起不来。
-func (s *Server) providerStore() (ProviderConfigStore, bool) {
-	ps, ok := s.store.(ProviderConfigStore)
+func (a *API) providerStore() (ProviderConfigStore, bool) {
+	ps, ok := a.deps.Store().(ProviderConfigStore)
 	return ps, ok
 }
 
 // providerRoutes 注册 provider 配置管理路由。
 //
 // 由 routes() 在 Admin.APIKey 非空的分支里调用，与其他管理端点同生共死。
-func (s *Server) providerRoutes() {
-	s.mux.Handle("GET /admin/providers", s.adminChain(s.handleProviderList))
-	s.mux.Handle("POST /admin/providers", s.adminChain(s.handleProviderCreate))
-	// capabilities 是字面量段，比 {name} 单段通配更具体，ServeMux 会优先
-	// 命中它 —— 不依赖注册顺序，但必须先于 {name} 存在，否则
-	// GET /admin/providers/capabilities 会被当成 name="capabilities" 的详情查询。
-	s.mux.Handle("GET /admin/providers/capabilities", s.adminChain(s.handleProviderCapabilities))
-	s.mux.Handle("GET /admin/providers/{name}", s.adminChain(s.handleProviderGet))
-	s.mux.Handle("PUT /admin/providers/{name}", s.adminChain(s.handleProviderUpdate))
-	s.mux.Handle("DELETE /admin/providers/{name}", s.adminChain(s.handleProviderDelete))
-	s.mux.Handle("GET /admin/providers/{name}/versions", s.adminChain(s.handleProviderVersions))
-	s.mux.Handle("GET /admin/providers/{name}/versions/{version_id}", s.adminChain(s.handleProviderVersion))
-	s.mux.Handle("POST /admin/providers/{name}/rollback", s.adminChain(s.handleProviderRollback))
-	s.mux.Handle("POST /admin/providers/{name}/dry-run", s.adminChain(s.handleProviderDryRun))
-	s.mux.Handle("POST /admin/reload-config", s.adminChain(s.handleReloadConfig))
+func (a *API) providerRoutes() {
+	a.mux.Handle("GET /admin/providers", a.deps.AdminChain(a.handleProviderList))
+	a.mux.Handle("POST /admin/providers", a.deps.AdminChain(a.handleProviderCreate))
+	// capabilities 是字面量段，比 {name} 单段通配更具体。Go 1.22+ 的 ServeMux
+	// 按「更具体的模式优先」判定，与注册顺序无关 —— 紧挨着写只是为了阅读时
+	// 能看出两者的关系。若哪天有人把这条删掉，GET /admin/providers/capabilities
+	// 会退化成 name="capabilities" 的详情查询（返回 provider 不存在而非路由缺失），
+	// 因此 api_test.go 里有一条断言专门钉住这个优先级。
+	a.mux.Handle("GET /admin/providers/capabilities", a.deps.AdminChain(a.handleProviderCapabilities))
+	a.mux.Handle("GET /admin/providers/{name}", a.deps.AdminChain(a.handleProviderGet))
+	a.mux.Handle("PUT /admin/providers/{name}", a.deps.AdminChain(a.handleProviderUpdate))
+	a.mux.Handle("DELETE /admin/providers/{name}", a.deps.AdminChain(a.handleProviderDelete))
+	a.mux.Handle("GET /admin/providers/{name}/versions", a.deps.AdminChain(a.handleProviderVersions))
+	a.mux.Handle("GET /admin/providers/{name}/versions/{version_id}", a.deps.AdminChain(a.handleProviderVersion))
+	a.mux.Handle("POST /admin/providers/{name}/rollback", a.deps.AdminChain(a.handleProviderRollback))
+	a.mux.Handle("POST /admin/providers/{name}/dry-run", a.deps.AdminChain(a.handleProviderDryRun))
+	a.mux.Handle("POST /admin/reload-config", a.deps.AdminChain(a.handleReloadConfig))
 }
 
 // providerBody 是创建/更新/预演共用的请求体。
@@ -72,12 +75,12 @@ type providerBody struct {
 // DisallowUnknownFields 是必需的: 字段名写错（quota_window 少写 _nanos、
 // refresh_hour 写成 refreshHour）在宽松解析下会静默取零值，
 // 于是「我明明填了刷新点」的配置落库时刷新点是空的。
-func (s *Server) decodeProviderBody(w http.ResponseWriter, r *http.Request) (providerBody, bool) {
+func (a *API) decodeProviderBody(w http.ResponseWriter, r *http.Request) (providerBody, bool) {
 	var body providerBody
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
 		return providerBody{}, false
 	}
 	return body, true
@@ -88,24 +91,24 @@ func (s *Server) decodeProviderBody(w http.ResponseWriter, r *http.Request) (pro
 // 映射集中在一处，避免每个 handler 各写一份 —— 分散写最常见的后果是
 // 某个 handler 漏了 ErrVersionConflict 的分支，于是乐观锁失败被当成 500，
 // 运维看到「服务器错误」而不是「刷新重试」。
-func (s *Server) writeProviderStoreErr(w http.ResponseWriter, r *http.Request, err error, what string) {
+func (a *API) writeProviderStoreErr(w http.ResponseWriter, r *http.Request, err error, what string) {
 	switch {
 	case errors.Is(err, ErrProviderNotFound):
-		s.writeError(w, r, http.StatusNotFound, "provider_not_found", "provider 不存在")
+		a.writeError(w, r, http.StatusNotFound, "provider_not_found", "provider 不存在")
 	case errors.Is(err, ErrProviderExists):
-		s.writeError(w, r, http.StatusConflict, "provider_exists",
+		a.writeError(w, r, http.StatusConflict, "provider_exists",
 			"provider 名已被占用（含已停用的）。provider 名进入配额 key 与归档维度，不允许复用")
 	case errors.Is(err, ErrProviderVersionConflict):
-		s.writeError(w, r, http.StatusConflict, "version_conflict",
+		a.writeError(w, r, http.StatusConflict, "version_conflict",
 			"配置已被他人修改，请刷新后重试")
 	case errors.Is(err, ErrProviderNameImmutable):
-		s.writeError(w, r, http.StatusBadRequest, "name_immutable", msgNameImmutable)
+		a.writeError(w, r, http.StatusBadRequest, "name_immutable", msgNameImmutable)
 	case errors.Is(err, ErrProviderQuotaKindImmutable):
-		s.writeError(w, r, http.StatusUnprocessableEntity, "quota_kind_immutable", msgQuotaKindImmutable)
+		a.writeError(w, r, http.StatusUnprocessableEntity, "quota_kind_immutable", msgQuotaKindImmutable)
 	default:
-		s.log.ErrorContext(r.Context(), what, "err", err,
-			"request_id", RequestIDFromContext(r.Context()))
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error", what)
+		a.deps.Log().ErrorContext(r.Context(), what, "err", err,
+			"request_id", httpcore.RequestIDFromContext(r.Context()))
+		a.writeError(w, r, http.StatusInternalServerError, "internal_error", what)
 	}
 }
 
@@ -130,27 +133,27 @@ const (
 //
 // 不查库、不依赖 providerStore: 取值集合由编译进来的适配器决定，
 // 与部署是否启用配置管理无关，因此这个端点在任何部署形态下都可用。
-func (s *Server) handleProviderCapabilities(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+func (a *API) handleProviderCapabilities(w http.ResponseWriter, r *http.Request) {
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"supported_providers": confsnap.SupportedProviders(),
 	})
 }
 
 // handleProviderList 处理 GET /admin/providers。
-func (s *Server) handleProviderList(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderList(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
 	items, err := ps.ListProvidersWithUsage(r.Context(), time.Now())
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 列表失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 列表失败")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"providers": items,
 		"count":     len(items),
 		// 受支持的 provider 取值随列表一起带出: 选择器选项与列表数据来自
@@ -163,17 +166,17 @@ func (s *Server) handleProviderList(w http.ResponseWriter, r *http.Request) {
 //
 // 附带近 7 个配额日的单 Key 单日峰值用量: 编辑 quota_limit 时若填到峰值
 // 以下，改动一生效就会让那批 Key 当日立刻被判超额 —— 界面必须先告知这个数。
-func (s *Server) handleProviderGet(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderGet(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
 	name := r.PathValue("name")
 	cur, err := ps.GetProviderConfig(r.Context(), name)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
 		return
 	}
 
@@ -181,11 +184,11 @@ func (s *Server) handleProviderGet(w http.ResponseWriter, r *http.Request) {
 	// 让整个详情页因为一次归档表查询失败而打不开是过度耦合。
 	peak, peakErr := ps.GetProviderPeakUsage(r.Context(), name, 7, time.Now())
 	if peakErr != nil {
-		s.log.WarnContext(r.Context(), "读取 provider 峰值用量失败", "provider", name, "err", peakErr)
+		a.deps.Log().WarnContext(r.Context(), "读取 provider 峰值用量失败", "provider", name, "err", peakErr)
 	}
 	hasTraffic, trafficErr := ps.ProviderHasTraffic(r.Context(), name)
 	if trafficErr != nil {
-		s.log.WarnContext(r.Context(), "检查 provider 流量失败", "provider", name, "err", trafficErr)
+		a.deps.Log().WarnContext(r.Context(), "检查 provider 流量失败", "provider", name, "err", trafficErr)
 	}
 
 	resp := map[string]any{
@@ -197,25 +200,25 @@ func (s *Server) handleProviderGet(w http.ResponseWriter, r *http.Request) {
 		resp["peak_hint"] = "近 7 个配额日内单 Key 单日最高用量。quota_limit 是单 Key 上限，" +
 			"设到此值以下会让那批 Key 一生效就判超额"
 	}
-	writeJSON(w, http.StatusOK, resp)
+	httpcore.WriteJSON(w, http.StatusOK, resp)
 }
 
 // handleProviderCreate 处理 POST /admin/providers。
-func (s *Server) handleProviderCreate(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderCreate(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
-	body, ok := s.decodeProviderBody(w, r)
+	body, ok := a.decodeProviderBody(w, r)
 	if !ok {
 		return
 	}
 
 	failures, warnings := validateProviderInput(body.ProviderConfigView, true)
 	if len(failures) > 0 {
-		s.writeProviderInvalid(w, r, failures, warnings)
+		a.writeProviderInvalid(w, r, failures, warnings)
 		return
 	}
 
@@ -226,18 +229,18 @@ func (s *Server) handleProviderCreate(w http.ResponseWriter, r *http.Request) {
 		Actor:  adminActor(r),
 	})
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "创建 provider 失败")
+		a.writeProviderStoreErr(w, r, err, "创建 provider 失败")
 		return
 	}
 
-	s.audit(r, "create_provider", body.Name, map[string]any{
+	a.audit(r, "create_provider", body.Name, map[string]any{
 		"version": version,
 		"reason":  body.Reason,
 		"after":   body.ProviderConfigView,
 	})
 
-	reloaded, newVersion := s.reloadAfterWrite(r, "create_provider", body.Name)
-	writeJSON(w, http.StatusCreated, map[string]any{
+	reloaded, newVersion := a.reloadAfterWrite(r, "create_provider", body.Name)
+	httpcore.WriteJSON(w, http.StatusCreated, map[string]any{
 		"provider":       body.ProviderConfigView,
 		"version":        version,
 		"warnings":       warnings,
@@ -253,35 +256,35 @@ func (s *Server) handleProviderCreate(w http.ResponseWriter, r *http.Request) {
 // 就必须知道「哪些零值是没填、哪些是真的要清空」，而那正是 PATCH 语义
 // 最常写错的地方 —— 把 count_models 清空与不改动混为一谈，
 // 会让一批按次计费的模型静默退回 token 计量。
-func (s *Server) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
 	name := r.PathValue("name")
-	body, ok := s.decodeProviderBody(w, r)
+	body, ok := a.decodeProviderBody(w, r)
 	if !ok {
 		return
 	}
 
 	cur, err := ps.GetProviderConfig(r.Context(), name)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
 		return
 	}
 
 	// 路径与请求体都能表达 name，冲突时拒绝而不是二选一 ——
 	// 「按路径为准」会让一个写着别人名字的请求体被静默接受。
 	if body.Name != "" && body.Name != name {
-		s.writeError(w, r, http.StatusBadRequest, "name_immutable", msgNameImmutable)
+		a.writeError(w, r, http.StatusBadRequest, "name_immutable", msgNameImmutable)
 		return
 	}
 	// quota_kind 与当前不符即拒。空串视为「沿用当前」而非「改成空」:
 	// 界面提交全量配置时一定带上它，而脚本省略它是常态。
 	if body.QuotaKind != "" && body.QuotaKind != cur.QuotaKind {
-		s.writeProviderImmutableConflict(w, r, http.StatusBadRequest, cur, body.ProviderConfigView)
+		a.writeProviderImmutableConflict(w, r, http.StatusBadRequest, cur, body.ProviderConfigView)
 		return
 	}
 
@@ -301,7 +304,7 @@ func (s *Server) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
 
 	failures, warnings := validateProviderInput(next, false)
 	if len(failures) > 0 {
-		s.writeProviderInvalid(w, r, failures, warnings)
+		a.writeProviderInvalid(w, r, failures, warnings)
 		return
 	}
 
@@ -314,14 +317,14 @@ func (s *Server) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: body.ExpectedVersion,
 	})
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "更新 provider 失败")
+		a.writeProviderStoreErr(w, r, err, "更新 provider 失败")
 		return
 	}
 
 	// detail 同时带 before 与 diff: diff 便于快速看「改了什么」，
 	// before 是回答「改之前到底是什么」的唯一凭据 —— 只存 diff 的话，
 	// 一旦某个字段的 diff 计算有误，原值就永久丢失了。
-	s.audit(r, "update_provider", name, map[string]any{
+	a.audit(r, "update_provider", name, map[string]any{
 		"version":          version,
 		"previous_version": cur.Version,
 		"reason":           body.Reason,
@@ -330,8 +333,8 @@ func (s *Server) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
 		"diff":             diff,
 	})
 
-	reloaded, newVersion := s.reloadAfterWrite(r, "update_provider", name)
-	writeJSON(w, http.StatusOK, map[string]any{
+	reloaded, newVersion := a.reloadAfterWrite(r, "update_provider", name)
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"provider":       next,
 		"version":        version,
 		"diff":           diff,
@@ -346,10 +349,10 @@ func (s *Server) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
 // 软删除。物理删会让 usage_records / key_daily_history 里那批行失去归因，
 // 账目从此对不上，且 provider 名会被释放给下一个同名配置复用 ——
 // 两段互不相干的用量从此混在同一个维度下。
-func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
@@ -363,24 +366,24 @@ func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&body); err != nil {
-			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+			a.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
 			return
 		}
 	}
 
 	cur, err := ps.GetProviderConfig(r.Context(), name)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
 		return
 	}
 
 	version, err := ps.DeleteProvider(r.Context(), name, body.Reason, adminActor(r), body.ExpectedVersion)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "停用 provider 失败")
+		a.writeProviderStoreErr(w, r, err, "停用 provider 失败")
 		return
 	}
 
-	s.audit(r, "delete_provider", name, map[string]any{
+	a.audit(r, "delete_provider", name, map[string]any{
 		"version":          version,
 		"previous_version": cur.Version,
 		"reason":           body.Reason,
@@ -388,8 +391,8 @@ func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
 		"soft_delete":      true,
 	})
 
-	reloaded, newVersion := s.reloadAfterWrite(r, "delete_provider", name)
-	writeJSON(w, http.StatusOK, map[string]any{
+	reloaded, newVersion := a.reloadAfterWrite(r, "delete_provider", name)
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"name":    name,
 		"version": version,
 		// 明确回「软删除」而非「已删除」: 运维需要知道数据还在、
@@ -402,7 +405,7 @@ func (s *Server) handleProviderDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeProviderInvalid 写出校验不通过的响应。
-func (s *Server) writeProviderInvalid(w http.ResponseWriter, r *http.Request, failures, warnings []providerCheck) {
+func (a *API) writeProviderInvalid(w http.ResponseWriter, r *http.Request, failures, warnings []providerCheck) {
 	// 与 writeError 不同: 校验失败必须逐字段回，只回一句「参数非法」
 	// 会让运维在十几个字段里靠猜定位。故此处直接写业务结构。
 	w.Header().Set("Content-Type", "application/json")
@@ -416,7 +419,7 @@ func (s *Server) writeProviderInvalid(w http.ResponseWriter, r *http.Request, fa
 		"failures": failures,
 		"warnings": warnings,
 	}); err != nil {
-		s.log.WarnContext(r.Context(), "写出校验错误响应失败", "err", err)
+		a.deps.Log().WarnContext(r.Context(), "写出校验错误响应失败", "err", err)
 	}
 }
 
@@ -436,7 +439,7 @@ func (s *Server) writeProviderInvalid(w http.ResponseWriter, r *http.Request, fa
 //
 // 无论哪条路径都带字段级差异 —— 只说「不可修改」而不说当前值与目标值，
 // 运维还得自己去翻两个版本对比才知道差在哪。
-func (s *Server) writeProviderImmutableConflict(w http.ResponseWriter, r *http.Request, status int, cur, target ProviderConfigView) {
+func (a *API) writeProviderImmutableConflict(w http.ResponseWriter, r *http.Request, status int, cur, target ProviderConfigView) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(map[string]any{
@@ -456,6 +459,6 @@ func (s *Server) writeProviderImmutableConflict(w http.ResponseWriter, r *http.R
 		"remedy": "新建一个使用目标量纲的 provider，把 Key 迁过去，再停用当前 provider。" +
 			"重试本操作不会成功",
 	}); err != nil {
-		s.log.WarnContext(r.Context(), "写出量纲冲突响应失败", "err", err)
+		a.deps.Log().WarnContext(r.Context(), "写出量纲冲突响应失败", "err", err)
 	}
 }

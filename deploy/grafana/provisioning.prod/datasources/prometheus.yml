@@ -1,0 +1,27 @@
+# Grafana 数据源自动装载 —— 生产形态专用（docker-compose.prod.yml）
+#
+# 与 ../provisioning/datasources/prometheus.yml（本地）的差异仅一处:
+#   本地: url: http://prometheus:9090   （bridge 服务名 DNS）
+#   生产: url: http://127.0.0.1:9091    （Prometheus 在 host 网络绑回环，
+#                                        Grafana 同在 host 网络，直连回环）
+#
+# uid 固定为 fluxkeys-prom，与本地一致 —— dashboard JSON 通过 uid 引用数据源，
+# 两个环境共用同一份 JSON，改 uid 会让全部面板变 No data。
+
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: fluxkeys-prom
+    url: http://127.0.0.1:9091
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

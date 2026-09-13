@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS upstream_keys (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 增量迁移: CREATE TABLE IF NOT EXISTS 对已存在的表是空操作，不会补列。
+-- 因此新增列必须在**任何引用它的语句之前**显式补上 —— 紧邻的
+-- idx_upstream_keys_shard 就用到 shard，放到文件末尾的「增量迁移」段
+-- 会导致该索引先于列创建，直接报 column "shard" does not exist，
+-- 使任何既有部署升级后无法启动（新库因建表时已带该列而看不出问题）。
+ALTER TABLE upstream_keys ADD COLUMN IF NOT EXISTS shard TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_upstream_keys_provider_status ON upstream_keys(provider, status);
 CREATE INDEX IF NOT EXISTS idx_upstream_keys_pool_status ON upstream_keys(pool, status);
 CREATE INDEX IF NOT EXISTS idx_upstream_keys_status ON upstream_keys(status);
@@ -103,6 +110,10 @@ CREATE TABLE IF NOT EXISTS usage_records (
     latency_ms        INTEGER     NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 同理: 先补列再建索引。当前没有索引引用 reasoning_tokens，但保持同一
+-- 规则可以避免「以后给新列加索引」时重新踩一遍顺序坑。
+ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS reasoning_tokens BIGINT NOT NULL DEFAULT 0;
+
 CREATE INDEX IF NOT EXISTS idx_usage_user_day  ON usage_records(user_id, quota_day);
 CREATE INDEX IF NOT EXISTS idx_usage_key_day   ON usage_records(upstream_key_id, quota_day);
 CREATE INDEX IF NOT EXISTS idx_usage_provider_day ON usage_records(provider, quota_day);
@@ -158,11 +169,9 @@ CREATE INDEX IF NOT EXISTS idx_drift_created ON quota_drift_logs(created_at DESC
 -- 所有语句必须幂等，本文件在每次启动时重复执行。
 -- ============================================================
 
--- 推理模型思维链 token（含于 completion_tokens 内，仅作可观测性拆分）
-ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS reasoning_tokens BIGINT NOT NULL DEFAULT 0;
-
--- Key 的机器归属（多机部署分片）。已部署实例升级时补列，语义见上方建表注释。
-ALTER TABLE upstream_keys ADD COLUMN IF NOT EXISTS shard TEXT NOT NULL DEFAULT '';
+-- 注意: 补列语句（ALTER TABLE ... ADD COLUMN IF NOT EXISTS）**不在这里**。
+-- 它们必须紧跟各自的 CREATE TABLE，位于任何引用新列的语句之前 ——
+-- 放到本段会让「建索引」先于「补列」执行并发失败。见文件中相应位置的注释。
 
 -- 归档主键补齐 provider。
 --

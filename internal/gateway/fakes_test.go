@@ -180,8 +180,8 @@ type fakeStore struct {
 	usage []UsageRecord
 	// audits 收集审计日志。
 	audits []auditEntry
-	// volcKeys 是已导入的火山 Key，以 key_id 为索引。
-	volcKeys map[string]NewVolcKey
+	// upstreamKeys 是已导入的火山 Key，以 key_id 为索引。
+	upstreamKeys map[string]NewUpstreamKey
 	// pingErr 非 nil 时 Ping 失败。
 	pingErr error
 	// recordErr 非 nil 时 RecordUsage 失败。
@@ -291,22 +291,22 @@ func (f *fakeStore) RevokeUserAPIKey(ctx context.Context, userID, keyID int64) e
 	return fmt.Errorf("%w: key %d", ErrKeyNotFound, keyID)
 }
 
-func (f *fakeStore) UpsertUpstreamKey(ctx context.Context, in NewVolcKey) (bool, error) {
+func (f *fakeStore) UpsertUpstreamKey(ctx context.Context, in NewUpstreamKey) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.upsertErr != nil {
 		return false, f.upsertErr
 	}
-	if f.volcKeys == nil {
-		f.volcKeys = map[string]NewVolcKey{}
+	if f.upstreamKeys == nil {
+		f.upstreamKeys = map[string]NewUpstreamKey{}
 	}
-	prev, existed := f.volcKeys[in.KeyID]
+	prev, existed := f.upstreamKeys[in.KeyID]
 	// 复刻真实语义: secret 留空时保留库中已有密文，
 	// 这让运维能用同一份清单只更新 pool 等元数据而不接触密钥
 	if in.Secret == "" && existed {
 		in.Secret = prev.Secret
 	}
-	f.volcKeys[in.KeyID] = in
+	f.upstreamKeys[in.KeyID] = in
 	return !existed, nil
 }
 
@@ -321,7 +321,7 @@ func (f *fakeStore) AssignShard(ctx context.Context, shard string, keyIDs []stri
 	f.shardCalls = append(f.shardCalls, shardCall{Shard: shard, KeyIDs: append([]string(nil), keyIDs...)})
 	var n int64
 	for _, id := range keyIDs {
-		if _, ok := f.volcKeys[id]; ok {
+		if _, ok := f.upstreamKeys[id]; ok {
 			n++
 		}
 	}
@@ -416,16 +416,16 @@ func (f *fakeStore) egressIPOf(keyID string) (string, bool) {
 
 func (f *fakeStore) Ping(ctx context.Context) error { return f.pingErr }
 
-func (f *fakeStore) volcKeyCount() int {
+func (f *fakeStore) upstreamKeyCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.volcKeys)
+	return len(f.upstreamKeys)
 }
 
-func (f *fakeStore) volcKey(id string) (NewVolcKey, bool) {
+func (f *fakeStore) upstreamKey(id string) (NewUpstreamKey, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	k, ok := f.volcKeys[id]
+	k, ok := f.upstreamKeys[id]
 	return k, ok
 }
 

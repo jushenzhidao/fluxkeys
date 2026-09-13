@@ -1350,7 +1350,7 @@ func TestAdmin_导入Key支持单个与批量(t *testing.T) {
 	}
 	resp2.Body.Close()
 
-	if n := env.store.volcKeyCount(); n != 3 {
+	if n := env.store.upstreamKeyCount(); n != 3 {
 		t.Errorf("已导入 %d 个 Key, 期望 3", n)
 	}
 }
@@ -1384,7 +1384,7 @@ func TestAdmin_导入Key是幂等的(t *testing.T) {
 			t.Errorf("重复导入 updated_count = %v, 期望 1", out["updated_count"])
 		}
 	}
-	if n := env.store.volcKeyCount(); n != 1 {
+	if n := env.store.upstreamKeyCount(); n != 1 {
 		t.Errorf("重复导入产生了 %d 条记录, 期望 1", n)
 	}
 }
@@ -1407,7 +1407,7 @@ func TestAdmin_导入Key留空secret保留原密文(t *testing.T) {
 	post(`{"key_id":"volc_300","secret":"sk-original","pool":"main"}`)
 	post(`{"key_id":"volc_300","pool":"cold"}`)
 
-	k, ok := env.store.volcKey("volc_300")
+	k, ok := env.store.upstreamKey("volc_300")
 	if !ok {
 		t.Fatal("Key 不存在")
 	}
@@ -1587,7 +1587,7 @@ func TestAdmin_重载失败不影响导入返回成功(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("状态码 = %d, 重载失败不应影响导入结果: %s", resp.StatusCode, body)
 	}
-	if n := env.store.volcKeyCount(); n != 1 {
+	if n := env.store.upstreamKeyCount(); n != 1 {
 		t.Errorf("Key 未落库: %d", n)
 	}
 }

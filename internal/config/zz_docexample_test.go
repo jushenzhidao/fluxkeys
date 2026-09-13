@@ -456,7 +456,7 @@ func TestDefault_默认启用封禁恢复(t *testing.T) {
 	}
 }
 
-// deploy/.env.example 里写的推理预扣旋钮必须真的能生效，否则运维改了没反应。
+// .env.example 里写的推理预扣旋钮必须真的能生效，否则运维改了没反应。
 func TestApplyEnv_推理预扣参数(t *testing.T) {
 	t.Setenv("QUOTA_REASONING_OUTPUT_MULTIPLIER", "4.5")
 	t.Setenv("QUOTA_REASONING_FLOOR_TOKENS", "2048")

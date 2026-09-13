@@ -1,10 +1,4 @@
-package gateway
-
-// provider 配置的版本历史、回滚、预演与热加载端点。
-//
-// 与 admin_provider.go（CRUD）分文件是为了让单文件保持在可整屏审阅的规模:
-// 这一组端点的共同点是**都不直接改当前态**（回滚经由新版本间接改），
-// 而 CRUD 那一组都是直接写当前态，两类的审阅关注点不同。
+package adminapi
 
 import (
 	"encoding/json"
@@ -12,13 +6,15 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/fluxkeys/fluxkeys/internal/httpcore"
 )
 
 // handleProviderVersions 处理 GET /admin/providers/{name}/versions。
-func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderVersions(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
@@ -27,7 +23,7 @@ func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) 
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
-			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "limit 需为正整数")
+			a.writeError(w, r, http.StatusBadRequest, "invalid_request", "limit 需为正整数")
 			return
 		}
 		limit = n
@@ -36,7 +32,7 @@ func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) 
 	if v := r.URL.Query().Get("before"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
-			s.writeError(w, r, http.StatusBadRequest, "invalid_request", "before 需为正整数版本号")
+			a.writeError(w, r, http.StatusBadRequest, "invalid_request", "before 需为正整数版本号")
 			return
 		}
 		before = n
@@ -44,7 +40,7 @@ func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) 
 
 	versions, err := ps.ListProviderVersions(r.Context(), name, limit, before)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取配置版本历史失败")
+		a.writeProviderStoreErr(w, r, err, "读取配置版本历史失败")
 		return
 	}
 
@@ -54,7 +50,7 @@ func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) 
 	if len(versions) == limit {
 		nextBefore = versions[len(versions)-1].ID
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"provider_name": name,
 		"versions":      versions,
 		"next_before":   nextBefore,
@@ -62,36 +58,36 @@ func (s *Server) handleProviderVersions(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleProviderVersion 处理 GET /admin/providers/{name}/versions/{version_id}。
-func (s *Server) handleProviderVersion(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderVersion(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
 	name := r.PathValue("name")
 	id, err := strconv.ParseInt(r.PathValue("version_id"), 10, 64)
 	if err != nil || id <= 0 {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "版本号非法")
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "版本号非法")
 		return
 	}
 
 	v, err := ps.GetProviderVersion(r.Context(), id)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取配置版本失败")
+		a.writeProviderStoreErr(w, r, err, "读取配置版本失败")
 		return
 	}
 	// 版本号全局单调，A 的版本号拿去查 B 是能查到行的。不校验会让界面
 	// 在 B 的页面上展示 A 的配置（含 base_url 与凭据变量名），
 	// 而运维完全看不出这份配置不属于当前 provider。
 	if v.ProviderName != name {
-		s.writeError(w, r, http.StatusNotFound, "version_not_found",
+		a.writeError(w, r, http.StatusNotFound, "version_not_found",
 			"版本 "+strconv.FormatInt(id, 10)+" 不属于 provider "+name+
 				"。版本号是全局单调的，跨 provider 引用不成立")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"version": v})
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{"version": v})
 }
 
 // handleProviderRollback 处理 POST /admin/providers/{name}/rollback。
@@ -99,10 +95,10 @@ func (s *Server) handleProviderVersion(w http.ResponseWriter, r *http.Request) {
 // 回滚是**向前**的操作: 以目标版本的快照创建一个新版本，版本号继续递增，
 // 而不是把 provider_configs.version 改回旧值。后者会让版本链断裂 ——
 // 「当前生效的是哪个」与「哪些版本曾生效过」都读不出来。
-func (s *Server) handleProviderRollback(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderRollback(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
@@ -115,17 +111,17 @@ func (s *Server) handleProviderRollback(w http.ResponseWriter, r *http.Request) 
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "请求体非法: "+err.Error())
 		return
 	}
 	if body.TargetVersionID <= 0 {
-		s.writeError(w, r, http.StatusBadRequest, "invalid_request", "target_version_id 需为正整数")
+		a.writeError(w, r, http.StatusBadRequest, "invalid_request", "target_version_id 需为正整数")
 		return
 	}
 
 	cur, err := ps.GetProviderConfig(r.Context(), name)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
 		return
 	}
 
@@ -138,28 +134,28 @@ func (s *Server) handleProviderRollback(w http.ResponseWriter, r *http.Request) 
 	// 本层拦截的独有贡献，不是冗余。
 	target, err := ps.GetProviderVersion(r.Context(), body.TargetVersionID)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "读取目标配置版本失败")
+		a.writeProviderStoreErr(w, r, err, "读取目标配置版本失败")
 		return
 	}
 	if target.ProviderName != name {
-		s.writeError(w, r, http.StatusNotFound, "version_not_found",
+		a.writeError(w, r, http.StatusNotFound, "version_not_found",
 			"版本 "+strconv.FormatInt(body.TargetVersionID, 10)+" 不属于 provider "+name)
 		return
 	}
 	if target.Snapshot != nil && target.Snapshot.QuotaKind != cur.QuotaKind {
-		s.writeProviderImmutableConflict(w, r, http.StatusUnprocessableEntity, cur, *target.Snapshot)
+		a.writeProviderImmutableConflict(w, r, http.StatusUnprocessableEntity, cur, *target.Snapshot)
 		return
 	}
 
 	version, applied, err := ps.RollbackProvider(r.Context(), name,
 		body.TargetVersionID, body.Reason, adminActor(r), body.ExpectedVersion)
 	if err != nil {
-		s.writeProviderStoreErr(w, r, err, "回滚 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "回滚 provider 配置失败")
 		return
 	}
 
 	diff := ps.DiffProviderConfigs(cur, applied)
-	s.audit(r, "rollback_provider", name, map[string]any{
+	a.audit(r, "rollback_provider", name, map[string]any{
 		"version":           version,
 		"previous_version":  cur.Version,
 		"target_version_id": body.TargetVersionID,
@@ -169,8 +165,8 @@ func (s *Server) handleProviderRollback(w http.ResponseWriter, r *http.Request) 
 		"diff":              diff,
 	})
 
-	reloaded, newVersion := s.reloadAfterWrite(r, "rollback_provider", name)
-	writeJSON(w, http.StatusOK, map[string]any{
+	reloaded, newVersion := a.reloadAfterWrite(r, "rollback_provider", name)
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"provider":          applied,
 		"version":           version,
 		"target_version_id": body.TargetVersionID,
@@ -188,15 +184,15 @@ func (s *Server) handleProviderRollback(w http.ResponseWriter, r *http.Request) 
 // 预演不写库、不触发热加载，只回「若提交会怎样」: 校验结果 + 字段级差异。
 // 校验与差异都走真实提交用的同一个函数（validateProviderInput /
 // DiffProviderConfigs）—— 另写一套等于没有预演。
-func (s *Server) handleProviderDryRun(w http.ResponseWriter, r *http.Request) {
-	ps, ok := s.providerStore()
+func (a *API) handleProviderDryRun(w http.ResponseWriter, r *http.Request) {
+	ps, ok := a.providerStore()
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented", "当前部署未启用配置管理")
 		return
 	}
 
 	name := r.PathValue("name")
-	body, ok := s.decodeProviderBody(w, r)
+	body, ok := a.decodeProviderBody(w, r)
 	if !ok {
 		return
 	}
@@ -204,7 +200,7 @@ func (s *Server) handleProviderDryRun(w http.ResponseWriter, r *http.Request) {
 	cur, err := ps.GetProviderConfig(r.Context(), name)
 	isCreate := errors.Is(err, ErrProviderNotFound)
 	if err != nil && !isCreate {
-		s.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
+		a.writeProviderStoreErr(w, r, err, "读取 provider 配置失败")
 		return
 	}
 
@@ -269,7 +265,7 @@ func (s *Server) handleProviderDryRun(w http.ResponseWriter, r *http.Request) {
 	// 预演永远返回 200: 校验不通过是预演的正常结论而非请求错误。
 	// 用 4xx 表达「预演发现问题」会让前端无法区分「预演跑完了，结果是不合格」
 	// 与「预演本身没跑起来」。
-	writeJSON(w, http.StatusOK, resp)
+	httpcore.WriteJSON(w, http.StatusOK, resp)
 }
 
 // handleReloadConfig 处理 POST /admin/reload-config。
@@ -282,30 +278,30 @@ func (s *Server) handleProviderDryRun(w http.ResponseWriter, r *http.Request) {
 // 接到请求的那一个实例，其余实例继续用旧配置，而响应里依然写着「已生效」。
 // 那时必须补上 Redis pub/sub 广播或各实例轮询 provider_configs.version
 // 二者之一，并让本响应改为汇总各实例的生效状态。
-func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
-	rl, ok := s.store.(ProviderReloader)
+func (a *API) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
+	rl, ok := a.deps.Store().(ProviderReloader)
 	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "not_implemented",
+		a.writeError(w, r, http.StatusNotImplemented, "not_implemented",
 			"当前部署未启用配置热加载")
 		return
 	}
 
 	version, err := rl.ReloadProviderConfig(r.Context())
 	if err != nil {
-		s.log.ErrorContext(r.Context(), "配置热加载失败", "err", err,
-			"request_id", RequestIDFromContext(r.Context()))
+		a.deps.Log().ErrorContext(r.Context(), "配置热加载失败", "err", err,
+			"request_id", httpcore.RequestIDFromContext(r.Context()))
 		// 503 而非 500: 重载失败时进程仍在用旧快照正常服务，
 		// 这是「暂时没能生效，可重试」而不是「服务坏了」。
-		s.writeError(w, r, http.StatusServiceUnavailable, "reload_failed",
+		a.writeError(w, r, http.StatusServiceUnavailable, "reload_failed",
 			"配置热加载失败，进程仍在使用重载前的配置: "+err.Error())
 		return
 	}
 
-	s.audit(r, "reload_config", "provider_configs", map[string]any{
+	a.audit(r, "reload_config", "provider_configs", map[string]any{
 		"active_version": version,
 	})
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	httpcore.WriteJSON(w, http.StatusOK, map[string]any{
 		"reloaded":       true,
 		"active_version": version,
 		"scope":          "current_instance",
@@ -321,16 +317,16 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 // 以为改动没保存而重复提交，反而制造一串重复版本。但 reloaded=false 必须
 // 出现在响应里 —— 「已落库、进程仍用旧配置」这个中间态如果不说，
 // 运维会以为改动已经在生效，然后花很长时间排查一个「配置明明改了没用」的问题。
-func (s *Server) reloadAfterWrite(r *http.Request, action, target string) (bool, int64) {
-	rl, ok := s.store.(ProviderReloader)
+func (a *API) reloadAfterWrite(r *http.Request, action, target string) (bool, int64) {
+	rl, ok := a.deps.Store().(ProviderReloader)
 	if !ok {
 		return false, 0
 	}
 	version, err := rl.ReloadProviderConfig(r.Context())
 	if err != nil {
-		s.log.ErrorContext(r.Context(), "配置写入后热加载失败，进程仍在使用旧配置",
+		a.deps.Log().ErrorContext(r.Context(), "配置写入后热加载失败，进程仍在使用旧配置",
 			"action", action, "target", target, "err", err,
-			"request_id", RequestIDFromContext(r.Context()))
+			"request_id", httpcore.RequestIDFromContext(r.Context()))
 		return false, 0
 	}
 	return true, version

@@ -12,9 +12,6 @@ package gateway
 
 import (
 	"context"
-	cryptorand "crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +26,8 @@ import (
 	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/confsnap"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
+	"github.com/fluxkeys/fluxkeys/internal/gateway/adminapi"
+	"github.com/fluxkeys/fluxkeys/internal/httpcore"
 	"github.com/fluxkeys/fluxkeys/internal/metrics"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
 )
@@ -261,29 +260,11 @@ func (s *Server) routes() {
 	//
 	// APIKey 为空时完全不注册路由 —— 注册后靠中间件返回 403 是更差的做法:
 	// 一旦鉴权中间件因重构失效，管理接口就会裸奔。不注册则连路径都不存在。
+	//
+	// 具体路由表与各条路由的优先级说明（/admin/keys/ 与 {key_id} 的关系、
+	// shard 字面量段的优先级）已随实现迁到 internal/gateway/adminapi/api.go。
 	if s.cfg.Admin.APIKey != "" {
-		s.mux.Handle("/admin/keys", s.adminChain(s.handleAdminKeys))
-		s.mux.Handle("/admin/ips", s.adminChain(s.handleAdminIPs))
-		s.mux.Handle("/admin/keys/", s.adminChain(s.handleAdminKeyByID))
-		// 与上一行共存且优先。
-		//
-		// /admin/keys/ 的尾斜杠等价于匿名多段通配，而 {key_id} 是单段通配，
-		// 后者匹配的是前者的严格子集，故 ServeMux 判定新模式更具体、优先命中，
-		// 不会 panic。两者的分工是: PATCH /admin/keys/volc_001 命中这里，
-		// PUT /admin/keys/volc_001/ip 是两段路径、单段通配匹配不到，仍落到
-		// handleAdminKeyByID。
-		//
-		// 优先级由模式具体性决定而非注册顺序，紧挨着写只是为了阅读时能看到
-		// 两者的关系。路由冲突是注册期 panic（进程直接起不来），故另有一条
-		// 回归测试断言 New() 不 panic —— 推理正确不能替代对 panic 级故障的断言。
-		s.mux.Handle("PATCH /admin/keys/{key_id}", s.adminChain(s.handleAdminKeyPatch))
-		// shard 是字面量段，比 {key_id} 单段通配更具体，优先命中 ——
-		// 不依赖注册顺序。批量指派 Key 的机器归属，见 admin_shard.go。
-		s.mux.Handle("POST /admin/keys/shard", s.adminChain(s.handleAdminKeyShard))
-		s.mux.Handle("/admin/users", s.adminChain(s.handleAdminUsers))
-		s.mux.Handle("/admin/users/", s.adminChain(s.handleAdminUserByID))
-		// provider 配置管理，见 admin_provider.go。
-		s.providerRoutes()
+		adminapi.Register(s.mux, s)
 		s.log.Info("管理接口已启用")
 	} else {
 		s.log.Warn("admin.api_key 未配置，管理接口已完全禁用")
@@ -296,16 +277,17 @@ func (s *Server) routes() {
 type ctxKey int
 
 const (
-	ctxKeyRequestID ctxKey = iota
-	ctxKeyUser
+	// 请求 ID 的 context 键已下沉到 httpcore（管理面子包也要读它）。
+	// 本包只剩「已鉴权用户」这一个键。
+	ctxKeyUser ctxKey = iota
 )
 
 // RequestIDFromContext 取出请求 ID。
+//
+// 实现已下沉到 httpcore —— 管理面子包同样要读请求 ID，留在本包会让它反向依赖。
+// 保留同名薄包装，使本包既有的 20 处调用点无需改动。
 func RequestIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(ctxKeyRequestID).(string); ok {
-		return v
-	}
-	return ""
+	return httpcore.RequestIDFromContext(ctx)
 }
 
 // UserFromContext 取出已鉴权的用户。
@@ -327,16 +309,7 @@ func (s *Server) adminChain(h http.HandlerFunc) http.Handler {
 }
 
 func (s *Server) withRequestID(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 复用上游传入的请求 ID，保证跨系统链路可关联
-		id := r.Header.Get("X-Request-Id")
-		if id == "" {
-			id = newRequestID()
-		}
-		w.Header().Set("X-Request-Id", id)
-		ctx := context.WithValue(r.Context(), ctxKeyRequestID, id)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+	return httpcore.WithRequestID(next)
 }
 
 func (s *Server) withInFlight(endpoint string, next http.Handler) http.Handler {
@@ -548,46 +521,18 @@ func constantTimeEqual(a, b string) bool {
 	return v == 0
 }
 
-// errorEnvelope 是 OpenAI 风格的错误响应。
-type errorEnvelope struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code"`
-	} `json:"error"`
-}
-
 // writeError 写出统一格式的错误响应。
+//
+// 实现已下沉到 httpcore —— 管理面子包也要写同一种错误信封，留在本包会让它
+// 反向依赖。保留同名薄包装，使本包既有的 82 处调用点无需改动。
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
-	var e errorEnvelope
-	e.Error.Message = msg
-	e.Error.Code = code
-	e.Error.Type = errorTypeFor(status)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(e); err != nil {
-		s.log.WarnContext(r.Context(), "写出错误响应失败", "err", err)
-	}
+	httpcore.WriteError(w, r, s.log, status, code, msg)
 }
 
-func errorTypeFor(status int) string {
-	switch {
-	case status == http.StatusUnauthorized, status == http.StatusForbidden:
-		return "authentication_error"
-	case status == http.StatusTooManyRequests:
-		return "rate_limit_error"
-	case status >= 500:
-		return "server_error"
-	default:
-		return "invalid_request_error"
-	}
-}
-
+// writeJSON 是对 httpcore.WriteJSON 的薄包装，理由同 writeError
+// （本包既有 23 处调用点不动）。
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	httpcore.WriteJSON(w, status, v)
 }
 
 // readBody 读取并限长请求体。
@@ -650,20 +595,4 @@ func (s *Server) leaseTTLFor(stream bool) time.Duration {
 	return 120 * time.Second
 }
 
-// newRequestID 生成请求 ID。
-// newRequestID 生成一个 16 字节的伪随机 ID，编码为 32 字符十六进制串。
-//
-// 旧设计用 8 字节纳秒时间戳 + 4 字节随机数，在负载远低于生日悖论阈值时
-// 也会因「时间戳包含内部序列号字段，恰好撞、随机数也撞」而冲突（已实测
-// 观察到）。改用 crypto/rand.Read —— 它取默认 Reader（unix 上是
-// /dev/urandom，密码学级熵源），且无需 import 外部 UUID 库。
-//
-// 16 字节即 128 比特，生日悖论 1% 冲突概率的阈值是 2^64（约 1800 万亿次）；
-// 单进程 5000 QPS 全年也才 1500 亿次，实际冲突率 < 1e-10。
-func newRequestID() string {
-	var b [16]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
-		panic("crypto/rand: " + err.Error())
-	}
-	return "req_" + hex.EncodeToString(b[:])
-}
+// 请求 ID 的生成实现已下沉到 httpcore.NewRequestID。

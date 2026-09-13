@@ -27,7 +27,7 @@ func shardPost(t *testing.T, env *testEnv, body string) *http.Response {
 func TestAdminShard_批量指派并回报命中数(t *testing.T) {
 	env := newTestEnv(t)
 	// 预置两个 Key，第三个故意不存在
-	env.store.volcKeys = map[string]NewVolcKey{
+	env.store.upstreamKeys = map[string]NewUpstreamKey{
 		"volc_001": {KeyID: "volc_001"},
 		"volc_002": {KeyID: "volc_002"},
 	}
@@ -71,7 +71,7 @@ func TestAdminShard_批量指派并回报命中数(t *testing.T) {
 
 func TestAdminShard_重复ID去重后指派(t *testing.T) {
 	env := newTestEnv(t)
-	env.store.volcKeys = map[string]NewVolcKey{"volc_001": {KeyID: "volc_001"}}
+	env.store.upstreamKeys = map[string]NewUpstreamKey{"volc_001": {KeyID: "volc_001"}}
 
 	resp := shardPost(t, env,
 		`{"shard":"node-a","key_ids":["volc_001","volc_001","volc_001"]}`)
@@ -124,7 +124,7 @@ func TestAdminShard_允许空shard解除归属(t *testing.T) {
 	// shard 传空串是合法操作: 语义是「解除归属」，用于机器下线前摘流。
 	// 若把它当参数缺失拒绝，下线流程就没有 API 可走。
 	env := newTestEnv(t)
-	env.store.volcKeys = map[string]NewVolcKey{"volc_001": {KeyID: "volc_001"}}
+	env.store.upstreamKeys = map[string]NewUpstreamKey{"volc_001": {KeyID: "volc_001"}}
 
 	resp := shardPost(t, env, `{"shard":"","key_ids":["volc_001"],"reason":"机器A下线摘流"}`)
 	body := readAll(t, resp)

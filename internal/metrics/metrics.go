@@ -218,9 +218,6 @@ func New() *Metrics {
 	return m
 }
 
-// Registry 返回底层注册表，供测试与自定义 Collector 注册使用。
-func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
-
 // Handler 返回 /metrics 的 HTTP 处理器。
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{

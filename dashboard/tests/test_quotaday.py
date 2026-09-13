@@ -63,6 +63,32 @@ class TestQuotaDayBoundary:
         assert REFRESH_HOUR == 12
 
 
+class TestQuotaDayGoContract:
+    """与 Go 侧 ``internal/quota/quotaday.go`` 的契约对照。
+
+    Go 的 QuotaDayTime 规则只有一句：``if t.Hour() < RefreshHour { t = t.AddDate(0,0,-1) }``，
+    然后取该时刻的 Y/M/D。下面期望值全部按该规则**手工推导后硬编码**，
+    不经由 Python 的 quota_day 生成 —— 否则测试自证，抓不到两侧漂移。
+
+    秒级边界（11:59:59 / 12:00:00 / 12:00:01 / 00:00:00 / 23:59:59）已由
+    TestQuotaDayBoundary 钉死；这里补上「24 个整点的完整归属划分」，
+    覆盖其余 19 个整点，避免只在个别点对上、中间某小时错位却漏检。
+    """
+
+    def test_go_hour_partition_exhaustive(self) -> None:
+        # 期望值 = 「hour < 12 归前一日」这一 Go 规则的独立复述，非函数反推。
+        for hour in range(24):
+            moment = datetime(2026, 8, 23, hour, 0, 0, tzinfo=SH)
+            expected = date(2026, 8, 22) if hour < 12 else date(2026, 8, 23)
+            assert quota_day(moment) == expected, f"{hour:02d}:00 归属错误"
+
+    def test_go_rule_is_calendar_day_subtraction(self) -> None:
+        """退一日必须是日历减法（跨月/跨年/闰日都对），而非固定 24h。"""
+        assert quota_day(datetime(2026, 9, 1, 0, 0, 0, tzinfo=SH)) == date(2026, 8, 31)
+        assert quota_day(datetime(2026, 1, 1, 11, 59, 59, tzinfo=SH)) == date(2025, 12, 31)
+        assert quota_day(datetime(2024, 3, 1, 5, 0, 0, tzinfo=SH)) == date(2024, 2, 29)
+
+
 class TestMonthYearRollover:
     """跨月与跨年。用 date 减法而非字符串拼接，这里验证不会出现 0 日/13 月。"""
 

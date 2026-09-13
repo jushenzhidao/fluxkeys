@@ -77,6 +77,19 @@ type requestPlan struct {
 	finalUsage    *adapter.Usage
 	finalKeyID    string
 	finalEgressIP string
+
+	// committed 与 committedAmount 记录本次请求**实际从配额里扣掉**的量。
+	//
+	// 由 attempt 结束租约的地方回填（见 attempt 的 defer）。存在的理由: 让
+	// 流水与配额同源。若让 handlers 侧按对外状态码去猜，就会漏掉
+	// 「已按预扣量 Commit、但对外返回 502」的那几条路径 —— Redis 说扣了 1、
+	// 流水说 0，偏差方向是少记。
+	//
+	// 累加而非覆盖: 一次用户请求可能换 Key 重试，而每次重试都可能真实消耗
+	// 上游额度（例如第一次响应体超限、第二次成功）。逐次累加才能让
+	// 流水合计与 Redis 实扣合计严格相等。
+	committed       bool
+	committedAmount int64
 }
 
 // execute 执行一次用户请求，含换 Key 重试。
@@ -309,6 +322,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 		defer cancel()
 
 		if commitActual >= 0 {
+			// 先回填流水口径，再落 Commit。顺序无关紧要（两者都不依赖对方的结果），
+			// 但必须都执行: 只 Commit 不回填，就是「Redis 说扣了、流水说没扣」。
+			plan.committed = true
+			plan.committedAmount += commitActual
+
 			if cerr := s.quota.Commit(endCtx, lease, commitActual); cerr != nil {
 				s.log.ErrorContext(endCtx, "配额修正失败",
 					"request_id", plan.RequestID, "key_id", cand.KeyID,

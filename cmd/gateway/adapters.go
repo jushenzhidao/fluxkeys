@@ -181,6 +181,7 @@ func (a *schedulerAdapter) KeyStates(ctx context.Context) ([]gateway.KeyState, e
 	for _, k := range keys {
 		st := gateway.KeyState{
 			KeyID:      k.KeyID,
+			Provider:   k.Provider,
 			Status:     k.Status,
 			Pool:       k.Pool,
 			EgressIP:   k.EgressIP,
@@ -338,7 +339,7 @@ func (a *storeAdapter) AssignShard(ctx context.Context, shard string, keyIDs []s
 // 这比「先 SELECT 再判断」可靠: 后者在并发导入下有 TOCTOU 窗口，两个请求
 // 会同时报告 created。也比让 store 层加 RETURNING xmax = 0 更克制 —— 那是
 // 依赖 PostgreSQL 内部事务 ID 的技巧，换存储引擎即失效。
-func (a *storeAdapter) UpsertUpstreamKey(ctx context.Context, in gateway.NewVolcKey) (bool, error) {
+func (a *storeAdapter) UpsertUpstreamKey(ctx context.Context, in gateway.NewUpstreamKey) (bool, error) {
 	k, err := a.st.UpsertUpstreamKey(ctx, &store.UpstreamKey{
 		Provider:  in.Provider,
 		KeyID:     in.KeyID,
