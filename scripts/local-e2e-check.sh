@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# 本地端到端验证：真实网关二进制 + 真实 Redis + 真实 PostgreSQL + mockark 上游。
+# 本地端到端验证：真实网关二进制 + 真实 Redis + 真实 PostgreSQL + 假上游。
+#
+# 假上游的宿主是 test/mockark（测试夹具），由 test/mockark/cmd 以独立进程跑起来 ——
+# 这里必须用独立进程而不是进程内启动: 被测对象是「独立进程的网关」，上游若在
+# 同一进程内，就验不到网络层（连接、超时、流式 flush）。
 #
 # 覆盖: 配置加载 → 迁移 → provider seed → 出口 direct → 用户鉴权 →
 #       调度 → 配额 Lua 预扣 → 上游转发 → 用量落库。
@@ -47,12 +51,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 0. 构建 ==="
-go1.25.0 build -o /tmp/fk-mockark ./cmd/mockark || exit 1
+go1.25.0 build -o /tmp/fk-mockark ./test/mockark/cmd || exit 1
 go1.25.0 build -o /tmp/fk-gateway ./cmd/gateway || exit 1
-ok "已构建 mockark 与 gateway"
+ok "已构建假上游（test/mockark/cmd）与 gateway"
 
 echo
-echo "=== 1. 启动 mockark（上游）==="
+echo "=== 1. 启动假上游（test/mockark/cmd）==="
 /tmp/fk-mockark -addr "$MOCK_ADDR" -token-limit 100000 -count-limit 1000 >/tmp/fk-mockark.log 2>&1 &
 MOCK_PID=$!
 for i in $(seq 1 20); do
@@ -60,7 +64,7 @@ for i in $(seq 1 20); do
     sleep 0.3
 done
 curl -fsS -m 2 "http://${MOCK_ADDR}/_mock/stats" >/dev/null 2>&1 \
-    && ok "mockark 已就绪 ${MOCK_ADDR}" || { bad "mockark 未就绪"; cat /tmp/fk-mockark.log; exit 1; }
+    && ok "假上游已就绪 ${MOCK_ADDR}" || { bad "假上游未就绪"; cat /tmp/fk-mockark.log; exit 1; }
 
 echo
 echo "=== 2. 准备配置 ==="
@@ -153,7 +157,7 @@ UKEY=$(echo "$k" | python3 -c 'import sys,json;print(json.load(sys.stdin)["api_k
 [ -n "$UKEY" ] && ok "已签发用户 Key (user_id=${UID_})" || { bad "签发失败"; echo "$k"; exit 1; }
 
 echo
-echo "=== 6. 非流式请求（经网关 → mockark）==="
+echo "=== 6. 非流式请求（经网关 → 假上游）==="
 resp=$(curl -sS -m 60 -w '\n%{http_code}' -X POST "${GW_URL}/v1/chat/completions" \
     -H "Authorization: Bearer ${UKEY}" -H "Content-Type: application/json" \
     -d '{"model":"gpt-4","messages":[{"role":"user","content":"你好"}],"stream":false}')

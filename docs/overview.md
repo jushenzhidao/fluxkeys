@@ -19,10 +19,10 @@ V3 方案（1665 行）
 
 | | 文件 | 行数 |
 |---|---|---|
-| Go | 53 | 19,740（其中测试 9,443） |
-| Python 看板 | 15 | 4,183 |
+| Go | 106 | 35,867（其中测试 17,972） |
+| Python 看板 | 38 | 8,719 |
 
-Go 测试用例 297 个，Python 135 passed / 16 skipped。Go 直接依赖只有 4 个：pgx、go-redis、prometheus client、yaml。
+Go 测试用例 527 个，Python 310 passed / 18 skipped（跳过项为需真实 PG/Redis 的集成用例）。Go 直接依赖只有 4 个：pgx、go-redis、prometheus client、yaml。
 
 ## 架构要点
 
@@ -54,7 +54,8 @@ Go 测试用例 297 个，Python 135 passed / 16 skipped。Go 直接依赖只有
 
 ## 已验证行为
 
-`docker compose --profile mock up -d --build` 全栈端到端：
+以下行为在端到端形态下逐项验证过（当时假上游以本地全栈形态运行；该形态已收敛为
+`test/mockark` 的进程内夹具，等价的离线链路验证现由 `go test ./test/...` 承接）：
 
 - 8 次请求（7 非流式 + 1 流式）全部 200，落在 **8 个不同 Key** 上，合计 1419 tokens
 - 流式 SSE 完整走到 `data: [DONE]`
@@ -97,7 +98,7 @@ internal/egress/      可插拔出口层（direct / multi_ip）
 internal/gateway/     HTTP 服务 + 代理 + SSE + 限流 + 管理接口
 internal/store/       Postgres + AES-GCM 加密 + 异步用量流水
 internal/persona/     行为画像（时段窗口 + 节奏因子）
-cmd/mockark/          Mock 火山上游（离线验证全链路）
+test/mockark/         假上游夹具（集成测试进程内启动；cmd/ 是手工联调入口，不属产品）
 dashboard/            FastAPI 只读报表 + 轻前端
 deploy/               Prometheus + Grafana + alerts + setup-egress.sh
 .github/workflows/    ci.yml + release.yml

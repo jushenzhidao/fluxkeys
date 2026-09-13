@@ -17,7 +17,6 @@
 # 根目录直接 go build 出的二进制（27MB，绝不能进库）
 /gateway
 /fluxkeys-gateway
-/mockark
 /initdb
 *.exe
 *.test

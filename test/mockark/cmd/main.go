@@ -1,12 +1,21 @@
-// Command mockark 启动可控的火山 Ark Mock 上游。
+// Command mockrunner 把 test/mockark 夹具作为一个独立进程跑起来。
 //
-// 用途: 离线跑通网关全链路，并制造真实环境难以复现的异常（额度耗尽、429、
-// 流式中断），从而把「安心模式熔断」「换 Key 重试」「租约回收」变成
-// 可重复的确定性测试。
+// 存在理由: 假上游的宿主已经并入 test/mockark（不再是 internal/mockark +
+// cmd/mockark 那套「可发布的服务」形态）。但有两个场景需要它作为**独立进程**
+// 存在，而不是被测试在进程内启动:
+//
+//  1. scripts/local-e2e-check.sh —— 真实网关二进制 + 真实 Redis/PostgreSQL +
+//     真实上游地址的端到端验证。这里的被测对象是「独立进程的网关」，上游必须
+//     也是独立进程，否则验不到网络层（连接、超时、流式 flush）。
+//  2. 排查问题时手工起一个假上游观察流量。
+//
+// 它**不是产品的一部分**: 不被任何 Dockerfile target 构建、不发 GHCR 镜像、
+// 不出现在任何 compose 里 —— 那些都已随 mockark 一起移除。CI 也不跑它
+// （集成测试在进程内启动夹具，更快且无需端口）。
 //
 // 示例:
 //
-//	mockark -addr :18080 -token-limit 10000 -stream-delay 20ms
+//	go run ./test/mockark/cmd -addr :18080 -token-limit 10000 -stream-delay 20ms
 //	curl -s localhost:18080/_mock/stats | jq
 //	curl -sX POST localhost:18080/_mock/inject -d '{"kind":"429_quota","key_id":"volc_001","remaining":3}'
 package main
@@ -23,7 +32,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fluxkeys/fluxkeys/internal/mockark"
+	"github.com/fluxkeys/fluxkeys/test/mockark"
 )
 
 func main() {
@@ -67,7 +76,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("mockark 启动",
+		logger.Info("假上游（test/mockark）启动",
 			"addr", *addr, "token_limit", *tokenLimit, "count_limit", *countLimit,
 			"stream_delay", streamDelay.String(), "chunks", *chunks)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -77,15 +86,15 @@ func main() {
 
 	select {
 	case err := <-errCh:
-		logger.Error("mockark 监听失败", "err", err)
+		logger.Error("假上游监听失败", "err", err)
 		os.Exit(1)
 	case <-ctx.Done():
-		logger.Info("收到退出信号，关闭 mockark")
+		logger.Info("收到退出信号，关闭假上游")
 	}
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
-		logger.Error("mockark 关闭超时", "err", err)
+		logger.Error("假上游关闭超时", "err", err)
 	}
 }

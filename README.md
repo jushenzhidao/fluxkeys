@@ -25,12 +25,19 @@
 
 ## 快速开始
 
-默认配置指向内置的 Mock 火山服务，**无需任何真实 Key 即可跑通全链路**：
+`docker compose up` 拉起 Redis、Postgres、网关、看板与监控栈，但**不再内置假上游** ——
+上游默认指向真实火山地址（`https://ark.cn-beijing.volces.com`），业务链路需要真实火山 Key：
 
 ```bash
 cp .env.example .env      # 按提示填入随机密钥
 docker compose up -d
 ./scripts/smoke-test.sh          # 冒烟测试
+```
+
+**离线验证全链路**（无需任何真实 Key）改用进程内假上游的集成测试：
+
+```bash
+go test ./test/...
 ```
 
 访问：
@@ -77,7 +84,7 @@ sudo ./scripts/setup-egress.sh   # 配置网卡 + 策略路由，并逐 IP 验�
 
 ```
 cmd/gateway        网关主程序
-cmd/mockark        Mock 火山 Ark 服务（离线验证全链路）
+test/mockark       假上游夹具（集成测试进程内启动；另含手工联调入口 cmd/，非产品部件）
 internal/quota     配额管理：Lua 原子操作、租约、配额日、刷新探测
 internal/scheduler 五维打分调度引擎
 internal/egress    出口 IP 池与 Key-IP 绑定

@@ -28,11 +28,11 @@
 #      先 `docker compose down`（保留数据卷）再起本文件。
 #   2. 镜像策略: 默认用本地构建（image+build 并存，镜像缺失时 up 自动构建）。
 #      CI 已推 ghcr 时可预拉并改tag复用:
-#        docker pull ghcr.io/<owner>/fluxkeys-gateway:<ver>
-#        docker tag  ghcr.io/<owner>/fluxkeys-gateway:<ver> fluxkeys/gateway:<ver>
+#        docker pull ghcr.io/<owner>/fluxkeys:<ver>
+#        docker tag  ghcr.io/<owner>/fluxkeys:<ver> fluxkeys/gateway:<ver>
 #
 # 与本地形态（docker-compose.yml）的本质差异:
-#   - 无 mockark；上游默认真实火山地址（VOLC_BASE_URL 默认即生产值）
+#   - 上游默认真实火山地址（VOLC_BASE_URL 默认即生产值）
 #   - gateway 走 host 网络 —— multi_ip 模式要把 TCP 源地址绑到宿主机辅助 IP，
 #     bridge 容器看不到这些 IP，绑定会 EADDRNOTAVAIL 或静默退回主 IP（P1-6）
 #   - EGRESS_VERIFY_ON_START=true / REFRESH_ENABLED=true 默认开启（硬要求，
@@ -216,8 +216,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-redis-password}
       REDIS_DB: "0"
       POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:-change-me-pg-password}@127.0.0.1:5432/fluxkeys?sslmode=disable
-      # 默认即真实火山地址。写 mockark 地址会在运行期悄悄打假上游，别在
-      # 生产文件里开这个口子。
+      # 默认即真实火山地址。刻意不给「指向本地假上游」留默认值 ——
+      # 生产文件里留口子，只会在某次误配后悄悄打错上游。
       VOLC_BASE_URL: ${VOLC_BASE_URL:-https://ark.cn-beijing.volces.com}
       # 默认 multi_ip（本形态的核心能力）。过渡环境可在 .env 显式设 direct，
       # 但所有 Key 会共用主 IP 出口（P1-6 静默失效的风险自担）。

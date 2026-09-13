@@ -116,7 +116,7 @@ egress:
       max_keys: 8
 providers:
   volc:
-    base_url: "http://mockark:8081"
+    base_url: "https://ark.cn-beijing.volces.com"
     model_mapping:
       deepseek-v3: deepseek-v3-241226
 `

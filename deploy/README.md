@@ -4,7 +4,7 @@
 
 目录：
 
-- [快速开始](#快速开始)：本地离线跑通全链路
+- [快速开始](#快速开始)：起完整栈并做冒烟测试
 - [生产部署](#生产部署)：含出口 IP 配置
 - [生产切换清单](#生产切换清单)
 - [故障排查](#故障排查)
@@ -14,8 +14,8 @@
 
 ## 快速开始
 
-默认配置就是「离线可跑」形态：`EGRESS_MODE=direct` + 上游指向内置的 mockark 假服务，
-**不需要任何真实火山 Key**。
+`docker compose up` 起 Redis / Postgres / 网关 / 看板 / 监控栈，但**不再内置假上游**：
+上游默认指向真实火山地址（`https://ark.cn-beijing.volces.com`），业务链路需要真实火山 Key。
 
 ```bash
 # 1. 生成配置
@@ -33,6 +33,10 @@ docker compose up -d --build
 # 4. 冒烟测试
 bash scripts/smoke-test.sh
 ```
+
+> 没有真实 Key 时想验证整条链路，改用进程内假上游的集成测试：
+> `go test ./test/...` —— 假上游位于 `test/mockark`，随测试进程启动，
+> 不依赖任何外部服务（Redis/Postgres 也由内存实现替代）。
 
 访问入口：
 
@@ -473,8 +477,8 @@ curl -X POST http://127.0.0.1:9091/-/reload
 - [ ] `.env` 中 `REFRESH_ENABLED=true`
 - [ ] 密钥已用 `scripts/gen-prod-env.sh` 生成（或已轮换 compose 里的占位默认值），
       且 `FLUXKEYS_ENCRYPTION_KEY` 已备份到密钥管理系统（丢失不可恢复）
-- [ ] `.env` 中 `VOLC_BASE_URL` 指向真实火山地址，**不是 mockark**（生产默认值已是真实地址，核对未被覆盖）
-- [ ] `COMPOSE_PROFILES` 已去掉 `mock`
+- [ ] `.env` 中 `VOLC_BASE_URL` 指向真实火山地址（默认值即是，核对未被覆盖）
+- [ ] `COMPOSE_PROFILES` 按生产需要设置（如 `monitoring,backup`）
 - [ ] `FLUXKEYS_IMAGE_TAG` 是具体版本号，不是 `latest` / `dev`（首跑本地构建的 `dev` 除外）
 - [ ] `REDIS_PASSWORD` 已设置（非 compose 占位默认值）
 - [ ] `.env` 未被提交（`git check-ignore .env` 应有输出）
@@ -748,8 +752,8 @@ PROMETHEUS_HOST_PORT=19091
 GRAFANA_HOST_PORT=13000
 ```
 
-集成测试栈（`docker-compose.test.yml`）用 `TEST_POSTGRES_PORT` / `TEST_REDIS_PORT` /
-`TEST_MOCKARK_PORT` 避让。
+集成测试栈（`docker-compose.test.yml`）用 `TEST_POSTGRES_PORT` / `TEST_REDIS_PORT` 避让。
+假上游不在该栈里 —— 它是 `test/mockark` 的进程内夹具，不占端口。
 
 ### 冒烟测试报 502 或连接失败
 
@@ -942,8 +946,8 @@ CI 的 `deploy-lint` job 会自动执行这些测试。
 
 | 文件 | 用途 |
 |---|---|
-| `Dockerfile` | Go 侧多阶段构建，`--target gateway` / `--target mockark` |
-| `docker-compose.yml` | 本地/演示形态，默认离线可跑 |
+| `Dockerfile` | Go 侧多阶段构建，`--target gateway` |
+| `docker-compose.yml` | 本地/演示形态（不含假上游，业务链路需真实火山 Key） |
 | `docker-compose.prod.yml` | 生产形态（独立自包含），全参数默认化，一条命令部署 |
 | `docker-compose.test.yml` | CI/本地集成测试的最小依赖栈 |
 | `../.env.example` | 环境变量模板（仓库根目录，全项目唯一一份） |

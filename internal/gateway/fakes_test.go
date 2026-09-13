@@ -731,9 +731,9 @@ func newTestEnv(t *testing.T, opts ...func(*config.Config)) *testEnv {
 
 // upstreamStub 是一个可编程的假火山服务。
 //
-// 与 cmd/mockark 的分工: mockark 是完整的、可独立运行的 Mock 服务，
-// 用于集成测试与手工联调；这里的 stub 只服务单元测试，行为完全由测试
-// 逐条指定，不涉及记账与故障注入规则等状态。
+// 与 test/mockark 的分工: mockark 是完整的 Mock 上游，由集成测试在进程内
+// 启动；这里的 stub 只服务单元测试，行为完全由测试逐条指定，不涉及记账与
+// 故障注入规则等状态。
 type upstreamStub struct {
 	ts *httptest.Server
 	mu sync.Mutex

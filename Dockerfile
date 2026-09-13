@@ -1,7 +1,9 @@
-# FluxKeys Go 侧镜像 —— 多阶段构建，同一个 Dockerfile 产出两个 target。
+# FluxKeys Go 侧镜像 —— 多阶段构建，产出 gateway 一个 target。
 #
 #   docker build --target gateway -t fluxkeys/gateway:dev .
-#   docker build --target mockark -t fluxkeys/mockark:dev .
+#
+# 注：假上游（原 mockark）已不再作为可发布服务存在，改为 test/mockark 下的
+# 测试夹具，由集成测试在进程内启动，因此镜像里不再有对应的 target。
 #
 # 带版本信息的本地构建（注意 git rev-parse 在无提交的仓库会失败，用 || echo 兜底）：
 #   docker build --target gateway -t fluxkeys/gateway:dev \
@@ -66,9 +68,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -X main.commit=${GIT_COMMIT} \
       -X main.buildTime=${BUILD_TIME}"; \
     go build -trimpath -tags netgo,osusergo \
-        -ldflags "${LDFLAGS}" -o /out/gateway ./cmd/gateway; \
-    go build -trimpath -tags netgo,osusergo \
-        -ldflags "${LDFLAGS}" -o /out/mockark ./cmd/mockark
+        -ldflags "${LDFLAGS}" -o /out/gateway ./cmd/gateway
 
 # ============================================================================
 # Stage 2: 公共 runtime 基座
@@ -109,23 +109,3 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=40s --retries=3 \
     CMD wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:8080/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/gateway"]
-
-# ============================================================================
-# Stage 4: mockark（离线联调用的假上游）
-# ============================================================================
-FROM runtime-base AS mockark
-
-COPY --from=builder /out/mockark /usr/local/bin/mockark
-
-USER 65532:65532
-WORKDIR /home/nonroot
-
-# mockark 默认监听 :18080（见 cmd/mockark/main.go 的 -addr 默认值）
-EXPOSE 18080
-
-# mockark 没有 /healthz，它只暴露 /api/v3/* 与 /_mock/*。
-# 用 /_mock/stats 做探活 —— 它是纯内存读取，无副作用。
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:18080/_mock/stats || exit 1
-
-ENTRYPOINT ["/usr/local/bin/mockark"]

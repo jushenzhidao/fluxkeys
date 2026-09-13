@@ -13,8 +13,8 @@ import (
 
 	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
-	"github.com/fluxkeys/fluxkeys/internal/mockark"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
+	"github.com/fluxkeys/fluxkeys/test/mockark"
 )
 
 const itChat = `{"model":"gpt-4o","max_tokens":100,` +

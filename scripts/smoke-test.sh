@@ -5,14 +5,20 @@
 #
 # 目的：确认「docker compose up 之后系统真的能用」，而不只是容器 Running。
 # 容器健康检查只能说明进程活着，说明不了请求能不能跑通全链路
-# （网关 → 调度 → 配额 Lua → Egress → mockark → 回写用量）。
+# （网关 → 调度 → 配额 Lua → Egress → 上游 → 回写用量）。
 #
 # 用法:
 #   bash scripts/smoke-test.sh                       # 用默认地址
 #   GATEWAY_URL=http://1.2.3.4:8080 bash scripts/smoke-test.sh
 #   SKIP_DASHBOARD=1 bash scripts/smoke-test.sh      # 跳过看板检查
 #
-# 退出码: 0 全部通过；1 有失败项。可直接用于 CI 门禁。
+# 前提: **需要一个真实可用的上游**（本脚本会真的打一次 chat/completions）。
+#       仓库原本内置的假上游已移除（降级为 test/mockark 的测试夹具，由集成
+#       测试在进程内启动），因此本脚本不再能离线跑通。不需要真实 Key 的
+#       全链路验证请用: go test ./test/...
+#       也正因如此，CI 里不再调用本脚本（见 .github/workflows/ci.yml 的 smoke job）。
+#
+# 退出码: 0 全部通过；1 有失败项。
 #
 # 依赖: curl。jq 可选（有则做更严格的 JSON 断言，无则退化为字符串匹配）。
 # =============================================================================
@@ -59,7 +65,7 @@ if [[ -z "$ADMIN_API_KEY" ]]; then
   fi
 fi
 
-# 测试用模型名。mockark 应当接受任意模型名，这里用架构里提到的默认探测模型。
+# 测试用模型名。上游应接受任意模型名，这里用架构里提到的默认探测模型。
 TEST_MODEL="${TEST_MODEL:-deepseek-v3}"
 
 # 单个请求的超时。流式请求给更长时间。
@@ -561,7 +567,6 @@ summary() {
 诊断命令:
   docker compose ps
   docker compose logs --tail=100 gateway
-  docker compose logs --tail=50 mockark
 
 EOF
     return 1

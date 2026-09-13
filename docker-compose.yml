@@ -1,17 +1,20 @@
 # FluxKeys 单机部署编排（架构 v4 P0-5：单进程单实例）
 #
-# 快速开始（离线全链路，无需任何真实火山 Key）:
-#   cp .env.example .env && 按注释填三个密钥
+# 快速开始:
+#   cp .env.example .env && 按注释填密钥（含真实上游地址与真实 Key）
 #   docker compose up -d --build
 #   bash scripts/smoke-test.sh
 #
-# 默认形态 = 本地/演示形态：EGRESS_MODE=direct + VOLC_BASE_URL 指向 mockark。
-# 生产形态见文件末尾说明与 docker-compose.prod.yml。
+# 默认形态：EGRESS_MODE=direct + VOLC_BASE_URL 指向真实火山地址。
+#
+# ⚠️ 本编排**不再内置假上游**（原 mockark 已移除，见 test/mockark 的说明）。
+# 因此 `docker compose up` 需要一个真实可用的上游 Key 才能跑通调用链路。
+# 离线全链路验证改由 Go 集成测试承担（进程内启动假上游，无需任何真实 Key）:
+#   go test ./test/...
 #
 # Profile 说明:
-#   mock       - mockark 假上游。本地必开，生产关闭。
 #   monitoring - prometheus + grafana。按需开启。
-#   默认由 .env 里的 COMPOSE_PROFILES=mock,monitoring 控制。
+#   默认由 .env 里的 COMPOSE_PROFILES=monitoring 控制。
 
 name: fluxkeys
 
@@ -159,47 +162,6 @@ services:
           memory: 512M
 
   # =========================================================================
-  # mockark —— 火山 Ark 的假上游，让全链路可离线跑通
-  #
-  # profile=mock：生产环境把 COMPOSE_PROFILES 里的 mock 去掉即可不启动。
-  # 注意 gateway 刻意没有 depends_on mockark —— 上游只在处理请求时才被访问，
-  # 不是启动依赖；这样生产关掉 mock profile 时 gateway 也不会启动失败。
-  # =========================================================================
-  mockark:
-    profiles: ["mock"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: mockark
-      args:
-        VERSION: ${FLUXKEYS_IMAGE_TAG:-dev}
-    image: fluxkeys/mockark:${FLUXKEYS_IMAGE_TAG:-dev}
-    restart: unless-stopped
-    environment:
-      TZ: Asia/Shanghai
-    # mockark 通过 flag 配置，不读环境变量。默认 -addr :18080。
-    # stream-delay 给一点延迟，让流式响应更接近真实上游的分片节奏，
-    # 便于验证 SSE 转发是否及时 flush（不缓冲整个响应）。
-    command:
-      - -addr
-      - ":18080"
-      - -stream-delay
-      - 20ms
-    healthcheck:
-      # mockark 没有 /healthz，用无副作用的 /_mock/stats 探活
-      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:18080/_mock/stats"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
-          memory: 128M
-
-  # =========================================================================
   # gateway —— Go 网关主体
   # =========================================================================
   gateway:
@@ -237,8 +199,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       REDIS_DB: "0"
       POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@postgres:5432/fluxkeys?sslmode=disable
-      # 默认指向 mockark，这是「up 即可离线跑通」的关键开关
-      VOLC_BASE_URL: ${VOLC_BASE_URL:-http://mockark:18080}
+      # 默认指向真实火山地址。本地/CI 的离线验证走 go test ./test/...
+      VOLC_BASE_URL: ${VOLC_BASE_URL:-https://ark.cn-beijing.volces.com}
       EGRESS_MODE: ${EGRESS_MODE:-direct}
       EGRESS_IPS: ${EGRESS_IPS:-}
       EGRESS_VERIFY_ON_START: ${EGRESS_VERIFY_ON_START:-false}

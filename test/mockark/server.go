@@ -1,4 +1,4 @@
-// Package mockark 实现火山引擎 Ark 的可控 Mock 上游。
+// Package mockark 是集成测试用的可控火山 Ark 假上游（测试夹具）。
 //
 // 存在意义: 全链路的正确性依赖大量「上游异常」路径 —— 额度耗尽熔断、429
 // 换 Key、401 禁用 Key、流式中断后的租约回收。这些在真实火山上既无法稳定
@@ -8,8 +8,9 @@
 // P1-6 的失效模式是静默的（策略路由未配置时流量会全部走主 IP 而不报错），
 // 只有在上游侧观察源 IP 才能证明「Key-IP 绑定」真的生效。
 //
-// 本包被设计为可 in-process 启动（NewServer 返回 http.Handler），
-// 集成测试无需拉起子进程。
+// 本夹具通常由集成测试在进程内启动（NewServer 返回 http.Handler），
+// 无需拉起子进程。它不随发布流程构建镜像、也不出现在任何 compose 里；
+// test/mockark/cmd 那个独立入口只供手工联调与本地 e2e 使用，不属产品。
 package mockark
 
 import (

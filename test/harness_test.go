@@ -3,14 +3,14 @@
 // 与 internal/gateway 的单元测试的分工:
 //
 //	单元测试用逐条编程的假上游，验证「网关对某个具体响应的反应是否正确」；
-//	本包用真实的 cmd/mockark 服务，验证「整条链路在真实协议下能否跑通」。
+//	本包用 test/mockark 假上游（测试进程内启动），验证「整条链路在真实协议下能否跑通」。
 //
 // 后者能抓到前者抓不到的问题: 假上游是按测试的期望写的，若网关和假上游
 // 对协议的理解同时错了（比如都以为 usage 一定在 [DONE] 之前），单元测试
-// 会全绿而线上失败。mockark 按火山的真实报文格式实现，是独立的第二份实现。
+// 会全绿而线上失败。假上游按火山的真实报文格式实现，是独立的第二份实现。
 //
 // 仍被替换的是 Redis 与 Postgres —— 它们需要外部进程，而本包必须能在
-// 无依赖的 CI 环境里跑（离线验证全链路是 mockark 存在的全部理由）。
+// 无依赖的 CI 环境里跑（离线验证全链路是假上游存在的全部理由）。
 package test
 
 import (
@@ -31,8 +31,8 @@ import (
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/gateway"
 	"github.com/fluxkeys/fluxkeys/internal/metrics"
-	"github.com/fluxkeys/fluxkeys/internal/mockark"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
+	"github.com/fluxkeys/fluxkeys/test/mockark"
 )
 
 // ===== 内存调度器 =====

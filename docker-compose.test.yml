@@ -1,5 +1,8 @@
-# CI / 本地集成测试用的最小依赖栈 —— 只起 postgres + redis + mockark，
+# CI / 本地集成测试用的最小依赖栈 —— 只起 postgres + redis，
 # 不起 gateway/dashboard（被测代码由 go test 在宿主机进程内跑）。
+#
+# 假上游不在这里: 它已是 test/mockark 的进程内夹具，由集成测试自行启动，
+# 既不需要容器也不需要端口 —— 这正是它从独立服务降级为测试夹具的目的。
 #
 # 用法:
 #   docker compose -f docker-compose.test.yml up -d --wait
@@ -81,20 +84,3 @@ services:
       retries: 20
       start_period: 2s
 
-  mockark:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: mockark
-    image: fluxkeys/mockark:test
-    environment:
-      TZ: Asia/Shanghai
-    ports:
-      - "127.0.0.1:${TEST_MOCKARK_PORT:-18080}:18080"
-    healthcheck:
-      # mockark 没有 /healthz，用无副作用的 /_mock/stats 探活
-      test: ["CMD-SHELL", "wget -q -O /dev/null --tries=1 --timeout=2 http://127.0.0.1:18080/_mock/stats"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-      start_period: 2s

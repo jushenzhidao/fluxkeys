@@ -170,32 +170,14 @@ jobs:
           echo "已建表："
           psql -h 127.0.0.1 -U fluxkeys -d fluxkeys -c '\dt'
 
-      - name: 启动 mockark 假上游
-        run: |
-          # 后台跑 mockark，供适配层集成测试使用。
-          # nohup + 重定向，避免 job 结束时的信号影响，日志留档便于排查。
-          go build -o /tmp/mockark ./cmd/mockark
-          nohup /tmp/mockark > /tmp/mockark.log 2>&1 &
-          # 轮询等待就绪，而不是 sleep 固定秒数
-          for _ in $(seq 1 30); do
-            # mockark 只暴露 /api/v3/* 与 /_mock/*，没有 /healthz
-            if curl -fsS http://127.0.0.1:18080/_mock/stats > /dev/null 2>&1; then
-              echo "mockark 已就绪"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "mockark 启动超时，日志："
-          cat /tmp/mockark.log
-          exit 1
-
       - name: 集成测试
         env:
           # 变量名与 internal/config/config.go 的 applyEnv 一致
           REDIS_ADDR: 127.0.0.1:6379
           REDIS_DB: "0"
           POSTGRES_DSN: postgres://fluxkeys:fluxkeys@127.0.0.1:5432/fluxkeys?sslmode=disable
-          VOLC_BASE_URL: http://127.0.0.1:18080
+          # 不需要 VOLC_BASE_URL: 集成测试自己在进程内启动假上游，并把
+          # 配置里的 base_url 直接指向它（见 test/harness_test.go）。
           EGRESS_MODE: direct
           EGRESS_VERIFY_ON_START: "false"
           ADMIN_API_KEY: ci-admin-key
@@ -206,10 +188,6 @@ jobs:
           # -tags=integration 让需要外部依赖的测试与单测分离。
           # 若代码里没有用这个 build tag，这条命令等价于跑全部测试，不会失败。
           go test -race -tags=integration -count=1 ./... 2>&1 | tee integration.txt
-
-      - name: 失败时输出 mockark 日志
-        if: failure()
-        run: cat /tmp/mockark.log || true
 
   # =========================================================================
   # 出口 IP 绑定验证 —— 必须在 Linux 上跑，且需要 NET_ADMIN
@@ -465,8 +443,9 @@ jobs:
     name: 镜像构建验证
     runs-on: ubuntu-24.04
     strategy:
+      # 只剩 gateway: mockark 的 Dockerfile target 与镜像包都已移除（见 test/mockark）
       matrix:
-        target: [gateway, mockark]
+        target: [gateway]
     steps:
       - uses: actions/checkout@v4
 
@@ -505,13 +484,17 @@ jobs:
           echo "### ${{ matrix.target }} 镜像体积: $((size / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  # 端到端冒烟 —— 用 compose 起全栈跑 smoke-test.sh
+  # 全栈启动冒烟 —— 用 compose 起全栈，验证基础端点可达
   #
-  # 这是最接近"用户真实体验"的验证：如果这个 job 过了，说明
-  # `docker compose up` 确实能开箱跑通全链路。
+  # 覆盖: 全栈能 --wait 起来（含 healthcheck）、/healthz、/readyz、
+  #       管理端点鉴权生效、看板可访问。
+  #
+  # 不覆盖: 网关 → 上游的调用链路。CI 里没有可用的真实上游，而假上游已从产品
+  # 中移除（降级为 test/mockark 的测试夹具）。那条链路由 integration job 的
+  # Go 集成测试覆盖 —— 它在进程内启动假上游，不需要真实 Key 也不需要容器。
   # =========================================================================
   smoke:
-    name: Compose 端到端冒烟
+    name: Compose 全栈启动冒烟
     runs-on: ubuntu-24.04
     # 依赖镜像构建，避免构建失败时白跑
     needs: [docker-build]
@@ -531,12 +514,15 @@ jobs:
           DASHBOARD_SESSION_SECRET=ci-session-secret-0123456789abcdef0123456789abcdef
           FLUXKEYS_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000001
           EGRESS_MODE=direct
-          VOLC_BASE_URL=http://mockark:18080
+          # 刻意不设 VOLC_BASE_URL: 默认即真实火山地址，而 CI 无真实上游，
+          # 本 job 因此只验证可达性，不验证调用链路（见 job 头注释）。
           # provider seed 回退依赖全局配额原始值（provider_configs 有
           # quota_limit > 0 的 CHECK 约束），显式声明以免依赖 compose 默认值
           QUOTA_TOKEN_LIMIT=5000000
           REFRESH_ENABLED=false
-          COMPOSE_PROFILES=mock
+          # 空 profile: 只起 redis/postgres/gateway/dashboard。
+          # monitoring 会额外拉起 prometheus+grafana，本 job 用不上。
+          COMPOSE_PROFILES=
           EOF
 
       - name: 启动全栈
@@ -545,8 +531,46 @@ jobs:
           # 比自己写轮询更可靠
           docker compose up -d --build --wait --wait-timeout 300
 
-      - name: 冒烟测试
-        run: bash scripts/smoke-test.sh
+      - name: 全栈可达性断言
+        run: |
+          # 注意这里**不用** scripts/smoke-test.sh: 那个脚本的核心是「打一次
+          # 真实上游调用」，而 CI 没有可用上游。改成显式断言，避免脚本为了
+          # 兼容 CI 而多出一个「跳过上游」的分支（静默跳过比不检查更危险）。
+          set -euo pipefail
+          GW=http://localhost:8080
+
+          echo "=== /healthz ==="
+          curl -fsS "$GW/healthz" && echo
+
+          echo "=== /readyz（会真的检查 Redis/Postgres）==="
+          curl -fsS "$GW/readyz" && echo
+
+          echo "=== 管理端点鉴权生效（不带密钥应为 401）==="
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$GW/admin/keys")
+          if [ "$code" != "401" ]; then
+            echo "::error::/admin/keys 未带密钥应返回 401，实际 $code"
+            exit 1
+          fi
+          echo "  401 ✓"
+
+          echo "=== 看板可达（未登录 302/303 到登录页）==="
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/)
+          case "$code" in
+            200|302|303) echo "  $code ✓" ;;
+            *) echo "::error::看板根路径返回 $code"; exit 1 ;;
+          esac
+
+          echo "=== 业务端点需要用户鉴权（未带密钥应为 401）==="
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"x","messages":[{"role":"user","content":"hi"}]}')
+          if [ "$code" != "401" ]; then
+            echo "::error::/v1/chat/completions 未鉴权应返回 401，实际 $code"
+            exit 1
+          fi
+          echo "  401 ✓"
+
+          echo "全栈可达性断言全部通过（上游调用链路见 integration job）"
 
       - name: 失败时收集日志
         if: failure()
@@ -555,8 +579,6 @@ jobs:
           docker compose ps -a
           echo "===== gateway ====="
           docker compose logs --tail=200 gateway
-          echo "===== mockark ====="
-          docker compose logs --tail=100 mockark
           echo "===== dashboard ====="
           docker compose logs --tail=100 dashboard
           echo "===== postgres ====="

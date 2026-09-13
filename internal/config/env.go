@@ -52,12 +52,12 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("VOLC_BASE_URL"); v != "" {
 		// 这条不是兼容垫片，而是**唯一**的 provider 级 base_url 环境变量覆盖 ——
-		// 本地与 CI 用它把 volc 指向 mockark 假上游（compose 默认即
-		// http://mockark:18080），生产用它指回真实火山地址。
+		// 需要把 volc 指向别的上游（默认已是真实火山地址，联调/自建代理时才改）
+		// 时用它，不必改 YAML。
 		//
-		// 没有通用的 PROVIDER_<name>_BASE_URL 机制，所以删掉它会同时打断
-		// 「离线可跑」与 CI 链路。其他 provider 的地址只能写进 YAML
-		// 或经 /admin/providers 改（见 docs/provider-config-hotreload.md）。
+		// 没有通用的 PROVIDER_<name>_BASE_URL 机制，所以删掉它会让
+		// 「不改 YAML 就换 volc 上游地址」这条路断掉。其他 provider 的地址只能
+		// 写进 YAML 或经 /admin/providers 改（见 docs/provider-config-hotreload.md）。
 		if p, ok := cfg.Providers["volc"]; ok {
 			p.BaseURL = v
 			cfg.Providers["volc"] = p

@@ -63,10 +63,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 单一镜像包名 fluxkeys —— 原 fluxkeys-gateway 与 fluxkeys-mockark
+          # 两个包已合并。假上游不再作为可发布服务存在（见 test/mockark），
+          # 故这里只剩 gateway 一个目标。
           - target: gateway
-            image: fluxkeys-gateway
-          - target: mockark
-            image: fluxkeys-mockark
+            image: fluxkeys
 
     steps:
       - uses: actions/checkout@v4
@@ -215,8 +216,7 @@ jobs:
             echo "## 镜像"
             echo ""
             echo '```bash'
-            echo "docker pull ghcr.io/$owner/fluxkeys-gateway:${version#v}"
-            echo "docker pull ghcr.io/$owner/fluxkeys-mockark:${version#v}"
+            echo "docker pull ghcr.io/$owner/fluxkeys:${version#v}"
             echo '```'
             echo ""
             echo "支持架构：\`linux/amd64\`、\`linux/arm64\`"
