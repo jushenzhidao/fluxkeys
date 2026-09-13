@@ -67,7 +67,7 @@ func TestCount_响应超限时流水仍记实扣量(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("流水条数 = %d, 期望 1", len(recs))
 	}
-	if got := recs[0].CountUnits; int64(got) != used {
+	if got := recs[0].CountUnits; got != used {
 		t.Errorf("流水 count_units = %d, Redis 实扣 = %d —— 账面与配额不一致（偏差方向=少记）",
 			got, used)
 	}
@@ -93,7 +93,7 @@ func TestCount_成功路径流水与实扣一致(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("流水条数 = %d, 期望 1", len(recs))
 	}
-	if got := recs[0].CountUnits; int64(got) != used {
+	if got := recs[0].CountUnits; got != used {
 		t.Errorf("流水 count_units = %d, Redis 实扣 = %d", got, used)
 	}
 }

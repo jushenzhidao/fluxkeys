@@ -10,8 +10,7 @@
 # 不产生的副作用: 不访问任何真实上游域名，用独立 Redis DB(14) 与独立端口。
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
-REPO="$(pwd)"
+cd "$(dirname "$0")/.." || exit 1
 
 export PATH="$HOME/go/bin:$PATH"
 # curl 不会自动绕过回环: 不设 NO_PROXY 时本地请求会被 HTTP_PROXY 代理走，
@@ -37,7 +36,8 @@ PG_PORT=15434
 
 # 上游 Key 的密文存储需要 32 字节 hex 密钥；缺失时 store 会拒绝启动
 # （这是刻意的：宁可起不来也不明文存密钥）。本地测试用一次性随机值即可。
-export FLUXKEYS_ENCRYPTION_KEY="$(python3 -c 'import os;print(os.urandom(32).hex())')"
+FLUXKEYS_ENCRYPTION_KEY="$(python3 -c 'import os;print(os.urandom(32).hex())')"
+export FLUXKEYS_ENCRYPTION_KEY
 
 FAILS=0
 ok()   { echo "✅ $*"; }
@@ -59,7 +59,7 @@ echo
 echo "=== 1. 启动假上游（test/mockark/cmd）==="
 /tmp/fk-mockark -addr "$MOCK_ADDR" -token-limit 100000 -count-limit 1000 >/tmp/fk-mockark.log 2>&1 &
 MOCK_PID=$!
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     curl -fsS -m 2 "http://${MOCK_ADDR}/_mock/stats" >/dev/null 2>&1 && break
     sleep 0.3
 done
@@ -119,7 +119,7 @@ echo "=== 3. 启动网关 ==="
 /tmp/fk-gateway -config /tmp/fk-e2e.yaml >/tmp/fk-gateway.log 2>&1 &
 GW_PID=$!
 ready=0
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
     # 必须校验响应体形状，不能只看「有 200」。
     # 端口被别的服务占用时，健康探测会对着那个服务拿到 200，
     # 于是整轮断言都在测一个与本次部署无关的进程。

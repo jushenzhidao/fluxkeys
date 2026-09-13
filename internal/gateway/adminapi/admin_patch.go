@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/fluxkeys/fluxkeys/internal/egress"
 	"github.com/fluxkeys/fluxkeys/internal/httpcore"
-	"slices"
 )
 
 // PATCH /admin/keys/{key_id}: 调整 Key 的状态、池与画像。
