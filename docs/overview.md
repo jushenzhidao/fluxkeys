@@ -82,8 +82,8 @@ Go 测试用例 527 个，Python 310 passed / 18 skipped（跳过项为需真实
 
 ## 上线前必做
 
-1. **策略路由**。云厂商绑定辅助私网 IP 后，OS 不会自动配置到网卡也不建路由表，此时按 Key 绑定出口会**静默失效**（不报错，只是不生效，所有 Key 共享主 IP）。必须执行 `deploy/setup-egress.sh` 并保持 `egress.verify_on_start=true`——启动自检失败即拒绝启动，宁可起不来也不要带着失效的反封禁设计接流量。
-2. **切换真实上游**。`VOLC_BASE_URL` 指向火山，`EGRESS_MODE=multi_ip`。
+1. **策略路由**。云厂商绑定辅助私网 IP 后，OS 不会自动配置到网卡也不建路由表，此时按 Key 绑定出口会**静默失效**（不报错，只是不生效，所有 Key 共享主 IP）。必须执行 `deploy/setup-egress.sh` 并保持 `egress.verify_on_start=true`——启动自检失败即拒绝启动，宁可起不来也不要带着失效的反封禁设计接流量。出口地址既可逐条写进 `EGRESS_IPS`，也可设 `EGRESS_IPS_SOURCE=scan` 让网关扫描本机网卡（过滤规则与分档计划见 `deploy/README.md`）。
+2. **切换真实上游**。`EGRESS_MODE=multi_ip`；volc 地址默认就是真实火山（不再需要设 `VOLC_BASE_URL`——它一旦非空就会盖掉配置文件里的 provider 地址，只在确实要指向别处时才设）。
 3. **业务端口前置 TLS**。compose 的网关端口绑 0.0.0.0，生产需在前面加 Nginx/Caddy 终止 TLS。
 4. **导入 Key 并确认容量**。用 `POST /admin/keys` 批量导入后，检查启动日志的 `max_qps_now` 是否满足预期流量。
 5. **付费渠道 fallback 默认关闭**。启用时配置校验强制要求设置 `daily_budget_cents`。
