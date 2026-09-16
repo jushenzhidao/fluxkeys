@@ -230,6 +230,17 @@ func (s *memStore) UpsertUpstreamKey(ctx context.Context, in gateway.NewUpstream
 	return !existed, nil
 }
 
+// DeleteUpstreamKey 从内存表删除 Key，复刻存储层「影响 0 行即不存在」。
+func (s *memStore) DeleteUpstreamKey(ctx context.Context, keyID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.keys[keyID]; !ok {
+		return fmt.Errorf("%w: %s", gateway.ErrKeyNotFound, keyID)
+	}
+	delete(s.keys, keyID)
+	return nil
+}
+
 // PatchUpstreamKeyState 在内存中复刻局部更新语义。
 //
 // 复用 keys 这张表而非另开一张: 集成测试里 PATCH 的对象就是刚导入的 Key，

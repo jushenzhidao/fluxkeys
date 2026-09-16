@@ -415,6 +415,15 @@ func (a *storeAdapter) SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP s
 	return a.st.UpdateUpstreamKeyState(ctx, keyID, store.UpstreamKeyState{EgressIP: &egressIP})
 }
 
+// DeleteUpstreamKey 按 key_id 删除上游 Key，委托底层存储。
+//
+// 出口绑定的回收不在这里做: 它属于「管理面 DELETE 端点」这一调用方的职责，
+// 与删行成同一事务。把解绑塞进存储适配层会让「删行成功但解绑失败」的降级
+// 无处安放 —— 端点层才能决定「已删的行要不要回滚」。
+func (a *storeAdapter) DeleteUpstreamKey(ctx context.Context, keyID string) error {
+	return a.st.DeleteUpstreamKey(ctx, keyID)
+}
+
 // Ping 检查 Postgres 可达性。
 //
 // store 未暴露 Ping，直接用底层连接池 —— 用一条真实 SQL 探测会把

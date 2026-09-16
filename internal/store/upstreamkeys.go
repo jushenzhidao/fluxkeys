@@ -147,6 +147,28 @@ func (s *Store) GetUpstreamKey(ctx context.Context, keyID string) (*UpstreamKey,
 	return k, nil
 }
 
+// DeleteUpstreamKey 按 key_id 删除一个上游 Key。
+//
+// 只删元数据行: 出口绑定的回收由调用方（管理面 DELETE 端点）同步调
+// egress.Pool.Release 完成 —— 删行与解绑必须成对，只做一边都会留下不一致
+// （前者是 KI-035 根因的「容量假满」，后者是残留客户端泄漏）。本方法刻意
+// 不碰 egress，保证「删行」这一动作的幂等与可测。
+//
+// 影响 0 行视为不存在，返回 ErrNotFound，让上层映射为 404。
+func (s *Store) DeleteUpstreamKey(ctx context.Context, keyID string) error {
+	if keyID == "" {
+		return errors.New("store: key_id 不能为空")
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM upstream_keys WHERE key_id = $1`, keyID)
+	if err != nil {
+		return fmt.Errorf("store: 删除上游 Key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListUpstreamKeys 按条件列出上游 Key。
 //
 // filter.WithSecret 为 true 时才解密密钥 —— 看板、状态列表等只读场景不该

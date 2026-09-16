@@ -406,6 +406,26 @@ func (f *fakeStore) SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP stri
 	return nil
 }
 
+// DeleteUpstreamKey 复刻「删行 + 清内存态」语义。
+//
+// 同时清 upstreamKeys / keyMeta / egressIPs 三处: 真实存储删行后若内存态
+// 残留，PATCH 还能改到一个已删 Key 的元数据、出口 IP 还能查到已删 Key 的绑定，
+// 与测试收尾被迫用 SQL 直删时遇到的「容量假满」同源。fake 一次清干净，
+// DELETE 端点的「删行与解绑同事务」不变量在测试里才断言得出来。
+func (f *fakeStore) DeleteUpstreamKey(ctx context.Context, keyID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.upstreamKeys[keyID]; !ok {
+		if _, ok2 := f.keyMeta[keyID]; !ok2 {
+			return fmt.Errorf("%w: %s", ErrKeyNotFound, keyID)
+		}
+	}
+	delete(f.upstreamKeys, keyID)
+	delete(f.keyMeta, keyID)
+	delete(f.egressIPs, keyID)
+	return nil
+}
+
 // egressIPOf 返回落库的出口 IP。
 func (f *fakeStore) egressIPOf(keyID string) (string, bool) {
 	f.mu.Lock()

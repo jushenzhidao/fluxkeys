@@ -279,6 +279,10 @@ EGRESS_IPS=\
 - **`max_keys` 能调高的前提是行为画像已收窄**（见 `internal/persona`）。
   画像决定同一 IP 上有多少 Key 会在同一时刻活跃。沿用宽时段画像却调高
   `max_keys`，等于直接提高被识别的概率。
+- **移除 Key 用 `DELETE /admin/keys/{id}`**，不要直接 `DELETE FROM upstream_keys`。
+  删行与出口解绑（`egress.Release`）必须在同一次调用里完成——只删库会让
+  网关内存里的绑定「权威副本」不感知，表现为候选集恒空、新 Key 全部 502
+  的容量假满（KI-035 根因）。`DELETE` 端点已把这条同事务语义封装好。
 
 ##### 出口地址不想手抄？改用扫描（`EGRESS_IPS_SOURCE=scan`）
 

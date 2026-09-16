@@ -218,6 +218,13 @@ type Store interface {
 	// 会把 Key 换回原来的出口，等于凭空制造一次「老账号换了 IP」。
 	SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP string) error
 
+	// DeleteUpstreamKey 按 key_id 删除一个上游 Key。
+	//
+	// 只删元数据行: 出口绑定的回收由调用方（管理面 DELETE 端点）同步完成，
+	// 见 egress.Pool.Release。删行与解绑必须成对，否则留下容量假满或
+	// 残留客户端的单侧不一致。
+	DeleteUpstreamKey(ctx context.Context, keyID string) error
+
 	// Ping 检查数据库可达性，供 /readyz 使用。
 	Ping(ctx context.Context) error
 }

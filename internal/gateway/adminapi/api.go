@@ -42,6 +42,10 @@ func Register(mux *http.ServeMux, d Deps) {
 	// 回归测试断言 New() 不 panic —— 推理正确不能替代对 panic 级故障的断言。
 	mux.Handle("PATCH /admin/keys/{key_id}", d.AdminChain(a.handleAdminKeyPatch))
 
+	// DELETE 与 PATCH 同形（方法 + 单段 {key_id}），互不冲突；
+	// 两者都优先于 /admin/keys/ 子树，不会落到 handleAdminKeyByID。
+	mux.Handle("DELETE /admin/keys/{key_id}", d.AdminChain(a.handleAdminKeyDelete))
+
 	// shard 是字面量段，比 {key_id} 单段通配更具体，优先命中 ——
 	// 不依赖注册顺序。批量指派 Key 的机器归属，见 admin_shard.go。
 	mux.Handle("POST /admin/keys/shard", d.AdminChain(a.handleAdminKeyShard))

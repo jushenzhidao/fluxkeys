@@ -54,6 +54,8 @@ func TestRegister_路由表与优先级(t *testing.T) {
 		{http.MethodPut, "/admin/keys/volc_001/ip", "/admin/keys/"},
 		// {key_id} 单段通配比 /admin/keys/ 多段通配更具体，故优先
 		{http.MethodPatch, "/admin/keys/volc_001", "PATCH /admin/keys/{key_id}"},
+		// DELETE 与 PATCH 同形（方法 + 单段 {key_id}），互不冲突
+		{http.MethodDelete, "/admin/keys/volc_001", "DELETE /admin/keys/{key_id}"},
 		// shard 是字面量段，比 {key_id} 更具体
 		{http.MethodPost, "/admin/keys/shard", "POST /admin/keys/shard"},
 		{http.MethodGet, "/admin/users", "/admin/users"},
@@ -88,10 +90,10 @@ func TestRegister_路由表与优先级(t *testing.T) {
 	// 这条断言是安全相关的: 管理面能改 Key 状态、导入密钥、换出口 IP。
 	// 漏包一层 = 该端点裸奔，而「少写了一处 a.deps.AdminChain」在 review 里
 	// 极难看出来 —— 它只是少一层函数调用，没有语法差异。
-	// Register 共注册 18 条路由模式（Key/用户 7 条 + provider 11 条）。
-	// 上表的 20 条路径里有两条（/admin/keys/ 与 /admin/users/）各由多条路径
+	// Register 共注册 19 条路由模式（Key/用户 8 条 + provider 11 条）。
+	// 上表的 21 条路径里有两条（/admin/keys/ 与 /admin/users/）各由多条路径
 	// 命中同一模式，所以这里比的是「模式数」而不是「用例数」。
-	const wantPatterns = 18
+	const wantPatterns = 19
 	if d.chains != wantPatterns {
 		t.Errorf("AdminChain 被调用 %d 次，期望 %d —— 每条注册的路由都必须过它",
 			d.chains, wantPatterns)

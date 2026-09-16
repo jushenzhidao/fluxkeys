@@ -225,6 +225,7 @@ httpx.Timeout(connect=3.0, read=<按端点>, write=10.0, pool=3.0)
 |---|---|---|
 | `PUT /admin/keys/{id}/ip` | 15s | `Rebind` 是内存操作 + 关闭旧连接，很快；给足余量 |
 | `PATCH /admin/keys/{id}` | 15s | 单行 UPDATE + 内存状态设置 |
+| `DELETE /admin/keys/{id}` | 15s | 单行 DELETE + `egress.Release`（内存解绑）+ `scheduler.Reload`；三件事都要在超时内完成 |
 | `POST /admin/keys` | **90s** | 见下 |
 
 `POST /admin/keys` 需要显著更长的 read 超时，因为网关侧是**逐条 upsert**（`admin.go` 的循环，每条一次 `UpsertVolcKey`，每条还要做一次 AES-GCM 加密并 `egress.Bind`），导入 1000 个 Key 就是 1000 次数据库往返。按每条 20-50ms 估，1000 条需 20-50 秒。设 15s 会让大批量导入在网关**已经写入部分数据**后被看板判定超时——运维看到「失败」，实际库里已有几百条，这是最糟的状态。
