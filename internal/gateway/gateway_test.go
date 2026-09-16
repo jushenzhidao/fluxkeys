@@ -1419,6 +1419,51 @@ func TestAdmin_导入Key留空secret保留原密文(t *testing.T) {
 	}
 }
 
+func TestAdmin_导入Key的secret去首尾空白(t *testing.T) {
+	// 密钥粘贴时带上的换行/空格会原样进 `Bearer <secret>`，上游回
+	// `invalid_auth: The API key format is incorrect` —— 与「密钥真的无效」
+	// 同一个报错，且日志不留密钥值，排查只能靠猜（livetest-ai
+	// E2E-FK-VOLC-REAL 的阻塞项就是这个形态）。故导入时必须去空白。
+	env := newTestEnv(t)
+
+	import1 := func(payload string) string {
+		req, _ := http.NewRequest(http.MethodPost, env.ts.URL+"/admin/keys",
+			strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer admin-secret")
+		resp, err := env.ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		return readAll(t, resp)
+	}
+
+	// 带首尾换行与空格 —— 与 .env / 清单文件 / 终端粘贴的典型形态一致。
+	body := import1("{\"key_id\":\"volc_310\",\"secret\":\"  sk-pasted\\n\"}")
+	if !strings.Contains(body, `"imported_count":1`) {
+		t.Fatalf("应导入成功（去空白后是合法密钥），响应: %s", body)
+	}
+	k, ok := env.store.upstreamKey("volc_310")
+	if !ok {
+		t.Fatal("Key 不存在")
+	}
+	if k.Secret != "sk-pasted" {
+		t.Errorf("secret = %q，期望去空白后入库为 %q（否则上游会回 invalid_auth）",
+			k.Secret, "sk-pasted")
+	}
+
+	// 只含空白必须**报错**而不是退化成「未提供 secret」: 后者会保留库中旧密文，
+	// 而运维显然是想写入新值 —— 静默不生效比报错更贵。
+	import1(`{"key_id":"volc_310","secret":"sk-keep"}`)
+
+	body = import1(`{"key_id":"volc_310","secret":"   "}`)
+	if !strings.Contains(body, `"failed_count":1`) {
+		t.Fatalf("只含空白的 secret 应逐条报错，响应: %s", body)
+	}
+	if k, _ := env.store.upstreamKey("volc_310"); k.Secret != "sk-keep" {
+		t.Errorf("只含空白的 secret 不得改动库中密文，实际 %q", k.Secret)
+	}
+}
+
 func TestAdmin_导入Key单条失败不中断整批(t *testing.T) {
 	// 1000 个 Key 因第 3 个格式错误而全部回滚，运维只能反复试错
 	env := newTestEnv(t)

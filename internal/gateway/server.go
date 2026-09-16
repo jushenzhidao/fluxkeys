@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -450,11 +451,19 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Start() <-chan error {
 	ch := make(chan error, 1)
 	go func() {
-		// 收集所有 provider 名称用于日志
-		providers := make([]string, 0, len(s.cfg.Providers))
-		for name := range s.cfg.Providers {
+		// provider 名称取自**运行期快照**，不是 Deps.Config。
+		//
+		// 快照才是运行期真相: 启动换入（main.go 5.1 节）已按库中的 enabled
+		// 状态替换过 providers 段，而 Deps.Config 是 -config 文件的静态副本。
+		// 读文件副本会打出一行与事实相反的启动日志 —— 实测中运维据此认为
+		// 「配置没生效」，而实际上运行期是对的（或反之），是排障时最容易被
+		// 误导的一类证据。排序是为了让多次启动的日志可逐字比对。
+		snapCfg := s.snaps.Current().Cfg
+		providers := make([]string, 0, len(snapCfg.Providers))
+		for name := range snapCfg.Providers {
 			providers = append(providers, name)
 		}
+		sort.Strings(providers)
 		s.log.Info("网关启动", "addr", s.srv.Addr,
 			"egress_mode", string(s.egress.Mode()),
 			"providers", providers)

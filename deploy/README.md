@@ -143,7 +143,10 @@ FLUXKEYS_IMAGE_TAG=v1.0.0       # 升级时用具体版本；首跑默认本地�
 
 - `EGRESS_MODE=multi_ip`（可显式改 direct 过渡）、`EGRESS_VERIFY_ON_START=true`、
   `REFRESH_ENABLED=true`
-- `VOLC_BASE_URL` 默认即真实火山地址 `https://ark.cn-beijing.volces.com`
+- `VOLC_BASE_URL` 默认**不注入**（留空 = 由配置文件的内置默认值决定，即真实火山
+  地址 `https://ark.cn-beijing.volces.com`）。环境变量优先级高于 `-config` YAML，
+  一旦注入就会盖掉配置文件里的地址 —— 夹具/联调把 volc 指向假上游时，必须确认
+  它确实是空的，否则配置看着改对了、流量仍打到真实火山
 - `ADMIN_API_KEY` 默认为空 = 管理接口与看板管理操作禁用（刻意不给仓库内置的
   已知密钥），由 gen 脚本生成；裸跑时可内联传递：
   `ADMIN_API_KEY=$(openssl rand -hex 32) docker compose up -d`
@@ -276,6 +279,42 @@ EGRESS_IPS=\
 - **`max_keys` 能调高的前提是行为画像已收窄**（见 `internal/persona`）。
   画像决定同一 IP 上有多少 Key 会在同一时刻活跃。沿用宽时段画像却调高
   `max_keys`，等于直接提高被识别的概率。
+
+##### 出口地址不想手抄？改用扫描（`EGRESS_IPS_SOURCE=scan`）
+
+`EGRESS_IPS` 要求逐条列出地址，而地址是云厂商按机器分配的：抄错、漏抄、扩容后
+忘补，表现都是「某个档位没出口」或「容量比预期小」，且不会有任何配置错误提示。
+扫描把「地址从哪来」自动化，**分层规则不变**：
+
+```bash
+# .env
+EGRESS_IPS=                    # 必须清空：两者互斥，同时设置会被配置校验拒绝
+EGRESS_IPS_SOURCE=scan
+```
+
+分档计划（每档几个地址、单出口承载多少 Key）在镜像内的
+`configs/config.prod.yml` 的 `egress.scan.tiers`，预置的就是本文推荐形态
+（19 hot×10 / 5 warm×50 / 8 cold×100；`cold` 那项写 `count: 0` 表示接住剩余地址）。
+
+过滤规则同在 `egress.scan` 段，可按机器调整：
+
+- 排除回环、链路本地 `169.254/16`、组播，以及 `docker0` / `br-*` / `veth` /
+  `tun` 等虚拟网卡的地址。内置黑名单**始终生效**，自定义 `iface_deny` 是追加
+  而非替换（否则一次 `iface_deny: [eth1]` 就会把容器网桥一并放进来 —— 出口池里
+  混进内网地址不报错，只在上游侧表现为「一批账号从内网地址访问」）。
+- `prefix_allow` / `prefix_deny` 按 CIDR 收窄范围，deny 优先。机器上还有管理网时，
+  用 `prefix_allow` 只纳入出口网段最稳妥。
+- 同一网卡上的 secondary 地址（辅助 IP 的典型形态）会被一并纳入；地址按**数值**
+  排序后依次填入各档，顺序稳定 —— 重启后同一地址仍落在同一档，其上的 Key 密度
+  假设不会漂移。
+- **每个网卡的首地址（主 IP）也在候选内**。若该地址另有用途（SSH / 管理面），
+  用 `prefix_deny` 把它排掉；确需纳入内置黑名单里的网卡，用 `egress.ips`
+  显式指定（那条路径不经过滤）。
+
+⚠️ 切换前先核对地址数：扫描到的可用地址**少于**分档计划要求时，网关**拒绝启动**，
+不会缩水运行 —— 缩水会静默丢掉撤离余量，而那是「出口被封时其上 Key 有地方可去」
+的唯一保障。多出来的地址不参与计划，启动日志会告警（计划里留一个 `count: 0`
+的项即可接住它们）。
 
 ##### ⚠️ 改动 `pool_shares` 必须同步复核 `max_keys`
 
@@ -515,7 +554,8 @@ curl -X POST http://127.0.0.1:9091/-/reload
 - [ ] `.env` 中 `REFRESH_ENABLED=true`
 - [ ] 密钥已用 `scripts/gen-prod-env.sh` 生成（或已轮换 compose 里的占位默认值），
       且 `FLUXKEYS_ENCRYPTION_KEY` 已备份到密钥管理系统（丢失不可恢复）
-- [ ] `.env` 中 `VOLC_BASE_URL` 指向真实火山地址（默认值即是，核对未被覆盖）
+- [ ] `.env` 中 `VOLC_BASE_URL` 未被设置（留空时地址取自配置文件的内置默认值，
+      这才是本项要核对的状态）；仅当 volc 确实要指向别的上游时才显式赋值
 - [ ] `COMPOSE_PROFILES` 按生产需要设置（如 `monitoring,backup`）
 - [ ] `FLUXKEYS_IMAGE_TAG` 是具体版本号，不是 `latest` / `dev`（首跑本地构建的 `dev` 除外）
 - [ ] `REDIS_PASSWORD` 已设置（非 compose 占位默认值）
@@ -609,7 +649,10 @@ docker compose logs --tail=100 gateway
 |---|---|---|
 | `未配置 FLUXKEYS_ENCRYPTION_KEY` | 密钥缺失 | `.env` 中设置 32 字节 hex |
 | `需为 32 字节` | 密钥长度不对 | `openssl rand -hex 32` 重新生成 |
-| `egress.mode=multi_ip 必须配置 egress.ips` | 缺 `EGRESS_IPS` | 补上 |
+| `egress.mode=multi_ip 必须配置 egress.ips` | 缺 `EGRESS_IPS`（且未开扫描） | 补上地址清单，或设 `EGRESS_IPS_SOURCE=scan` 让网关自己扫本机地址 |
+| `EGRESS_IPS 与 egress.ips_source=scan 同时设置` | 两种地址来源互斥 | 清空 `EGRESS_IPS`（用扫描），或把 `EGRESS_IPS_SOURCE` 改回 `config` |
+| `未在本机发现任何可用出口地址` | 辅助 IP 未配置，或过滤条件过严 | 先跑 `scripts/setup-egress.sh` 绑定辅助 IP；再核对 `egress.scan` 的黑白名单 |
+| `分档计划要求 N 个出口地址…本机只发现 M 个` | 机器地址数少于分档计划 | 按本机实际地址数改 `egress.scan.tiers`（各档数字见撤离余量公式） |
 | `egress.mode 非法` | 拼写错误 | 只能是 `direct` 或 `multi_ip` |
 | `reap_interval 必须短于 lease_ttl` | 配额参数不自洽 | 回收间隔必须短于租约 TTL，否则泄漏无法及时回收 |
 | `软水位比例必须小于硬水位比例` | 水位配置反了 | 检查 soft/hard ratio |

@@ -325,15 +325,32 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-redis-password}
       REDIS_DB: "0"
       POSTGRES_DSN: postgres://fluxkeys:${POSTGRES_PASSWORD:-change-me-pg-password}@127.0.0.1:5432/fluxkeys?sslmode=disable
-      # 默认即真实火山地址。刻意不给「指向本地假上游」留默认值 ——
-      # 部署文件里留口子，只会在某次误配后悄悄打错上游。
-      VOLC_BASE_URL: ${VOLC_BASE_URL:-https://ark.cn-beijing.volces.com}
+      # 只在显式设置时透传，默认留空 —— 空串会被 internal/config/env.go 忽略，
+      # 于是 volc 的 base_url 由配置文件（configs/*.yml）或 /admin/providers 决定。
+      #
+      # 这里曾经写成 ${VOLC_BASE_URL:-https://ark.cn-beijing.volces.com}，
+      # 后果实测过（livetest-ai E2E-FK-VOLCENV-OVERRIDE）: 环境变量优先级高于
+      # -config YAML，于是夹具配置把 volc 指向本地假上游后，地址仍被这个默认值
+      # 盖掉 —— 假 Key 被打到真实火山，返回 401 并把出口 IP 打进上游封禁名单。
+      # 根因不是「默认值指向真上游」而是「总是写一个值」: 只要 env 恒非空，
+      # 配置文件就永远无法覆盖它，provider 地址的单一真相来源就被破坏了。
+      # 现在把「不给假上游留默认值」交给配置文件去保证（内置档位不含
+      # providers 段，回落 Default() 的就是真实火山地址）。
+      VOLC_BASE_URL: ${VOLC_BASE_URL:-}
       # 默认 multi_ip（本形态的核心能力）。过渡环境可在 .env 显式设 direct，
       # 但所有 Key 会共用主 IP 出口（P1-6 静默失效的风险自担）。
       EGRESS_MODE: ${EGRESS_MODE:-multi_ip}
       # 唯一无法默认化的参数。为空时网关启动即失败并报
       # "multi_ip 必须配置 egress.ips" —— 快速失败优于静默共用主 IP。
       EGRESS_IPS: ${EGRESS_IPS:-}
+      # 出口地址的另一个来源: 留空/`config` = 用上面的 EGRESS_IPS；
+      # 设成 `scan` = 扫描本机网卡上符合条件的 IPv4 地址（排除回环、链路本地、
+      # docker0 / br-* / veth / 各类隧道），再按镜像内置档位里的
+      # egress.scan.tiers 分档填充。
+      #
+      # 两个来源互斥: 同时设置会被配置校验拒绝启动（静默择一会让人以为生效的
+      # 那条其实没生效）。用扫描时必须把 EGRESS_IPS 清空。
+      EGRESS_IPS_SOURCE: ${EGRESS_IPS_SOURCE:-}
       # 默认开启：宁可启动失败，也不要带着失效的出口绑定跑。
       # 启动自检会用每个 IP 作为源地址拨测一次上游，任一失败即拒绝启动；
       # 确实需要临时跳过时在 .env 设 false（自检失败的报错里也提示了这一点）。

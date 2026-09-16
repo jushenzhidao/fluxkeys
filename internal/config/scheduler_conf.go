@@ -25,23 +25,58 @@ const maxReqPerHourPerIP = 3000
 // 仅在 multi_ip 且已配份额时检查。direct 模式没有出口概念，
 // 未配份额时全档等权，压力自然按 Key 数量分布，不会失配。
 func (c *Config) validatePoolShareCapacity() error {
-	shares := c.Scheduler.NormalizedPoolShares()
-	if shares == nil || c.Egress.Mode != "multi_ip" || len(c.Egress.IPs) == 0 {
+	if c.Scheduler.NormalizedPoolShares() == nil || c.Egress.Mode != "multi_ip" {
 		return nil
 	}
+	// 扫描模式下各档实际有几个出口，要等装配完成才知道（分档计划 + 本机扫到的
+	// 地址数，含「接住剩余」那一档的动态数量）。这里不猜，由装配层在
+	// PlanTierIPs 之后调 ValidateEgressCapacity 做同一项校验。
+	//
+	// 不能让这一项在扫描模式下直接失效: 它是防「某档份额远超其出口承载」的
+	// 唯一自动闸门，静默跳过等于开一个开关就丢掉了一层保护。
+	if c.Egress.Scanning() {
+		return nil
+	}
+	perPool, generic := countPoolsByEgressIPs(c.Egress.IPs)
+	return c.validateShareDensity(perPool, generic)
+}
 
-	// 统计各档的 IP 数。未标档位的 IP 通用，计入所有档位的可用量。
-	perPool := map[string]int{}
-	generic := 0
-	for _, ip := range c.Egress.IPs {
+// countPoolsByEgressIPs 统计各档的出口数与通用出口数。
+//
+// 未标档位的 IP 是通用的，对所有档位等价可用，故单独返回由调用方加到每一档。
+func countPoolsByEgressIPs(ips []EgressIP) (perPool map[string]int, generic int) {
+	perPool = make(map[string]int, 3)
+	for _, ip := range ips {
 		if ip.Pool == "" {
 			generic++
 			continue
 		}
 		perPool[ip.Pool]++
 	}
-	// 没有任何 IP 标了档位 → 用户没在用出口分层，份额与 IP 数的匹配无从谈起
-	// （所有 IP 对所有档位等价可用）。这时份额只影响 Key 的选取偏好，
+	return perPool, generic
+}
+
+// ValidateEgressCapacity 用**实际**的各档出口数校验份额密度。
+//
+// 导出给它处调用，是因为扫描模式下这个数字只有装配完成才知道: 分档计划给出
+// 每档几个地址，「接住剩余」那一档还要加上本机实际扫到的余额。在配置校验阶段
+// 推算这个数只能靠猜，而猜错的代价是拦住一个本来合法的部署。
+func (c *Config) ValidateEgressCapacity(perPool map[string]int, generic int) error {
+	return c.validateShareDensity(perPool, generic)
+}
+
+// validateShareDensity 是份额密度校验的本体，两条地址来源共用。
+//
+// 拦的是这类错误: 给 hot 档配 70% 份额，但它只有 4 个 IP —— 20 QPS 下
+// 每 IP 每小时要发 12600 次请求，是真人强度的 4 倍。配比本身不提高容量，
+// 它只是重新分配压力，配错会把密度问题从一个档位搬到另一个档位。
+func (c *Config) validateShareDensity(perPool map[string]int, generic int) error {
+	shares := c.Scheduler.NormalizedPoolShares()
+	if shares == nil || c.Egress.Mode != "multi_ip" {
+		return nil
+	}
+	// 没有任何出口标了档位 → 没在用出口分层，份额与出口数的匹配无从谈起
+	// （所有出口对所有档位等价可用）。这时份额只影响 Key 的选取偏好，
 	// 不会造成某个出口被过度使用，故跳过检查。
 	if len(perPool) == 0 {
 		return nil
@@ -67,15 +102,15 @@ func (c *Config) validatePoolShareCapacity() error {
 		ips := perPool[pool] + generic
 		if ips == 0 {
 			return fmt.Errorf(
-				"config: scheduler.pool_shares[%s]=%.0f%% 但 egress.ips 里没有该档位的 IP，"+
+				"config: scheduler.pool_shares[%s]=%.0f%% 但出口配置里没有该档位的出口，"+
 					"这些流量会全部走回退路径（或直接失败）", pool, share*100)
 		}
 		perIP := reqPerHour * share / float64(ips)
 		if perIP > maxReqPerHourPerIP {
 			return fmt.Errorf(
-				"config: scheduler.pool_shares[%s]=%.0f%% 与该档 %d 个 IP 不匹配 —— "+
-					"每 IP 每小时 %.0f 次请求，超过上限 %d（约 0.8 QPS，真人强度）。"+
-					"要么下调该档份额，要么给该档增加 IP",
+				"config: scheduler.pool_shares[%s]=%.0f%% 与该档 %d 个出口不匹配 —— "+
+					"每出口每小时 %.0f 次请求，超过上限 %d（约 0.8 QPS，真人强度）。"+
+					"要么下调该档份额，要么给该档增加出口",
 				pool, share*100, ips, perIP, maxReqPerHourPerIP)
 		}
 	}

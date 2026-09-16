@@ -71,12 +71,16 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// defaultMaxKeysPerIP 是未指定时单个出口 IP 的 Key 承载上限。
+// DefaultMaxKeysPerIP 是未指定 max_keys 时单个出口 IP 的 Key 承载上限。
 //
 // 取 10 是保守值，适用于未做分层、也未收窄行为画像的部署。
 // 画像窄化后（见 internal/persona）同 IP 的并发密度大幅下降，
 // warm/cold 档可显著调高 —— 但这必须显式配置，不做隐式放宽。
-const defaultMaxKeysPerIP = 10
+//
+// 导出给它处复用（装配层为「扫描本机地址」模式的分档计划兜底）：这个数字同时
+// 决定了默认容量与单 IP 的账号密度，只应有一处定义 —— 两边各写一份而日后漂移，
+// 表现是「同一台机器上两条地址来源给出不同的承载能力」，且不会有任何报错。
+const DefaultMaxKeysPerIP = 10
 
 // parseEgressIPs 解析 EGRESS_IPS 环境变量。
 //
@@ -100,7 +104,7 @@ func parseEgressIPs(s string) []EgressIP {
 		}
 
 		// 先切出档位与容量，剩余部分才是 addr[=public]
-		pool, maxKeys := "", defaultMaxKeysPerIP
+		pool, maxKeys := "", DefaultMaxKeysPerIP
 		if i := strings.Index(part, "|"); i >= 0 {
 			rest := part[i+1:]
 			part = strings.TrimSpace(part[:i])

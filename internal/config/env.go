@@ -67,8 +67,18 @@ func applyEnv(cfg *Config) {
 		cfg.Egress.Mode = v
 	}
 	// EGRESS_IPS 形如 "172.16.0.2=1.2.3.4,172.16.0.3=1.2.3.5"
+	//
+	// 顺手记下「IPs 来自环境变量」这一事实: 它与 egress.ips_source=scan 是
+	// 互斥的两种地址来源（一个显式给出清单，一个扫描本机），同时生效会让其中
+	// 一个静默失效。Validate 据此拒绝启动，而不是在这里替运维挑一个。
 	if v := os.Getenv("EGRESS_IPS"); v != "" {
 		cfg.Egress.IPs = parseEgressIPs(v)
+		cfg.Egress.ipsFromEnv = true
+	}
+	// 出口地址来源: config（默认，读 egress.ips）| scan（扫描本机网卡地址）。
+	// 与 EGRESS_IPS 互斥，见上。
+	if v := os.Getenv("EGRESS_IPS_SOURCE"); v != "" {
+		cfg.Egress.IPsSource = v
 	}
 	if v := os.Getenv("EGRESS_VERIFY_ON_START"); v != "" {
 		cfg.Egress.VerifyOnStart = v == "true" || v == "1"

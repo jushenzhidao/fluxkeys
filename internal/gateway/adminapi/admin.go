@@ -291,6 +291,35 @@ func (a *API) handleImportKeys(w http.ResponseWriter, r *http.Request) {
 
 	for _, it := range items {
 		it.KeyID = strings.TrimSpace(it.KeyID)
+		// secret 也要去首尾空白 —— 它是唯一一处「字符串稍有偏差就只会得到上游
+		// 401」的输入。
+		//
+		// 密钥从 .env、清单文件或终端粘贴过来时极易带上换行/空格，而这些字符会
+		// 原样进 Authorization 头（`Bearer <secret>`），上游回
+		// `invalid_auth: The API key format is incorrect` —— 与「密钥本身无效」
+		// 完全同一个报错，而日志里不留密钥的值，排查只能靠猜。
+		// 实测踩中: livetest-ai E2E-FK-VOLC-REAL 就是卡在这个报错上，报告只能
+		// 写「需人工核实该 Key 及其库中密文是否被污染」。
+		//
+		// 去空白是安全的（合法的上游 Key 不含首尾空白），但**必须告警** ——
+		// 静默修正等于把「清单里有瑕疵」这件事藏起来，下次它还会以别的形式出现。
+		if raw := it.Secret; raw != "" {
+			it.Secret = strings.TrimSpace(raw)
+			if it.Secret != raw {
+				a.deps.Log().WarnContext(r.Context(),
+					"导入的 secret 含首尾空白，已按去空白后的值入库（否则上游会回 invalid_auth）",
+					"key_id", it.KeyID, "raw_len", len(raw), "trimmed_len", len(it.Secret))
+			}
+			if it.Secret == "" {
+				// 只含空白: 不能退化成「未提供 secret」（那会保留库中旧密文，
+				// 而运维显然是想写入新值），如实报错让人修清单。
+				failures = append(failures, failure{
+					KeyID:  it.KeyID,
+					Reason: "secret 只含空白字符，请检查导入清单（上游会回 invalid_auth）",
+				})
+				continue
+			}
+		}
 		// 单上游部署允许省略 provider，多上游必须显式指定，否则会静默
 		// 把 Key 挂到错误的上游上。
 		it.Provider = snap.Cfg.ResolveProvider(strings.TrimSpace(it.Provider))

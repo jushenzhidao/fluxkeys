@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"time"
 )
 
@@ -20,11 +21,34 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: redis.addr 不能为空")
 	}
 
+	switch c.Egress.IPsSource {
+	case "", EgressSourceConfig, EgressSourceScan:
+	default:
+		return fmt.Errorf("config: egress.ips_source 非法 %q（应为 %s 或 %s）",
+			c.Egress.IPsSource, EgressSourceConfig, EgressSourceScan)
+	}
+
 	switch c.Egress.Mode {
 	case "direct":
+		// direct 不使用出口 IP，ips 与 scan 都不参与（本地 / CI 形态）。
 	case "multi_ip":
+		if c.Egress.Scanning() {
+			// EGRESS_IPS 是运维显式给出的地址清单，与「扫描本机」互斥。
+			// 二者同在时必须让人选一个: 静默择一的结果是运维以为生效的那条没生效，
+			// 表现是出口集合与预期不符（多几个或少了几个地址），却没有任何提示。
+			if c.Egress.ipsFromEnv {
+				return fmt.Errorf("config: EGRESS_IPS 与 egress.ips_source=scan 同时设置 —— " +
+					"前者是显式地址清单，后者要求扫描本机地址，两者互斥。" +
+					"请删掉其中之一（清空 EGRESS_IPS，或把 ips_source 改回 config）")
+			}
+			if err := c.Egress.validateScan(c.Scheduler.PoolShares); err != nil {
+				return err
+			}
+			break
+		}
 		if len(c.Egress.IPs) == 0 {
-			return fmt.Errorf("config: egress.mode=multi_ip 必须配置 egress.ips")
+			return fmt.Errorf("config: egress.mode=multi_ip 必须配置 egress.ips" +
+				"（或用 egress.ips_source=scan 让网关扫描本机地址）")
 		}
 	default:
 		return fmt.Errorf("config: egress.mode 非法 %q（应为 direct 或 multi_ip）", c.Egress.Mode)
@@ -121,6 +145,81 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: refresh.probe_interval (%s) 过长，"+
 			"在 %s~%s 窗口内不足 3 轮探测，刷新很可能整天都确认不了",
 			c.Refresh.ProbeInterval, c.Refresh.WindowStart, c.Refresh.WindowEnd)
+	}
+	return nil
+}
+
+// validateScan 校验「扫描本机地址」模式的分档计划。
+//
+// 这里拦的都是**静默失效**: 计划写错不会报错，只在运行时表现为「某档没出口、
+// 请求全失败」或「容量比预期小」，而健康检查一路全绿。逐个对应关系:
+//
+//	pool 名拼错（Hot / hot ）—— 该档永远不匹配任何 Key，等于该档不存在
+//	count=0 出现在中间项    —— 它之后的每一项都拿不到地址，容量恒为 0
+//	tiers 为空              —— 没有任何地址能进池
+//	档位缺项                —— scheduler.pool_shares 里分了 Key 却无出口
+//
+// shares 直接取 scheduler.pool_shares: 配额在哪里分出去，就必须在哪里有出口接住。
+func (e Egress) validateScan(shares map[string]float64) error {
+	if len(e.Scan.Tiers) == 0 {
+		return fmt.Errorf("config: egress.ips_source=scan 必须配置 egress.scan.tiers —— " +
+			"扫描只决定「有哪些地址」，各档分多少个地址、单出口承载多少 Key " +
+			"仍必须显式给出（见 deploy/README.md 的分层容量公式）")
+	}
+	for _, p := range e.Scan.PrefixAllow {
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("config: egress.scan.prefix_allow 含非法 CIDR %q: %w", p, err)
+		}
+	}
+	for _, p := range e.Scan.PrefixDeny {
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("config: egress.scan.prefix_deny 含非法 CIDR %q: %w", p, err)
+		}
+	}
+
+	for i, t := range e.Scan.Tiers {
+		switch t.Pool {
+		case "", "hot", "warm", "cold":
+		default:
+			return fmt.Errorf("config: egress.scan.tiers[%d].pool 非法 %q"+
+				"（应为 hot / warm / cold，或留空表示通用档）—— 拼错不会报错，只是该档永远不会被填上",
+				i, t.Pool)
+		}
+		if t.Count < 0 {
+			return fmt.Errorf("config: egress.scan.tiers[%d].count=%d 非法（0 表示「接住剩余全部」）",
+				i, t.Count)
+		}
+		if t.Count == 0 && i != len(e.Scan.Tiers)-1 {
+			return fmt.Errorf("config: egress.scan.tiers[%d].count=0（接住剩余全部）只能出现在最后一项，"+
+				"否则它之后的每一项都拿不到地址", i)
+		}
+		if t.MaxKeys < 0 {
+			return fmt.Errorf("config: egress.scan.tiers[%d].max_keys=%d 非法（0 表示取默认值）",
+				i, t.MaxKeys)
+		}
+	}
+
+	// 通用档（pool 留空）承接任何档位，有它就无需再逐档核对。
+	anyPool := false
+	covered := make(map[string]bool, len(e.Scan.Tiers))
+	for _, t := range e.Scan.Tiers {
+		if t.Pool == "" {
+			anyPool = true
+			break
+		}
+		covered[t.Pool] = true
+	}
+	if anyPool {
+		return nil
+	}
+	for pool, share := range shares {
+		if share <= 0 || covered[pool] {
+			continue
+		}
+		return fmt.Errorf("config: scheduler.pool_shares 给档位 %q 分了 %.0f%% 的 Key，"+
+			"但 egress.scan.tiers 里没有该档出口（也没有通用档）——"+
+			"这些 Key 将找不到出口，请求全部失败而健康检查全绿。"+
+			"请补上该档，或加一项 pool 留空的通用档", pool, share)
 	}
 	return nil
 }

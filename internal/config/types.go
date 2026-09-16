@@ -102,6 +102,30 @@ type Egress struct {
 	Mode string `yaml:"mode"`
 	// IPs 是出口 IP 列表，仅 multi_ip 模式使用。
 	IPs []EgressIP `yaml:"ips"`
+
+	// IPsSource 决定出口地址从哪来:
+	//
+	//	""/"config"（默认）—— 用上面的 ips 段，逐条显式列出地址
+	//	"scan"             —— 扫描本机网卡上符合条件的地址，按 scan.tiers 填档
+	//
+	// scan 只替掉「地址从哪来」这一件事，**不改变分层规则**: 每档的名额与
+	// max_keys 仍由 tiers 决定，反封禁的容量算术（各档 IP 数满足撤离余量、
+	// 单 IP 等效密度不超上限）依旧由运维按同一套公式计算。
+	//
+	// 存在的理由: `ips` 段要求手抄地址清单，而地址是云厂商分配、按机器不同的。
+	// 抄错/漏抄的表现是「某档没出口」或「容量不足」，却不会有任何配置错误提示
+	// —— 实测（livetest-ai KI-035 的同机排查）就出现过把「档位无可用出口」
+	// 当成档位配置问题去改的情形。
+	IPsSource string `yaml:"ips_source"`
+
+	// Scan 是 ips_source=scan 时的过滤与分档规则。
+	Scan EgressScan `yaml:"scan"`
+
+	// ipsFromEnv 记录「IPs 是由环境变量 EGRESS_IPS 覆盖出来的」。
+	//
+	// 非导出、不参与 YAML 解码，只服务于一条校验: EGRESS_IPS 是运维显式给出的
+	// 清单，与 ips_source=scan 同时生效会让两者静默互相覆盖 —— 必须报错让人选一个。
+	ipsFromEnv bool
 	// RequestTimeout 是上游请求的整体超时。
 	RequestTimeout time.Duration `yaml:"request_timeout"`
 	// VerifyOnStart 启动时校验每个出口 IP 的连通性。
@@ -170,6 +194,61 @@ type EgressIP struct {
 	// 与上百个 Key 共享出口，分层的收益归零。
 	Pool string `yaml:"pool"`
 }
+
+// EgressScan 是 ips_source=scan 时的地址过滤与分档计划。
+type EgressScan struct {
+	// IfaceDeny 是**追加**在 egress 内置黑名单（回环、docker0 / br-* / veth /
+	// tun / 各类隧道，见 egress.DefaultIfaceDeny）之后的自定义网卡名前缀。
+	//
+	// 语义是追加而非替换: 若允许替换，一次 `iface_deny: [eth1]` 就会把容器网桥
+	// 一并放行，出口池里混进内网地址不会报错，只在上游侧表现为「同一批账号
+	// 从内网地址访问」。确需把内置黑名单里的网卡当出口时，用 egress.ips
+	// 显式指定地址（那条路径不经过滤）。
+	IfaceDeny []string `yaml:"iface_deny"`
+
+	// PrefixAllow / PrefixDeny 是按 CIDR 匹配的地址黑白名单，deny 优先。
+	//
+	// 用于「机器上有多组地址，只把其中一组当出口」的场景（例如出口 IP 段是
+	// 172.16.0.0/24，而主机还有管理网 10.0.0.0/8）。留空表示不按网段过滤。
+	PrefixAllow []string `yaml:"prefix_allow"`
+	PrefixDeny  []string `yaml:"prefix_deny"`
+
+	// Tiers 是分档填充计划，按**书写顺序**消费扫描到的地址（地址先排序，
+	// 保证同一台机器每次启动的归属完全一致）。
+	//
+	// 它就是 egress.ips 在 scan 模式下的等价物: 把「地址 + 档位 + max_keys」
+	// 的三元组拆成「地址来自扫描」+「档位与容量来自这里」。
+	Tiers []EgressScanTier `yaml:"tiers"`
+}
+
+// EgressScanTier 是分档计划的一项。
+type EgressScanTier struct {
+	// Pool 是档位名（hot / warm / cold），留空表示通用档。
+	Pool string `yaml:"pool"`
+
+	// Count 是本档分配多少个地址。
+	//
+	// 0 表示「接住剩余全部」，只允许出现在最后一项 —— 否则它后面的项永远
+	// 拿不到地址，配额看着配了却恒为 0（Validate 会拦这种写法）。
+	Count int `yaml:"count"`
+
+	// MaxKeys 是该档单个出口可绑定的 Key 数上限，与 egress.ips 的 max_keys 同义。
+	//
+	// 0 表示取内置默认值（DefaultMaxKeysPerIP，保守值 10）；需要按档位分级
+	// 承载时（hot 10 / warm 50 / cold 100）必须显式写出，这正是分层的意义所在。
+	MaxKeys int `yaml:"max_keys"`
+}
+
+// 出口地址来源（egress.ips_source）。
+const (
+	// EgressSourceConfig 是默认来源: 逐条读出 egress.ips / EGRESS_IPS。
+	EgressSourceConfig = "config"
+	// EgressSourceScan 表示扫描本机网卡地址，按 egress.scan.tiers 填档。
+	EgressSourceScan = "scan"
+)
+
+// Scanning 报告是否启用「扫描本机地址」。
+func (e Egress) Scanning() bool { return e.IPsSource == EgressSourceScan }
 
 // Provider 是单个上游服务商的配置。
 type Provider struct {

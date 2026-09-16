@@ -393,6 +393,27 @@ func (b *background) collectMetrics(ctx context.Context) error {
 	}
 	b.forgetStaleKeys(live)
 
+	// 出口绑定按库对账（livetest-ai KI-035）。
+	//
+	// live 与上一行同源，是「库中仍然存在的 Key」的全集 —— 注意**不限状态**:
+	// banned 的 Key 也在内，它的绑定必须留着，复活时要回同一个出口。
+	// 差别在于 forgetStaleKeys 回收的是指标序列，这一步回收的是**出口的可绑定
+	// 名额占用**: 绑定的权威副本在网关内存，库里的行被直接删掉（SQL、另一个
+	// 进程、看板）后内存不感知，两个出口的 load 就永久停在历史值上 ⇒
+	// 候选集恒空、新导入的 Key 全部 502，而报错文案指向「档位无可用出口」
+	// 这个根本不存在的成因。
+	//
+	// 刻意放在 15 秒一轮的指标采集里，而不是 5 分钟一轮的 key_reload:
+	// 复用本轮已经查出来的 key 列表（零额外查询），并把「容量假满」的持续
+	// 窗口从分钟级压到十几秒。key_reload 那侧的 RetainClients 只清客户端、
+	// 保留绑定，语义不同，两者不能合并。
+	if n := b.pool.ReleaseBindings(live); n > 0 {
+		b.log.Warn("已回收库中不存在的 Key 的出口绑定",
+			"count", n, "catalog_keys", len(live),
+			"hint", "库中已无这些 Key（多为直接改库删行）；"+
+				"直接改库不会立刻反映到内存容量，请改用 DELETE /admin/keys/{key_id}（删行与解绑同事务）")
+	}
+
 	st := b.pool.Stats()
 	byState := make(map[string]int, 4)
 	reputation := make(map[string]int, len(st.PerIP))

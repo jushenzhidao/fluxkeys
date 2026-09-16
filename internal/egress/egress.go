@@ -483,10 +483,7 @@ func (p *Pool) BindInPool(keyID, pool string) (string, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		if pool != PoolAny {
-			return "", fmt.Errorf("%w: 档位 %q 无可用出口", ErrNoIP, pool)
-		}
-		return "", ErrNoIP
+		return "", p.noCandidateError(pool, load)
 	}
 
 	// 确定性哈希，同一候选集下结果一致。
@@ -499,6 +496,118 @@ func (p *Pool) BindInPool(keyID, pool string) (string, error) {
 	chosen := candidates[start]
 	p.bindings[keyID] = chosen.Addr
 	return chosen.Addr, nil
+}
+
+// noCandidateError 解释「一个候选出口都没有」的具体成因。
+//
+// 原实现对候选集为空一律报「档位 %q 无可用出口」，但候选为空有四种毫不相干的
+// 成因: 档位不匹配、容量已满、出口处于观察/冷却期或信誉不足、出口已被封禁。
+// 四者对应完全不同的处置动作，用同一句文案会把排查引向错误方向。
+//
+// 实测踩中（livetest-ai KI-035）: 用 SQL 直删 upstream_keys 后内存绑定未回收，
+// 两个出口的负载恒等于历史绑定数（≥ max_keys）⇒ 候选恒空，新导入的 Key 全部
+// 502 且文案指向「档位 cold 无可用出口」。运维据此去改 EGRESS_IPS 的档位配置
+// 或 pool_shares，而真实成因是「容量被已不存在的 Key 占满」，与档位无关。
+//
+// 调用方持有 p.mu（与候选集构造同一临界区），故这里读到的负载与候选判定
+// 出自同一时刻的快照，不会出现「报容量满而实际上刚空出位置」。
+func (p *Pool) noCandidateError(pool string, load map[string]int) error {
+	var (
+		poolMismatch []string
+		banned       []string
+		full         []string
+		notAssign    []string
+		fullCap      int
+		fullBound    int
+	)
+	for _, ip := range p.ips {
+		switch {
+		case !ip.Accepts(pool):
+			poolMismatch = append(poolMismatch, ip.Addr)
+		case ip.State() == IPBanned:
+			banned = append(banned, ip.Addr)
+		case load[ip.Addr] >= ip.MaxKeys:
+			full = append(full, fmt.Sprintf("%s(%d/%d)", ip.Addr, load[ip.Addr], ip.MaxKeys))
+			fullCap += ip.MaxKeys
+			fullBound += load[ip.Addr]
+		case !ip.Assignable():
+			// Assignable 为假而尚未归入上面两类的，只剩信誉跌破阈值
+			// 与 suspect/cooldown 两种观察期状态 —— 它们都不接受新 Key。
+			notAssign = append(notAssign,
+				fmt.Sprintf("%s(状态=%s,信誉=%d)", ip.Addr, ip.State(), ip.Reputation()))
+		}
+	}
+
+	var reasons []string
+	if len(full) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"容量已满: %d 个出口的可绑定名额用尽（%s），合计上限 %d，当前内存绑定 %d 个 Key",
+			len(full), sampleOf(full), fullCap, fullBound))
+	}
+	if len(notAssign) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"暂停分配: %d 个出口处于观察/冷却期或信誉不足（%s）", len(notAssign), sampleOf(notAssign)))
+	}
+	if len(banned) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"已封禁: %d 个出口被判定为上游封禁（%s）", len(banned), sampleOf(banned)))
+	}
+	if len(poolMismatch) > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"档位不符: %d 个出口不承接档位 %q（%s）", len(poolMismatch), pool, sampleOf(poolMismatch)))
+	}
+
+	scope := "全池"
+	if pool != PoolAny {
+		scope = fmt.Sprintf("档位 %q", pool)
+	}
+	if len(reasons) == 0 {
+		return fmt.Errorf("%w: %s 没有任何出口（egress.ips 为空）", ErrNoIP, scope)
+	}
+	// 成因排在档位之前，且档位只作为「范围」出现在末尾。
+	//
+	// 顺序不是排版问题: 旧文案以「档位 %q 无可用出口」开头，实测中运维据此
+	// 去改 EGRESS_IPS 的档位与 pool_shares，而真实成因是容量被库中已不存在的
+	// Key 占满 —— 读第一眼就决定了排查方向。
+	//
+	// 尾注同样必要: 绑定的权威副本在内存，直接改库不会立刻反映到容量算术上
+	// （周期对账会回收，管理面删 Key 接口则立即解绑）。
+	return fmt.Errorf("%w: %s（范围: %s）。"+
+		"注意内存绑定量按库周期对账回收：若刚用 SQL 直接删/改过 upstream_keys，"+
+		"名额要等下一轮对账才释放（改走管理面删 Key 接口则会立即解绑）",
+		ErrNoIP, joinReasons(reasons), scope)
+}
+
+// sampleOf 把地址列表截断成适合放进错误文案的短串。
+//
+// 32 IP 的池子在极端情况下会全部落进同一成因，完整列表会让错误响应变成一屏，
+// 而运维真正需要的是「哪一类成因、涉及多少个」。
+func sampleOf(items []string) string {
+	const max = 3
+	var b []byte
+	for i, s := range items {
+		if i == max {
+			b = append(b, fmt.Sprintf(",…共%d个", len(items))...)
+			break
+		}
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, s...)
+	}
+	return string(b)
+}
+
+// joinReasons 用「；」连接多个成因。
+func joinReasons(reasons []string) string {
+	var b []byte
+	for i, r := range reasons {
+		if i > 0 {
+			b = append(b, "；"...)
+		}
+		b = append(b, r...)
+	}
+	return string(b)
 }
 
 // Adopt 采纳一条来自持久层的既有 Key-IP 绑定。
@@ -812,17 +921,84 @@ func (p *Pool) RetainClients(live map[string]bool) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
-	for keyID, c := range p.clients {
+	for keyID := range p.clients {
 		if live[keyID] {
 			continue
 		}
-		if tr, ok := c.Transport.(*http.Transport); ok {
-			tr.CloseIdleConnections()
-		}
-		delete(p.clients, keyID)
+		p.closeClientLocked(keyID)
 		n++
 	}
 	return n
+}
+
+// ReleaseBindings 回收「持久层已不存在」的 Key 的绑定与客户端，返回回收数量。
+//
+// 与 RetainClients 的边界必须分清，这是本方法存在的全部理由:
+//
+//   - RetainClients 只清传输资源，绑定一律保留 —— 绑定是「Key-IP 终身绑定」的
+//     本体，Key 短暂下线（banned / cooldown / 暂时移出活跃池）再回来必须仍落
+//     在原出口，否则就是凭空制造一次「老账号换 IP」。
+//   - 本方法只在调用方确知该 Key 在库中已经不存在时才回收。此时没有任何东西
+//     能证明这个 Key 还会回来，而它的绑定会**永久占着一个可绑定名额** ——
+//     容量算术用的是内存绑定数（见 BindInPool 的 load）。
+//
+// 为什么必须有它（livetest-ai KI-035）: 绑定的权威副本在网关内存，而
+// upstream_keys 可能被直接改（SQL 删行、另一个进程、看板）。不回收到期绑定有两个
+// 后果，且都不报错: ① 容量「假满」—— 两个出口的 load 恒等于历史绑定数，
+// 候选集恒空，新导入的 Key 全部 502 且文案指向档位；② /admin/ips 的 bound_keys
+// 与库中实际 Key 数不符，只读接口给出与事实相反的证据。
+//
+// keep 必须由持久层的**全量** key_id 集合构造。用调度器的 KeyIDSet 会漏掉
+// banned 的 Key（Reload 只装载 active），那样它们的绑定会被误回收 ——
+// 复活后换出口，正是终身绑定要避免的事。
+func (p *Pool) ReleaseBindings(keep map[string]bool) int {
+	if p.mode == ModeDirect {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for keyID := range p.bindings {
+		if keep[keyID] {
+			continue
+		}
+		delete(p.bindings, keyID)
+		p.closeClientLocked(keyID)
+		n++
+	}
+	return n
+}
+
+// Release 回收单个 Key 的出口绑定，返回被释放的地址（原本无绑定时为空串）。
+//
+// 供「删除 Key」这类确知该 Key 不会再用原出口的路径调用: 删行与解绑必须成对，
+// 只删库或只解绑都会留下不一致的一侧（前者是容量假满，后者是残留客户端）。
+func (p *Pool) Release(keyID string) string {
+	if keyID == "" || p.mode == ModeDirect {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	addr := p.bindings[keyID]
+	delete(p.bindings, keyID)
+	// 无绑定时同样要丢客户端: 它可能是绑定已在别处被清掉之后由请求路径建立的。
+	p.closeClientLocked(keyID)
+	return addr
+}
+
+// closeClientLocked 关闭并移除某个 Key 的独立客户端。调用方须持有 p.mu。
+//
+// 必须关空闲连接而非只删 map 项: Transport 的连接池与内部 goroutine 会随
+// 连接一直活着，只删引用等于泄漏。
+func (p *Pool) closeClientLocked(keyID string) {
+	c, ok := p.clients[keyID]
+	if !ok {
+		return
+	}
+	if tr, ok := c.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	delete(p.clients, keyID)
 }
 
 // Stats 汇总出口池状态，供看板与 /admin 使用。

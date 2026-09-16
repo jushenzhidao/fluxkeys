@@ -162,7 +162,7 @@ func run() error {
 	}
 
 	// ===== 4. 出口池 =====
-	pool, err := buildEgressPool(cfg)
+	pool, err := buildEgressPool(cfg, log)
 	if err != nil {
 		return fmt.Errorf("构建出口池: %w", err)
 	}
@@ -193,6 +193,31 @@ func run() error {
 	snaps, err := confsnap.NewHolderFromConfig(cfg, 0)
 	if err != nil {
 		return fmt.Errorf("构建配置快照: %w", err)
+	}
+
+	// ===== 5.1 启动换入：库真相优先于配置文件（KI-033）=====
+	//
+	// provider_configs 是 provider 配置的真相来源，管理面与看板都写这张表，
+	// 而运行期读的是快照。此前 ReloadProviderConfig 只挂在管理面写路径上，
+	// 冷启动直接用 -config 文件装配 ⇒ 运维经 API 停用某个 provider 后，
+	// **进程一重启它就重新上线**（fail-open），直到下一次管理面写入才回到库真相。
+	//
+	// 实测（livetest-ai E2E-FK-BOOT-DB-TRUTH）: 库里 volc enabled=false，
+	// 冷启动后 /v1/models 仍列出其模型；POST /admin/reload-config 才消失。
+	// 0.1.4 起内置调优档刻意不写 providers 段，形态更明显 —— 启动直接回落
+	// 「内置默认 volc」一个 provider，库里的两个 provider 状态完全不被采纳。
+	//
+	// 位置必须在装载 Key 池之前: 调度器按 provider 计算水位、校验 Key 归属，
+	// 先装 Key 再换配置会留下一批「属于已停用 provider」的 Key 在池内，
+	// 它们不可用却仍占着调度名额，要等 5 分钟后的 key_reload 才被清出。
+	// 此刻尚无活跃请求，换入成本可以忽略。
+	//
+	// 失败不阻断启动: 文件配置必须始终是可工作的兜底（库连接抖动、库为空、
+	// 库中一个 provider 都没启用 —— 都不该让进程起不来）。沿用文件快照并告警，
+	// 让 /readyz 与后续的 key_reload 去反映真实状态。
+	storeAdapter := &storeAdapter{st: st, snaps: snaps, base: cfg, log: log}
+	if _, err = storeAdapter.ReloadProviderConfig(ctx); err != nil {
+		log.Warn("启动时按库中 provider 配置换入失败，沿用配置文件快照", "error", err)
 	}
 
 	// ===== 6. 调度器 =====
@@ -263,7 +288,7 @@ func run() error {
 		sched: sched, st: st, qm: qm,
 		cfg: quotaLimits{snaps: snaps},
 	}
-	storeAdapter := &storeAdapter{st: st}
+	// storeAdapter 已在 5.1 节随「启动换入」一起构造（它必须先于调度器存在）。
 
 	// ===== 7. 后台任务 =====
 	//
@@ -289,18 +314,18 @@ func run() error {
 		return fmt.Errorf("启动后台任务: %w", err)
 	}
 
-	// 把配置热加载所需的依赖补进 storeAdapter。
+	// 热加载所需的最后一个依赖：常驻协程对齐。
 	//
-	// 必须在这里（bg 之后）而不是第 266 行就地构造：afterSwap 要指向
-	// bg.ReconcileRefreshers，而 bg 在那一行还不存在；少了它，热加载换入的新
-	// provider 不会有刷新探测器，被移除的探测器也不会停。
+	// 必须在这里（bg 之后）赋值而不是随构造给出: afterSwap 指向
+	// bg.ReconcileRefreshers，而 bg 在 5.1 节构造 storeAdapter 时还不存在。
+	// 少了它，热加载换入的新 provider 不会有刷新探测器，被移除的探测器也不会停
+	// —— 表现为新 provider 的 Key 永不经历刷新探测，额度耗尽后不再恢复调度。
 	//
-	// 这四个字段为空时管理面的写操作会退回「reloaded=false 且不生效」的旧形态
-	// （ReloadProviderConfig 返回 errReloadUnavailable），不会 panic。
-	storeAdapter.snaps = snaps
-	storeAdapter.base = cfg
+	// snaps / base / log 已随构造一起给出，此处不重复赋值。它们若为空，
+	// 管理面的写操作会退回「reloaded=false 且不生效」的旧形态
+	// （ReloadProviderConfig 返回 errReloadUnavailable），不会 panic ——
+	// 而 5.1 节那次启动换入走的正是同一条路径。
 	storeAdapter.afterSwap = bg.ReconcileRefreshers
-	storeAdapter.log = log
 
 	// ===== 8. HTTP 服务 =====
 	//
@@ -397,15 +422,103 @@ func newLogger() *slog.Logger {
 }
 
 // buildEgressPool 按配置构造出口池。
-func buildEgressPool(cfg *config.Config) (*egress.Pool, error) {
+//
+// 出口地址有两个来源（egress.ips_source）: 配置文件逐条列出，或扫描本机网卡
+// 地址后按分档计划填充。两条路径给出的都是「地址 + 档位 + 单出口承载上限」，
+// 差别只在地址从哪来 —— 分层容量算术不因来源而变（见 deploy/README.md）。
+func buildEgressPool(cfg *config.Config, log *slog.Logger) (*egress.Pool, error) {
 	mode := egress.Mode(cfg.Egress.Mode)
 
 	var ips []*egress.IP
-	if mode == egress.ModeMultiIP {
+	switch {
+	case mode != egress.ModeMultiIP:
+		// direct 不使用出口 IP（本地 / CI 形态）。
+
+	case cfg.Egress.Scanning():
+		if len(cfg.Egress.IPs) > 0 {
+			// YAML 里也写了 ips —— 扫描模式下它不参与。
+			//
+			// 这里刻意不报错: 档位配置随镜像分发（改它要重建镜像），而「在这台
+			// 机器上试一次扫描」不该被旧清单挡住。但必须把「忽略了什么」说出来，
+			// 否则运维会以为那份清单仍在生效，实际出口集合已经换了一批。
+			log.Warn("egress.ips_source=scan 已生效，egress.ips 中的地址被忽略",
+				"ignored_count", len(cfg.Egress.IPs))
+		}
+
+		addrs, err := egress.DiscoverAddrs(egress.ScanOptions{
+			IfaceDeny:   cfg.Egress.Scan.IfaceDeny,
+			PrefixAllow: cfg.Egress.Scan.PrefixAllow,
+			PrefixDeny:  cfg.Egress.Scan.PrefixDeny,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("扫描本机出口地址: %w", err)
+		}
+
+		tiers := make([]egress.TierSpec, 0, len(cfg.Egress.Scan.Tiers))
+		for _, t := range cfg.Egress.Scan.Tiers {
+			tiers = append(tiers, egress.TierSpec{Pool: t.Pool, Count: t.Count, MaxKeys: t.MaxKeys})
+		}
+		var unused []string
+		ips, unused, err = egress.PlanTierIPs(addrs, tiers, config.DefaultMaxKeysPerIP)
+		if err != nil {
+			return nil, err
+		}
+
+		// 分档结果出来后补做一次「份额 vs 出口数」的密度校验。
+		//
+		// 配置校验阶段算不出这一步: 「接住剩余」那一档实际拿到几个地址，要等
+		// 分档计划与本机扫到的地址数相遇才知道（见 validatePoolShareCapacity）。
+		// 不补这一步，开启扫描就等于丢掉「某档份额远超其出口承载」的唯一自动
+		// 闸门 —— 那正是反封禁设计里最贵的一类静默失效。
+		perPool := make(map[string]int, len(tiers))
+		generic := 0
+		for _, ip := range ips {
+			if ip.Pool == "" {
+				generic++
+				continue
+			}
+			perPool[ip.Pool]++
+		}
+		if err := cfg.ValidateEgressCapacity(perPool, generic); err != nil {
+			return nil, err
+		}
+
+		// 逐档报出实际归属。
+		//
+		// 地址是按排序顺序分配的，「哪个地址进了哪一档」在别处查不到 —— 而档位
+		// 决定了该出口上 Key 的密度假设，是排查容量与风控问题时唯一的依据。
+		// 固定顺序（hot → warm → cold → 通用）输出，便于多次启动的日志逐字比对。
+		byPool := make(map[string][]string, len(tiers))
+		for _, ip := range ips {
+			byPool[ip.Pool] = append(byPool[ip.Pool], ip.Addr)
+		}
+		for _, pool := range []string{"hot", "warm", "cold", egress.PoolAny} {
+			tierAddrs := byPool[pool]
+			if len(tierAddrs) == 0 {
+				continue
+			}
+			name := pool
+			if name == "" {
+				name = "通用"
+			}
+			log.Info("出口档位归属", "pool", name, "count", len(tierAddrs),
+				"addrs", strings.Join(tierAddrs, ","))
+		}
+		log.Info("出口地址来自扫描", "found", len(addrs), "used", len(ips),
+			"unused", len(unused))
+		if len(unused) > 0 {
+			// 计划没用完的地址是纯容量损失: 它们在池外，不替任何 Key 分担密度，
+			// 而出租方按地址计费。通常意味着分档计划的地址数被写小了。
+			log.Warn("有可用地址未纳入分档计划，不会分担任何 Key",
+				"count", len(unused), "addrs", strings.Join(unused, ","))
+		}
+
+	default:
 		for _, ic := range cfg.Egress.IPs {
 			ips = append(ips, egress.NewPooledIP(ic.Addr, ic.PublicIP, ic.MaxKeys, ic.Pool))
 		}
 	}
+
 	pool, err := egress.NewPool(mode, ips, cfg.Egress.RequestTimeout)
 	if err != nil {
 		return nil, err

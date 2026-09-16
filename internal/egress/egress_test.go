@@ -197,17 +197,42 @@ func TestIPStateMachine(t *testing.T) {
 
 // 信誉低于 50 进入观察期，不再承接新 Key。
 func TestIP_LowReputationNotAssignable(t *testing.T) {
-	ip := NewIP("127.0.0.1", "1.2.3.4", 10)
-	for i := 0; i < 6; i++ {
-		ip.MarkFailure()
-		ip.MarkSuccess() // 恢复 state，但信誉不回补
+	// 信誉只在「连续失败 >= 3 进 cooldown」那一步扣 10 分，而 MarkSuccess 会把
+	// failStreak 清零。所以旧写法（失败一次随即成功、重复 6 轮）信誉恒为 100，
+	// 必然走到 t.Skipf —— 它从来没有断言过任何东西，是一个恒绿灯的空壳。
+	//
+	// 正确构造: 一轮 = 连续 3 次失败（进 cooldown 扣分）+ 一次成功
+	// （借 MarkSuccess 从 cooldown 回到 active，好让下一轮继续扣分），每轮 -10。
+	dropReputation := func(ip *IP, rounds int) {
+		for i := 0; i < rounds; i++ {
+			ip.MarkFailure()
+			ip.MarkFailure()
+			ip.MarkFailure()
+			ip.MarkSuccess()
+		}
 	}
-	if ip.Reputation() >= 50 {
-		// 失败次数不足以压到 50 以下时跳过
-		t.Skipf("信誉仍为 %d，跳过", ip.Reputation())
+
+	ip := NewIP("127.0.0.1", "1.2.3.4", 10)
+	dropReputation(ip, 6)
+	if rep := ip.Reputation(); rep >= 50 {
+		t.Fatalf("构造失败: 信誉 %d 未跌破 50，无法验证该阈值（扣分路径可能已变）", rep)
+	}
+	if ip.State() != IPActive {
+		t.Fatalf("构造失败: 状态 %s，期望借 MarkSuccess 回到 active", ip.State())
 	}
 	if ip.Assignable() {
-		t.Error("信誉低于 50 应停止分配新 Key")
+		t.Error("信誉低于 50 应停止分配新 Key（进入观察期）")
+	}
+
+	// 边界另一侧: 阈值是「跌破 50」，恰好 50 仍应可分配。
+	// 只测一侧的话，把阈值改成 60 之类的改动会静默通过。
+	edge := NewIP("127.0.0.2", "1.2.3.5", 10)
+	dropReputation(edge, 5)
+	if rep := edge.Reputation(); rep != 50 {
+		t.Fatalf("构造失败: 信誉 %d，期望恰好 50", rep)
+	}
+	if !edge.Assignable() {
+		t.Error("信誉恰好 50 应仍可分配（阈值是跌破 50）")
 	}
 }
 
