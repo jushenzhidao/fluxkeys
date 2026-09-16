@@ -133,7 +133,8 @@ wait_for_gateway() {
 常见原因:
   - FLUXKEYS_ENCRYPTION_KEY 未设置或不是 32 字节 hex（网关会拒绝启动）
   - Postgres/Redis 未就绪，网关连接失败退出
-  - 端口被占用，改 .env 里的 GATEWAY_HOST_PORT
+  - 端口被占用：host 网络下 8080/9090 直接占宿主机端口，先确认没有第二个
+    gateway（旧栈没 down 掉 / 手工跑的进程）在监听；要换端口用 FLUXKEYS_ADDR
 EOF
   exit 1
 }

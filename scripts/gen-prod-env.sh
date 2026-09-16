@@ -11,7 +11,7 @@
 # ⚠️ --force 会重写全部密钥:
 #   - POSTGRES_PASSWORD 换掉后，旧数据卷的账号认证立即失效
 #   - FLUXKEYS_ENCRYPTION_KEY 换掉后，已导入的火山 Key 全部解不开（不可恢复）
-#   确需重来请先备份数据卷，或删卷重建: docker compose -f docker-compose.prod.yml down -v
+#   确需重来请先备份数据卷，或删卷重建: docker compose down -v
 # =============================================================================
 set -euo pipefail
 
@@ -37,7 +37,7 @@ cat > .env <<EOF
 #      （需全量解密重加密）。请把本文件备份到密钥管理系统。
 #   2. .env 在 .gitignore 中，绝不提交。
 #   3. 改 REDIS_PASSWORD / POSTGRES_PASSWORD 等启动参数后，需要
-#      docker compose -f docker-compose.prod.yml down && up 才生效。
+#      docker compose down && up 才生效。
 
 # ---- 密钥（强随机，勿手工替换为弱口令）----
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
@@ -76,5 +76,5 @@ chmod 600 .env
 echo "已生成 .env（权限 600）。下一步:"
 echo "  1. 编辑 .env 填 EGRESS_IPS（机器相关，无法代填；生成方法见 deploy/README.md）"
 echo "  2. sudo bash scripts/setup-egress.sh --persist --ips '<同 EGRESS_IPS>'"
-echo "  3. docker compose -f docker-compose.prod.yml up -d"
+echo "  3. docker compose up -d"
 echo "  4. bash scripts/smoke-test.sh"

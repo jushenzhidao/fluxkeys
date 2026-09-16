@@ -146,7 +146,7 @@ FLUXKEYS_IMAGE_TAG=v1.0.0       # 升级时用具体版本；首跑默认本地�
 - `VOLC_BASE_URL` 默认即真实火山地址 `https://ark.cn-beijing.volces.com`
 - `ADMIN_API_KEY` 默认为空 = 管理接口与看板管理操作禁用（刻意不给仓库内置的
   已知密钥），由 gen 脚本生成；裸跑时可内联传递：
-  `ADMIN_API_KEY=$(openssl rand -hex 32) docker compose -f docker-compose.prod.yml up -d`
+  `ADMIN_API_KEY=$(openssl rand -hex 32) docker compose up -d`
 
 > **`REFRESH_ENABLED=true` 是硬要求。**
 > 火山 12:00 刷新配额，而配额日边界也在 12:00（P0-3）。关闭刷新探测后，
@@ -411,28 +411,66 @@ EGRESS_BAN_COOLDOWN_MAX=24h  # 指数退避的上限
 
 ### 第 3 步：启动
 
-`docker-compose.prod.yml` 是**独立形态**（自包含，不与 `docker-compose.yml` 叠加）。
-与旧形态共用项目名和卷名，同机切换时先下架旧容器（保留数据卷）：
+仓库只有**一份**编排文件 `docker-compose.yml`（2026-09-17 起，原
+`docker-compose.prod.yml` 与 `docker-compose.test.yml` 已合并进它，合并理由见该
+文件头），所以命令里不再需要 `-f`：
 
 ```bash
-docker compose down   # 若之前用本地形态跑过；数据卷不会删
-docker compose -f docker-compose.prod.yml up -d
+docker compose up -d
 bash scripts/smoke-test.sh
 ```
+
+项目名与卷名没变（都是 `fluxkeys`），因此从旧的两文件形态切过来**不需要迁移数据** ——
+`up -d` 会按新定义重建容器，命名卷原样保留。
 
 优先拉 CI 发布的版本化镜像，拉不到时 `up` 会自动退回本地构建：
 
 ```bash
-docker compose -f docker-compose.prod.yml pull gateway
+docker compose pull gateway
 ```
 
-`EGRESS_MODE=multi_ip`、`EGRESS_VERIFY_ON_START=true`、`REFRESH_ENABLED=true`
-已在生产文件中硬编码，不依赖 `.env` 是否记得设置。
+**调优档**：compose 形态的配置本来只有「环境变量 + 内置默认值」两个来源，而
+`internal/config/env.go` 只映射了 17 个变量 —— `redis.pool_size`、
+`postgres.max_conns`、`quota.reap_*`、`scheduler.*` 这些**没有 env 出口**，
+在容器里根本调不了。所以调优档由**构建期打进镜像**：
+
+| 档位 | 源文件（仓库） | 镜像内路径 | 定位 |
+|---|---|---|---|
+| `prod`（默认） | `configs/config.prod.yml` | `/etc/fluxkeys/config.prod.yml` | 只补容量，不动风控姿态（单 Key 间隔仍是 5s） |
+| `loadtest` | `configs/config.loadtest.yml` | `/etc/fluxkeys/config.loadtest.yml` | 关闭单 Key 节流与档位配比，**仅压测**，先读文件头的代价说明 |
+
+切换档位（`docker compose up -d` 会用新命令行重建容器）：
+
+```bash
+FLUXKEYS_TUNING=loadtest docker compose up -d
+```
+
+**档位文件不挂宿主机目录**（`Dockerfile` 里 `COPY configs/ /etc/fluxkeys/`）。这样做的收益
+是镜像即「二进制 + 配置」的完整交付物：从 ghcr 拉的镜像自带与它匹配的档位，不会出现
+「宿主机上的 YAML 与镜像里的二进制语义不符」；容器也不需要任何宿主机目录挂载，与
+`read_only: true` / `cap_drop: ALL` 的安全基线一致。**代价是改档位内容必须重建镜像** ——
+临时验证可用命令行覆盖并挂自己的文件：
+
+```bash
+docker compose run --rm -v "$PWD/configs/config.loadtest.yml:/tmp/x.yml:ro" gateway -config /tmp/x.yml
+```
+
+（`deploy/schema.sql`、`prometheus.yml`、`grafana/` 仍然挂载 —— 它们属于 Postgres /
+Prometheus / Grafana 的官方镜像与初始化脚本，要内置就得自建镜像，不划算。）
+
+优先级是 `环境变量 > YAML > 内置默认值`，所以密钥、`EGRESS_IPS`、`FLUXKEYS_SHARD_ID`
+继续留在 `.env` 即可，两者不冲突。YAML 为严格模式（未知字段直接启动失败），
+唯一的例外是 **map 型默认值**：要清空 `scheduler.pool_shares` 必须写 `null`，
+写 `{}` 会被静默忽略并保留默认的 70/25/5。
+
+`EGRESS_MODE`、`EGRESS_IPS`、`EGRESS_VERIFY_ON_START`、`REFRESH_ENABLED` 由 `.env`
+提供，后两者默认为 `true` —— 关闭自检会带着失效的出口绑定继续跑，关闭刷新探测会在
+00:00-12:00 按满额度调度已耗尽的 Key（直接超刷），只在你明确要放弃这两道保护时才设 `false`。
 
 ### 第 4 步：确认 Prometheus 抓取
 
 生产形态下抓取目标无需手工调整 —— compose 挂载的是
-`deploy/prometheus.prod.yml`（target 已是 `127.0.0.1:9090`，网关与 Prometheus
+`deploy/prometheus.yml`（target 已是 `127.0.0.1:9090`，网关与 Prometheus
 同在 host 网络直连回环），不存在「忘了改 target 导致所有告警静默失效」的坑。
 
 启动后确认目标全部 `up`：
@@ -483,7 +521,7 @@ curl -X POST http://127.0.0.1:9091/-/reload
 - [ ] `REDIS_PASSWORD` 已设置（非 compose 占位默认值）
 - [ ] `.env` 未被提交（`git check-ignore .env` 应有输出）
 - [ ] Redis `appendonly=yes`、`appendfsync=everysec`、`maxmemory-policy=noeviction`
-- [ ] `deploy/prometheus.prod.yml` 随生产文件挂载，抓取目标 `127.0.0.1:9090`
+- [ ] `deploy/prometheus.yml` 随生产文件挂载，抓取目标 `127.0.0.1:9090`
 - [ ] Prometheus targets 全部 `up`
 - [ ] 已创建至少一个用户 API Key
 - [ ] 网关前已有 TLS 终止层
@@ -554,7 +592,7 @@ curl -4 --interface 172.16.0.12 https://api.ipify.org; echo
 | `bind: EADDRNOTAVAIL` | 地址不在网卡上 | 重跑脚本；确认云控制台已绑定该辅助 IP |
 | 能发包收不到响应 | `rp_filter=1` | `sysctl -w net.ipv4.conf.all.rp_filter=2` |
 | 重启后失效 | 未持久化 | 重跑并加 `--persist` |
-| 容器内绑定失败 | gateway 未走 host 网络 | 用 `docker-compose.prod.yml` |
+| 容器内绑定失败 | gateway 未走 host 网络 | 用 `docker-compose.yml` |
 | 出口 IP 数量对但公网地址与声明不符 | 控制台 EIP 关联关系与 `.env` 不一致 | 核对控制台，改 `EGRESS_IPS` |
 
 配套监控：`fluxkeys_egress_ips_by_state{state!="active"}` 非零会触发 `FluxKeysEgressIPDown`。
@@ -724,7 +762,7 @@ curl -s http://127.0.0.1:9091/api/v1/targets | jq '.data.activeTargets[]|{scrape
 ```
 
 生产形态下抓取目标固定为 `127.0.0.1:9090`（gateway 与 Prometheus 同在 host
-网络直连回环，配置由 `deploy/prometheus.prod.yml` 挂载）。若 target 仍 down，
+网络直连回环，配置由 `deploy/prometheus.yml` 挂载）。若 target 仍 down，
 按顺序排查：gateway 是否健康、9090 是否被其它进程占用、
 `FLUXKEYS_METRICS_ADDR` 是否被环境覆盖。
 
@@ -743,16 +781,29 @@ curl -s -u admin:admin -X POST http://127.0.0.1:3000/api/datasources/uid/fluxkey
 
 ### 端口冲突
 
-改 `.env` 里的 `*_HOST_PORT`：
+管理面（只看回环）改 `.env` 里的 `*_HOST_PORT`：
 
 ```bash
-GATEWAY_HOST_PORT=18080
 DASHBOARD_HOST_PORT=18000
 PROMETHEUS_HOST_PORT=19091
 GRAFANA_HOST_PORT=13000
+POSTGRES_HOST_PORT=15432
+REDIS_HOST_PORT=16379
 ```
 
-集成测试栈（`docker-compose.test.yml`）用 `TEST_POSTGRES_PORT` / `TEST_REDIS_PORT` 避让。
+gateway 没有端口映射这一层 —— 它走 host 网络，8080 是**宿主机端口本身**，要改就改
+`.env` 里的 `FLUXKEYS_ADDR`，同时确认没有第二个 gateway 进程在监听（旧栈没 `down`
+掉、或手工跑过二进制，都会表现为「端口被占用」）。
+
+集成测试栈与部署栈共用同一份编排文件，靠独立 project name + 换端口避让（容器名固定为
+`fluxkeys-test-postgres-1`，`scripts/local-e2e-check.sh` 依赖它）：
+
+```bash
+COMPOSE_PROJECT_NAME=fluxkeys-test \
+POSTGRES_PASSWORD=fluxkeys REDIS_PASSWORD=fluxkeys POSTGRES_HOST_PORT=15434 \
+  docker compose up -d --wait postgres redis
+```
+
 假上游不在该栈里 —— 它是 `test/mockark` 的进程内夹具，不占端口。
 
 ### 冒烟测试报 502 或连接失败
@@ -789,9 +840,9 @@ docker run --rm -v fluxkeys_redis-data:/data -v "$PWD:/backup" alpine:3.20.3 \
 
 ```bash
 # 改 .env 里的 FLUXKEYS_IMAGE_TAG，然后
-docker compose -f docker-compose.prod.yml pull gateway
-docker compose -f docker-compose.prod.yml build dashboard   # dashboard 无 CI 镜像，本地构建
-docker compose -f docker-compose.prod.yml up -d
+docker compose pull gateway
+docker compose build dashboard   # dashboard 无 CI 镜像，本地构建
+docker compose up -d
 bash scripts/smoke-test.sh
 ```
 
@@ -946,17 +997,15 @@ CI 的 `deploy-lint` job 会自动执行这些测试。
 
 | 文件 | 用途 |
 |---|---|
-| `Dockerfile` | Go 侧多阶段构建，`--target gateway` |
-| `docker-compose.yml` | 本地/演示形态（不含假上游，业务链路需真实火山 Key） |
-| `docker-compose.prod.yml` | 生产形态（独立自包含），全参数默认化，一条命令部署 |
-| `docker-compose.test.yml` | CI/本地集成测试的最小依赖栈 |
+| `Dockerfile` | Go 侧多阶段构建，`--target gateway`；构建期把 `configs/*.yml` 打进镜像的 `/etc/fluxkeys/` |
+| `docker-compose.yml` | **唯一**编排文件：部署形态即生产形态（gateway 走 host 网络），含 monitoring / tls / backup 三个 profile；测试依赖栈也复用它（独立 project name + 换端口） |
+| `configs/config.prod.yml` | 默认调优档 —— 只补容量（连接池 / 租约回收 / 活跃池），不动风控姿态；随镜像分发，改它要重建镜像 |
+| `configs/config.loadtest.yml` | 高并发压测档 —— 关闭单 Key 节流与档位配比，`FLUXKEYS_TUNING=loadtest` 启用，代价见文件头 |
 | `../.env.example` | 环境变量模板（仓库根目录，全项目唯一一份） |
-| `deploy/prometheus.yml` | 抓取配置（本地形态） |
-| `deploy/prometheus.prod.yml` | 抓取配置（生产形态，target 127.0.0.1:9090） |
+| `deploy/prometheus.yml` | 抓取配置（target `127.0.0.1:9090` —— gateway 与 Prometheus 同在 host 网络，直连回环） |
 | `deploy/alerts.yml` | 告警规则 |
 | `deploy/alerts_test.yml` | 告警规则单元测试 |
-| `deploy/grafana/` | 数据源与 dashboard 自动装载（本地形态） |
-| `deploy/grafana/provisioning.prod/` | Grafana 生产 provisioning（数据源指向回环） |
+| `deploy/grafana/` | 数据源与 dashboard 自动装载（数据源指向回环，uid 固定为 `fluxkeys-prom`） |
 | `scripts/gen-prod-env.sh` | 一键生成生产 `.env`（强随机密钥，幂等防覆盖） |
 | `scripts/setup-egress.sh` | 多 EIP 策略路由配置与验证 |
 | `scripts/smoke-test.sh` | 端到端冒烟测试 |

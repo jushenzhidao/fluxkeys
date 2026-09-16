@@ -1,6 +1,15 @@
-# Prometheus 抓取配置
+# Prometheus 抓取配置 —— 由 docker-compose.yml 只读挂载
 #
-# 单机单实例（架构 v4 P0-5），没有服务发现的必要，全部用静态目标。
+# 抓取目标是 127.0.0.1:9090：gateway 走 host 网络，与 Prometheus 共享网络栈，
+# 网关侧 FLUXKEYS_METRICS_ADDR 默认绑回环，因此这里直连回环即可，
+# 不存在「忘了改 target → 全部告警静默失效」的坑。
+#
+# 改完配置后热加载（无需重启）:
+#   curl -X POST http://127.0.0.1:${PROMETHEUS_HOST_PORT:-9091}/-/reload
+#
+# ⚠️ Prometheus 配置文件读不到 compose 的环境变量，所以 PROMETHEUS_HOST_PORT
+#    改用非 9091 时，下面的自抓取目标要手工同步（只影响 Prometheus 自监控，
+#    不影响 gateway 指标）。
 
 global:
   # 15s 抓取间隔：配额是秒级变化的状态，但告警判定都带 for 时长，
@@ -11,14 +20,13 @@ global:
   evaluation_interval: 15s
   external_labels:
     cluster: fluxkeys
-    env: local
+    env: prod
 
 rule_files:
   - /etc/prometheus/alerts.yml
 
-# 告警发送目标。MVP 未部署 Alertmanager，先留空并注释掉配置 ——
-# 规则仍会在 Prometheus UI 的 Alerts 页面求值并展示 firing 状态，
-# 只是不外发通知。接入时取消注释并起一个 alertmanager 服务即可。
+# MVP 未部署 Alertmanager，规则仍在 Prometheus UI 的 Alerts 页求值展示，
+# 只是不外发通知。接入时取消注释并补 alertmanager 服务。
 # alerting:
 #   alertmanagers:
 #     - static_configs:
@@ -26,26 +34,22 @@ rule_files:
 
 scrape_configs:
   # =========================================================================
-  # gateway 业务指标 —— 这是唯一真正重要的抓取目标
+  # gateway 业务指标 —— 唯一真正重要的抓取目标
   # =========================================================================
   - job_name: fluxkeys-gateway
     metrics_path: /metrics
     static_configs:
-      - targets: ["gateway:9090"]
+      - targets: ["127.0.0.1:9090"]
         labels:
           service: gateway
-    # 生产形态下 gateway 走 host 网络（见 docker-compose.prod.yml），
-    # bridge 网络内的 Prometheus 无法解析服务名 gateway。
-    # 那时把上面的 targets 改为:
-    #   - targets: ["host.docker.internal:9090"]
-    # prod override 已配好 extra_hosts: host.docker.internal:host-gateway。
 
   # =========================================================================
-  # Prometheus 自身 —— 用于确认抓取链路本身是活的
+  # Prometheus 自身 —— 确认抓取链路本身是活的
+  # 端口须与 compose 里的 --web.listen-address 一致（默认 9091）
   # =========================================================================
   - job_name: prometheus
     static_configs:
-      - targets: ["localhost:9090"]
+      - targets: ["127.0.0.1:9091"]
 
 # 说明：没有配 redis_exporter / postgres_exporter。
 # MVP 阶段 Redis/Postgres 的健康由 compose healthcheck 兜底，

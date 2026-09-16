@@ -19,6 +19,9 @@
 #      DNS 解析走 Go 自带 resolver，避免容器内 /etc/nsswitch.conf 差异导致的解析问题。
 #   3. 版本信息通过 -ldflags -X 注入。若 main 包里没有对应变量，Go 链接器会静默
 #      忽略，不会导致构建失败，因此这里可以先行注入、等 cmd/ 侧补上变量即生效。
+#   4. 调优档配置（configs/*.yml）在 gateway stage 里 COPY 到 /etc/fluxkeys/，
+#      随镜像分发而非挂宿主机目录。代价是改配置必须重建镜像 —— 换来的是配置与
+#      二进制版本同步演进、容器零宿主机目录依赖（与 read_only 基线一致）。
 
 # ============================================================================
 # Stage 1: builder
@@ -94,6 +97,21 @@ RUN addgroup -g 65532 -S nonroot \
 FROM runtime-base AS gateway
 
 COPY --from=builder /out/gateway /usr/local/bin/gateway
+
+# 调优档配置随镜像分发，**不挂宿主机目录**。
+#
+# 为什么放在 configs/ 而不是 deploy/: 构建上下文按 .dockerignore 排除了
+# deploy/（那是「Go 镜像不需要文档与监控配置」的有意裁剪）。把档位文件挪回
+# deploy/ 会让下面这行直接构建失败 —— 这是刻意的：失败可见，好过镜像里悄悄
+# 少一个档位文件、运行时才发现。
+#
+# 内置的好处: 镜像即「二进制 + 配置」的完整交付物，版本与配置一起演进；
+# 容器不需要任何宿主机目录挂载，与 read_only / cap_drop: ALL 的安全基线一致。
+COPY --chown=65532:65532 configs/ /etc/fluxkeys/
+
+# 不带参数直接 docker run 时用生产档。用 CMD 而非 ENTRYPOINT 的固定参数，
+# 才能让 compose 的 command（切档位）与手工 `-config X` 都覆盖得掉。
+CMD ["-config", "/etc/fluxkeys/config.prod.yml"]
 
 USER 65532:65532
 WORKDIR /home/nonroot

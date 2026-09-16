@@ -8,6 +8,19 @@
 # 覆盖: 配置加载 → 迁移 → provider seed → 出口 direct → 用户鉴权 →
 #       调度 → 配额 Lua 预扣 → 上游转发 → 用量落库。
 # 不产生的副作用: 不访问任何真实上游域名，用独立 Redis DB(14) 与独立端口。
+#
+# 前置：依赖栈由仓库唯一的 docker-compose.yml 起（2026-09-17 起不再有独立的
+# 测试 compose 文件），独立 project name 避免与部署栈抢容器、卷与端口：
+#
+#   COMPOSE_PROJECT_NAME=fluxkeys-test \
+#   POSTGRES_PASSWORD=fluxkeys REDIS_PASSWORD=fluxkeys POSTGRES_HOST_PORT=15434 \
+#     docker compose up -d --wait postgres redis
+#   bash scripts/local-e2e-check.sh
+#   COMPOSE_PROJECT_NAME=fluxkeys-test docker compose down -v
+#
+# 凭据与端口必须与下面常量一致：PG 127.0.0.1:15434（fluxkeys/fluxkeys）、
+# Redis 127.0.0.1:6379 DB 14（密码 fluxkeys）。容器名由 project name 决定，
+# 即 fluxkeys-test-postgres-1 —— 本脚本靠它查流水，改 project name 会全线失败。
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -33,6 +46,18 @@ GW_URL="http://${GW_ADDR}"
 ADMIN_KEY="test-admin-key"
 REDIS_DB=14
 PG_PORT=15434
+# 测试依赖栈的凭据。仓库唯一的 compose 文件里 Redis/Postgres 都是带密码的
+# （没有「留空即免密」的路径），所以两侧都得用这个值。
+PG_PASSWORD=fluxkeys
+REDIS_PASSWORD=fluxkeys
+# 被测网关按 applyEnv 读这个变量（容器形态同样如此），脚本形态用 YAML 之外
+# 的来源提供它，避免把密码写进临时 YAML。
+export REDIS_PASSWORD
+PG_CONTAINER=fluxkeys-test-postgres-1
+# 单文件 compose 把 PG 的本地（unix socket）认证也钉成了 scram-sha-256，
+# 因此在容器内跑 psql 必须带密码 —— 官方 entrypoint 自己在初始化时也是
+# 靠 export PGPASSWORD 才能建库的。
+PG_EXEC=(docker exec -e PGPASSWORD="${PG_PASSWORD}" "${PG_CONTAINER}")
 
 # 上游 Key 的密文存储需要 32 字节 hex 密钥；缺失时 store 会拒绝启动
 # （这是刻意的：宁可起不来也不明文存密钥）。本地测试用一次性随机值即可。
@@ -50,6 +75,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "=== 依赖栈就绪检查 ==="
+# 必须在任何断言之前。栈没起来时 docker exec / psql 只会给出空输出，脚本会
+# 一路「失败但继续」，最终结果里「没起栈」与「功能真的坏了」无法区分。
+if ! docker exec "${PG_CONTAINER}" pg_isready -U fluxkeys -d fluxkeys -h 127.0.0.1 >/dev/null 2>&1; then
+    bad "容器 ${PG_CONTAINER} 未就绪"
+    cat >&2 <<'EOF'
+请先起依赖栈（本仓没有独立的测试 compose，复用唯一的编排文件）:
+  COMPOSE_PROJECT_NAME=fluxkeys-test \
+  POSTGRES_PASSWORD=fluxkeys REDIS_PASSWORD=fluxkeys POSTGRES_HOST_PORT=15434 \
+    docker compose up -d --wait postgres redis
+EOF
+    exit 1
+fi
+ok "Postgres 已就绪（${PG_CONTAINER}）"
+if ! python3 -c 'import socket
+s=socket.socket(); s.settimeout(3); s.connect(("127.0.0.1",6379))' 2>/dev/null; then
+    bad "Redis 127.0.0.1:6379 未就绪"
+    exit 1
+fi
+ok "Redis 已就绪"
+
+echo
 echo "=== 0. 构建 ==="
 go1.25.0 build -o /tmp/fk-mockark ./test/mockark/cmd || exit 1
 go1.25.0 build -o /tmp/fk-gateway ./cmd/gateway || exit 1
@@ -186,8 +233,7 @@ ccode=$(echo "$cresp" | tail -n1)
 chk "按次模型请求 200（实际 ${ccode}）" "$([ "$ccode" = "200" ] && echo 0 || echo 1)"
 
 # Redis 侧实扣
-rused=$(docker exec fluxkeys-test-postgres-1 true 2>/dev/null; \
-    python3 - <<'PY'
+rused=$(python3 - <<'PY'
 import socket
 s=socket.create_connection(("127.0.0.1",6379),timeout=3)
 def cmd(*a):
@@ -197,6 +243,7 @@ def cmd(*a):
         out+=b"$%d\r\n%s\r\n"%(len(x),x)
     s.sendall(out); import time; time.sleep(0.15)
     return s.recv(65536).decode(errors="replace")
+cmd("AUTH","fluxkeys")
 cmd("SELECT",str(14))
 keys=cmd("KEYS","*quota:count:k1*")
 print(keys.strip().splitlines()[-1] if keys.strip() else "")
@@ -214,13 +261,14 @@ def cmd(*a):
         out+=b"$%d\r\n%s\r\n"%(len(x),x)
     s.sendall(out); time.sleep(0.15)
     return s.recv(65536).decode(errors="replace")
+cmd("AUTH","fluxkeys")
 cmd("SELECT","14")
 print(cmd("HGET","${rused}","used").strip().splitlines()[-1])
 PY
 )
     echo "    Redis used = ${h}"
     # 流水侧
-    recs=$(docker exec fluxkeys-test-postgres-1 psql -U fluxkeys -d fluxkeys -tAc \
+    recs=$("${PG_EXEC[@]}" psql -U fluxkeys -d fluxkeys -tAc \
         "select count_units, status_code, provider, model from usage_records where billing_kind='count' order by id desc limit 5" 2>/dev/null)
     echo "    流水 (count_units|status|provider|model):"
     echo "$recs" | sed 's/^/      /'
@@ -233,7 +281,7 @@ fi
 
 echo
 echo "=== 9. 用量流水（token 型）==="
-docker exec fluxkeys-test-postgres-1 psql -U fluxkeys -d fluxkeys -tAc \
+"${PG_EXEC[@]}" psql -U fluxkeys -d fluxkeys -tAc \
     "select provider, model, billing_kind, count_units, total_tokens, status_code, retry_count from usage_records order by id desc limit 6" 2>/dev/null | sed 's/^/    /'
 
 echo

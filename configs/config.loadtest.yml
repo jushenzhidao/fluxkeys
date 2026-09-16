@@ -1,0 +1,100 @@
+# =============================================================================
+# 高并发档（压测口径）—— FLUXKEYS_TUNING=loadtest
+# =============================================================================
+#
+# ⚠️ 先读这段再启用: 本档**关闭了「Key 反封禁」的两道节流**，那是本项目的核心
+#    设计目标，不是可以顺手关掉的优化项。
+#
+#   1. scheduler.min_request_interval: 5s → 0
+#      含义: 同一个 Key 可以无间隔连发。火山侧看到的是「一个账号在几秒内
+#      打出几十个请求」。
+#   2. scheduler.pool_shares → 空 map
+#      含义: 取消档位配比，压力不再向 IP 多的档倾斜，单 IP 瞬时并发会更高。
+#
+#   代码里的原话（config/types.go）: 「同一地址每秒冒出几个请求，无论背后
+#   几个账号都不像真人在操作」。这两项正是要防的特征。
+#
+#   所以本档的适用范围只有两种:
+#     a. 打自建 / 联调假上游（test/mockark、自建代理）做容量与稳定性压测；
+#     b. 内网全链路压测，且账号资产可弃。
+#   拿它长时间跑真实火山账号会显著加速封禁 —— 这属于明知故犯的决定。
+#
+# 加载语义与 config.prod.yml 完全一致（叠加在 Default() 之上、严格字段、
+# 环境变量优先、不写 providers 段），这里只列与生产档的差异项。
+#
+# 另一个**必须同步修改**的地方: 吞吐上来之后，先把 limit 改成不限制
+# （或用 docker run 的 --cpus 动态调），因为 compose 里 gateway 默认
+# cpus: "2.00" / memory: 2G —— 那是真实的硬上限，不放开的话压测测到的是
+# cgroup 限流而不是系统能力。Redis/Postgres 同理（maxmemory 768mb /
+# max_connections 100 都会先于应用成为瓶颈）。
+
+scheduler:
+  # 0 = 完全关闭单 Key 节流。此时 Scheduler.MaxQPS() 返回 0，
+  # 语义是「不存在这个上限」，唯一的实际闸门变成下游资源与上游 429。
+  min_request_interval: 0s
+  # 保持 0（关闭出口节流）。设非 0 会立刻变成 QPS 上限 = IP 数 ÷ 间隔。
+  egress_min_interval: 0s
+  # 活跃池目标放到很大，让全部已装载 Key 都可被调度。
+  active_pool_size: 5000
+  # 取消档位配比: 压力按 Key 数自然分布，不再向 hot 档倾斜。
+  #
+  # ⚠️ 必须写 null，不能写 {} —— yaml 对 map 是**逐键合并**，空的 {} 不会清掉
+  #    Default() 里的 70/25/5，而是静默保留默认配比（实测: 写 {} 之后
+  #    NormalizedPoolShares() 仍返回三档非零份额，与不写这一行完全一样）。
+  #    写 null / ~ 才会真正解码成空 map，此时 scheduler.pick 走「无配比」
+  #    分支: 直接在全部候选上加权随机。
+  #    （同类陷阱还有 providers 段，那个在 load.go 里被特判成整体替换。）
+  pool_shares: null
+  # 保可用性：目标档无可用 Key 时回退到其他档
+  pool_fallback: true
+  # 注意: expected_peak_qps 保持默认 0。一旦填正数，启动时会按
+  # 「单 IP 每小时 ≤ 3000 次」校验份额与 IP 数，本档的配置会被直接拦下 ——
+  # 这是有意的：那道校验就是风控线，压测口径下我们明确放弃它。
+
+redis:
+  # 每次配额 Lua 操作占一条连接且同步等待。默认 32 在几百并发下会成为
+  # 显式的排队点。上限受 Redis maxclients（默认 10000）约束。
+  pool_size: 512
+
+postgres:
+  # 默认 16 太保守。但注意这是**应用侧池**，必须 ≤ Postgres 容器的
+  # max_connections（compose 默认写死 100）—— 本档要先把那一项提到 400，
+  # 否则连接会在 Postgres 侧被拒，症状是随机报 too many clients。
+  max_conns: 200
+  min_conns: 50
+
+quota:
+  # 高 QPS 下租约产生速率高，回收跟不上表现为「额度被幽灵请求占着」
+  # （Key 看着没超水位却拒绝调度）。约束: 必须短于 lease_ttl。
+  reap_interval: 5s
+  reap_batch: 5000
+  # 打分快照刷新频率。更密 = 对配额变化反应更快，代价是 CPU。
+  snapshot_interval: 300ms
+  # 租约 TTL 保持默认：缩短它会让长流式请求在中途被回收器误释放
+  lease_ttl: 120s
+  stream_lease_ttl: 900s
+
+upstream:
+  # 重试是上游压力的放大器（最坏放大 4 倍）。压测要的是「系统本身的容量」，
+  # 让失败快速暴露比让它被重试掩盖更有价值。
+  max_retries: 1
+  retry_base_delay: 100ms
+  retry_jitter: 200ms
+
+egress:
+  # 压测时长尾请求会拖住连接数，超时收紧到 120s 更接近真实用户耐心
+  request_timeout: 120s
+
+server:
+  read_timeout: 60s
+  write_timeout: 0s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+  max_body_bytes: 10485760
+
+# 可选（默认注释掉，理由见下）:
+# 压测时另有两条路径会额外打上游、干扰对「转发容量」的测量。要测纯吞吐可以
+# 按需打开，但打真实火山时不要 — refresh 探测是防超刷的关键机制。
+#
+# refresh:
+#   enabled: false

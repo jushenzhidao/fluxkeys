@@ -667,8 +667,8 @@ main() {
        EGRESS_MODE=multi_ip
        EGRESS_IPS=$(IFS=,; printf '%s' "${ADDRS[*]}")
        EGRESS_VERIFY_ON_START=true
-  2. 启动生产形态（独立文件，不叠加本地 compose）:
-       docker compose -f docker-compose.prod.yml up -d
+  2. 启动（仓库只有一份编排文件，gateway 走 host 网络）:
+       docker compose up -d
   3. 网关启动后核对指标 fluxkeys_egress_ip_up 是否全为 1
 
 EOF

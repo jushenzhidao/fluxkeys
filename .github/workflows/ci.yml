@@ -117,9 +117,10 @@ jobs:
   # =========================================================================
   # Go 集成测试 —— 需要真实 Postgres + Redis
   #
-  # 用 GitHub Actions 的 services 而非 docker-compose.test.yml：
+  # 用 GitHub Actions 的 services 而非仓库里的 compose 依赖栈：
   # services 由 runner 托管，健康检查和网络都是内建的，比在 job 里再起
-  # 一层 compose 更稳。docker-compose.test.yml 的定位是**本地**跑集成测试，
+  # 一层 compose 更稳。compose 依赖栈（复用唯一的 docker-compose.yml，
+  # 独立 project name + 换端口）的定位是**本地**跑集成测试，
   # 两者环境变量保持一致，所以同一份测试代码两边都能跑。
   # =========================================================================
   go-integration:
@@ -371,12 +372,12 @@ jobs:
           EGRESS_IPS=172.16.0.11=203.0.113.11
           VOLC_BASE_URL=https://ark.cn-beijing.volces.com
           EOF
-          echo "--- 本地形态 ---"
-          docker compose -f docker-compose.yml config -q
-          echo "--- 生产形态 ---"
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
-          echo "--- 测试形态 ---"
-          docker compose -f docker-compose.test.yml config -q
+          echo "--- 部署形态（唯一文件；monitoring/backup 两个 profile 都要能解析）---"
+          docker compose --profile monitoring --profile backup config -q
+          echo "--- 测试依赖栈形态（独立 project name + 换端口，与 local-e2e-check.sh 一致）---"
+          COMPOSE_PROJECT_NAME=fluxkeys-test POSTGRES_PASSWORD=fluxkeys \
+            REDIS_PASSWORD=fluxkeys POSTGRES_HOST_PORT=15434 \
+            docker compose config -q
           rm -f .env
 
       - name: 校验 Prometheus 配置与告警规则

@@ -23,54 +23,51 @@
 
 设计依据与推导过程见 [docs/architecture-v4.md](docs/architecture-v4.md)，编码前的可行性实证见 [docs/feasibility-report.md](docs/feasibility-report.md)。
 
-## 快速开始
+## 部署
 
-`docker compose up` 拉起 Redis、Postgres、网关、看板与监控栈，但**不再内置假上游** ——
-上游默认指向真实火山地址（`https://ark.cn-beijing.volces.com`），业务链路需要真实火山 Key：
+本仓只有**一份** compose 文件（`docker-compose.yml`），它同时是唯一的部署入口 ——
+形态即生产形态：gateway 走 host 网络，因为 `multi_ip` 出口绑定必须看到宿主机网卡上的
+辅助 IP。完整流程（含出口 IP 规划、迁移、排障）见 [deploy/README.md](deploy/README.md)，
+最短路径：
 
 ```bash
-cp .env.example .env      # 按提示填入随机密钥
+bash scripts/gen-prod-env.sh          # 生成强随机密钥的 .env（权限 600）
+# 编辑 .env，填 EGRESS_IPS —— 唯一无法代填的参数
+sudo bash scripts/setup-egress.sh --persist --ips '...'   # 宿主机侧 IP + 策略路由
 docker compose up -d
-./scripts/smoke-test.sh          # 冒烟测试
+bash scripts/smoke-test.sh            # 冒烟：不只验容器 Running，验链路真的通
 ```
 
-**离线验证全链路**（无需任何真实 Key）改用进程内假上游的集成测试：
+升级到已发布的镜像：
 
 ```bash
-go test ./test/...
+docker pull ghcr.io/<owner>/fluxkeys:<版本> && docker tag ghcr.io/<owner>/fluxkeys:<版本> fluxkeys/gateway:<版本>
+FLUXKEYS_IMAGE_TAG=<版本> docker compose up -d
 ```
 
-访问：
+**出口 IP 必须额外配置**。云厂商绑定辅助私网 IP 后，操作系统不会自动配置到网卡也不会建立策略路由，此时所有流量仍走主 IP，按 Key 绑定出口会**静默失效**（不报错，只是不生效）。网关启动时会用每个 IP 作为源地址拨测一次上游，失败即拒绝启动 —— 这是有意的快速失败，不是故障。
 
-- 网关 `http://localhost:8080`
-- 统计看板 `http://localhost:8000`
-- 指标 `http://localhost:9090/metrics`
-- Grafana `http://localhost:3000`
+采用 host 网络要接受三个代价：8080/9090 直接占用宿主机端口（同机不能跑第二份 gateway）；容器内没有服务名 DNS，依赖地址一律走 `127.0.0.1`；任何 host 网络容器都能访问回环上的 Redis/Postgres，密码是唯一的门。
+
+## 本地验证（不需要 compose）
+
+host 网络要求宿主机有辅助 IP，开发机通常没有，所以本地验证走这两条：
+
+```bash
+go test ./test/...                 # 离线全链路：进程内假上游，无需任何真实 Key
+bash scripts/local-e2e-check.sh    # 真实 Redis/Postgres + 假上游的端到端（依赖栈起法见脚本头部）
+```
+
+访问地址（均在宿主机回环）：网关 `http://127.0.0.1:8080`、看板 `http://127.0.0.1:8000`（远程走 SSH 隧道）、指标 `http://127.0.0.1:9090/metrics`、Prometheus `9091`、Grafana `3000`。
 
 调用示例：
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $USER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v3","messages":[{"role":"user","content":"你好"}]}'
 ```
-
-## 切换到生产
-
-```bash
-EGRESS_MODE=multi_ip
-EGRESS_IPS=172.16.0.2=1.2.3.4,172.16.0.3=1.2.3.5
-VOLC_BASE_URL=https://ark.cn-beijing.volces.com
-```
-
-**出口 IP 需要额外配置**。云厂商绑定辅助私网 IP 后，操作系统不会自动配置到网卡也不会建立策略路由，此时所有流量仍走主 IP，按 Key 绑定出口会**静默失效**（不报错，只是不生效）。必须先执行：
-
-```bash
-sudo ./scripts/setup-egress.sh   # 配置网卡 + 策略路由，并逐 IP 验证真实出口
-```
-
-网关启动时会自动校验出口连通性（`EGRESS_VERIFY_ON_START=true`），配置错误会在日志中直接暴露。详见 [deploy/README.md](deploy/README.md)。
 
 ## 技术栈
 
@@ -78,7 +75,7 @@ sudo ./scripts/setup-egress.sh   # 配置网卡 + 策略路由，并逐 IP 验�
 - **热状态**：Redis 7，AOF everysec
 - **持久化**：Postgres 16（用户、Key 元数据、用量流水、审计）
 - **看板**：Python 3.12 + FastAPI，只读
-- **部署**：Docker Compose 单机 · **CI**：GitHub Actions
+- **部署**：Docker Compose（单一编排文件，gateway 走 host 网络）· **CI**：GitHub Actions
 
 ## 项目结构
 
