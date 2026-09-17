@@ -120,6 +120,20 @@ func (a *API) handleAdminKeyPatch(w http.ResponseWriter, r *http.Request) {
 		a.deps.Scheduler().SetKeyStatus(keyID, res.NewStatus)
 	}
 
+	// 同步活跃池归属（KI-034）: SetKeyStatus 只改 health，进不了活跃池 s.keys
+	// —— 活跃池只由 Reload 按「库状态 = active」整体重建，周期 key_reload 有
+	// 数分钟滞后。一个重启前就被 ban 的 Key 根本不在 s.keys 里，光改 health
+	// 它永远不会被 Select 遍历到。RefreshKey 定向把这个 Key 的池归属与库中
+	// 现状对齐（复活则拉回选择集，pool/persona 变更则就地刷新元数据）。
+	//
+	// 失败只降级告警，不回滚已生效的写库与内存状态: 库已是新值，下一个周期
+	// key_reload 会兜底把归属对齐，期间的影响至多是一个复活的 Key 晚几分钟
+	// 进入选择集 —— 比让运维以为「复活失败」而反复重试要好。
+	if err := a.deps.Scheduler().RefreshKey(r.Context(), keyID); err != nil {
+		a.deps.Log().WarnContext(r.Context(), "Key 元数据已更新但调度器单键刷新失败，活跃池将延迟到下个 key_reload 同步",
+			"key_id", keyID, "err", err)
+	}
+
 	changed := patchChangedFields(res)
 	forced := req.Force && slices.Contains(terminalKeyStatuses, res.PrevStatus)
 

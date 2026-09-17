@@ -310,6 +310,34 @@ func TestAdminPatch_带force可复活终态Key(t *testing.T) {
 	}
 }
 
+func TestAdminPatch_force复活后触发单键刷新(t *testing.T) {
+	// KI-034: 复活只改 health 不够，必须调 RefreshKey 把 Key 拉回活跃池 —
+	// 活跃池只由 Reload 按「库状态 = active」重建，重启前被禁的 Key 不在池里。
+	env := patchEnv(t)
+
+	code, _ := doPatch(t, env, "volc_banned", `{"status":"active","force":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", code)
+	}
+	if calls := env.sched.refreshKeyCalls(); !slices.Equal(calls, []string{"volc_banned"}) {
+		t.Errorf("RefreshKey 调用 = %v, 期望 [volc_banned]", calls)
+	}
+}
+
+func TestAdminPatch_只改pool时也刷新单键归属(t *testing.T) {
+	// RefreshKey 不只为复活服务: pool / persona 变更后活跃池里的元数据
+	// 也要就地刷新，否则要等下一个周期 key_reload 才生效。
+	env := patchEnv(t)
+
+	code, _ := doPatch(t, env, "volc_001", `{"pool":"warm"}`)
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", code)
+	}
+	if calls := env.sched.refreshKeyCalls(); !slices.Equal(calls, []string{"volc_001"}) {
+		t.Errorf("RefreshKey 调用 = %v, 期望 [volc_001]", calls)
+	}
+}
+
 func TestAdminPatch_收紧方向无需force(t *testing.T) {
 	// 隔离一个可疑 Key 必须随时可做，加确认步骤只会延误处置。
 	env := patchEnv(t)

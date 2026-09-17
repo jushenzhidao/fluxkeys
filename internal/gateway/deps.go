@@ -109,6 +109,13 @@ type Scheduler interface {
 	// 才跑一次。新部署导入完 Key 后若不立刻重载，网关会在长达 5 分钟里
 	// 对所有请求返回 503 —— 运维会合理地认为导入失败了。
 	Reload(ctx context.Context) error
+
+	// RefreshKey 让单个 Key 的活跃池归属与其库中现状对齐，不触发全量 Reload。
+	//
+	// 由 PATCH /admin/keys/{key_id} 在写库成功后调用（KI-034）。与 Reload 的
+	// 差别是作用域: Reload 重建整个活跃池，RefreshKey 只同步被改的那一个 Key，
+	// 让「force 复活重启前被禁的 Key」立即进入选择集而不必等下一个周期。
+	RefreshKey(ctx context.Context, keyID string) error
 }
 
 // ErrNoCandidate 表示当前无可用 Key。

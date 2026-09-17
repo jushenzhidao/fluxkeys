@@ -113,6 +113,15 @@ func (a *schedulerAdapter) SetKeyStatus(keyID, status string) {
 // （5 分钟）才能开始服务。
 func (a *schedulerAdapter) Reload(ctx context.Context) error { return a.sched.Reload(ctx) }
 
+// RefreshKey 让调度器把单个 Key 的活跃池归属与库中现状对齐。
+//
+// 由 PATCH /admin/keys/{key_id} 在写库成功后调用（KI-034）。与 SetKeyStatus
+// 的分工: SetKeyStatus 改 health（封禁/复活的状态机），RefreshKey 改活跃池
+// 归属（把复活的 Key 拉回选择集）。两者都要，缺一个都会留下一种不一致。
+func (a *schedulerAdapter) RefreshKey(ctx context.Context, keyID string) error {
+	return a.sched.RefreshKey(ctx, keyID)
+}
+
 func (a *schedulerAdapter) MarkFailure(keyID string, kind gateway.FailureKind) {
 	a.sched.MarkFailure(keyID, mapFailureKind(kind))
 }
@@ -468,6 +477,23 @@ func (s shardScopedStore) ListUpstreamKeys(ctx context.Context, f store.Upstream
 
 func (s shardScopedStore) GetKeyHistory(ctx context.Context, keyIDs []string, quotaDay time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error) {
 	return s.st.GetKeyHistory(ctx, keyIDs, quotaDay)
+}
+
+// GetUpstreamKey 按 key_id 读取单个 Key，但只接管本机分片的 Key。
+//
+// 与 ListUpstreamKeys 同一套分片语义: 单机部署（shard 为空）恒等透传；
+// 多机部署下，属于别的分片的 Key 对本机视同不存在（ErrNotFound）。否则
+// PATCH 一台机器上的外机 Key 会把它拉进本机活跃池 —— 同一 Key 同时出现在
+// 两台机器的选择集里，等于让它从两个出口发请求，正是分片要避免的事。
+func (s shardScopedStore) GetUpstreamKey(ctx context.Context, keyID string) (*store.UpstreamKey, error) {
+	k, err := s.st.GetUpstreamKey(ctx, keyID)
+	if err != nil {
+		return nil, err
+	}
+	if s.shard != "" && k.Shard != s.shard {
+		return nil, store.ErrNotFound
+	}
+	return k, nil
 }
 
 // parseClock 解析 "HH:MM" 为自零点起的偏移量。

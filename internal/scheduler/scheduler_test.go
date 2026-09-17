@@ -42,6 +42,18 @@ func (f *fakeStore) ListUpstreamKeys(ctx context.Context, filter store.UpstreamK
 	return out, nil
 }
 
+func (f *fakeStore) GetUpstreamKey(ctx context.Context, keyID string) (*store.UpstreamKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.keys {
+		if k.KeyID == keyID {
+			cp := k
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
 func (f *fakeStore) GetKeyHistory(ctx context.Context, keyIDs []string, day time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

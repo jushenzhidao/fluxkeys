@@ -43,13 +43,14 @@ import (
 // 选中哪个 Key 不确定，会让「配额耗尽后换到下一个 Key」这类断言变得
 // 无法精确表达。集成测试要验证的是网关的换 Key 逻辑，不是打分算法。
 type memSched struct {
-	mu       sync.Mutex
-	keys     []string
-	cursor   int
-	disabled map[string]string
-	failures map[string][]gateway.FailureKind
-	success  map[string]int
-	reloads  int
+	mu        sync.Mutex
+	keys      []string
+	cursor    int
+	disabled  map[string]string
+	failures  map[string][]gateway.FailureKind
+	success   map[string]int
+	reloads   int
+	refreshes int
 	// pools 是 Key 的档位归属，决定它首次绑定出口时落在哪档 IP 上。
 	// 未设置的 Key 用空串（不限档位）。
 	pools map[string]string
@@ -126,6 +127,18 @@ func (m *memSched) Reload(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.reloads++
+	return nil
+}
+
+// RefreshKey 复刻真实调度器的「复活即回选择集」语义。
+//
+// memSched 的可选集合就是构造时传入的固定 keys 列表，「活跃池归属」无需
+// 维护；真正影响可选性的是 disabled 集合，而它在 SetKeyStatus("active")
+// 时已清空。所以这里只需记录调用，便于断言 PATCH 触发了单键刷新（KI-034）。
+func (m *memSched) RefreshKey(ctx context.Context, keyID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshes++
 	return nil
 }
 

@@ -120,6 +120,11 @@ func (e keyEntry) poolOf() string {
 // Store 是调度器对持久化层的最小依赖，便于测试替换。
 type Store interface {
 	ListUpstreamKeys(ctx context.Context, filter store.UpstreamKeyFilter) ([]store.UpstreamKey, error)
+	// GetUpstreamKey 按 key_id 读取单个 Key（含解密 Secret、任意状态）。
+	//
+	// RefreshKey 用它做单键定向同步：只关心「这一个 Key 现在是什么状态」，
+	// 不该为此触发一次全量 ListUpstreamKeys + 重建。
+	GetUpstreamKey(ctx context.Context, keyID string) (*store.UpstreamKey, error)
 	GetKeyHistory(ctx context.Context, keyIDs []string, quotaDay time.Time) (map[store.HistoryKey]store.KeyDailyHistory, error)
 }
 
@@ -277,28 +282,7 @@ func (s *Scheduler) Reload(ctx context.Context) error {
 	entries := make([]keyEntry, 0, len(rows))
 	keyIDs := make([]string, 0, len(rows))
 	for _, r := range rows {
-		// 水位必须按该 Key 所属 provider 的量纲取。
-		//
-		// 原先一律用 TokenHard()/TokenSoft()，对按次计费的 provider 就是量纲
-		// 错配: 拿「500 万 token 的 95%」当成「1200 次的硬水位」。这个数不会
-		// 让任何一层报错 —— snap.Hard 是正数，Used+Prededuct 永远远小于它，
-		// 于是 :434 的硬水位过滤对按次 provider 完全失效，超额只能等 Acquire
-		// 的 Lua 兜底，而调度打分里的 Ratio 也一路失真。
-		//
-		// 这是上一阶段那个缺陷的同源残留: 当时修了归档与打分的 ratio 口径，
-		// 漏了 Key 池装载这一层。
-		hard, soft := conf.LimitsFor(r.Provider, conf.IsCountProvider(r.Provider))
-		entries = append(entries, keyEntry{
-			keyID:     r.KeyID,
-			secret:    r.Secret,
-			provider:  r.Provider,
-			egressIP:  r.EgressIP,
-			pool:      r.Pool,
-			dbStatus:  r.Status,
-			persona:   persona.For(r.KeyID),
-			hardLimit: hard,
-			softLimit: soft,
-		})
+		entries = append(entries, s.buildEntry(r))
 		keyIDs = append(keyIDs, r.KeyID)
 		s.health.seed(r.KeyID, r.HealthScore, KeyStatus(r.Status))
 	}
@@ -314,6 +298,115 @@ func (s *Scheduler) Reload(ctx context.Context) error {
 	s.mu.Lock()
 	s.keys = entries
 	s.history = hist
+	s.mu.Unlock()
+	return nil
+}
+
+// buildEntry 把一行库存元数据转成调度条目。
+//
+// 水位必须按该 Key 所属 provider 的量纲取。
+//
+// 原先一律用 TokenHard()/TokenSoft()，对按次计费的 provider 就是量纲
+// 错配: 拿「500 万 token 的 95%」当成「1200 次的硬水位」。这个数不会
+// 让任何一层报错 —— snap.Hard 是正数，Used+Prededuct 永远远小于它，
+// 于是硬水位过滤对按次 provider 完全失效，超额只能等 Acquire 的 Lua
+// 兜底，而调度打分里的 Ratio 也一路失真。
+func (s *Scheduler) buildEntry(r store.UpstreamKey) keyEntry {
+	conf := s.conf
+	hard, soft := conf.LimitsFor(r.Provider, conf.IsCountProvider(r.Provider))
+	return keyEntry{
+		keyID:     r.KeyID,
+		secret:    r.Secret,
+		provider:  r.Provider,
+		egressIP:  r.EgressIP,
+		pool:      r.Pool,
+		dbStatus:  r.Status,
+		persona:   persona.For(r.KeyID),
+		hardLimit: hard,
+		softLimit: soft,
+	}
+}
+
+// upsertKey 把条目插入活跃池，或就地刷新已有条目的元数据。
+//
+// 调用方须持有 s.mu 写锁。刷新而非追加的理由: 同一 Key 的 pool / persona /
+// 出口会被管理接口改掉，若只追加会出现两条同 keyID 的条目，Select 把它当成
+// 两个独立候选 —— 既双倍计数又可能用旧元数据派出请求。
+func (s *Scheduler) upsertKey(e keyEntry) {
+	for i := range s.keys {
+		if s.keys[i].keyID == e.keyID {
+			s.keys[i] = e
+			return
+		}
+	}
+	s.keys = append(s.keys, e)
+}
+
+// removeKey 把条目从活跃池剔除。调用方须持有 s.mu 写锁。
+func (s *Scheduler) removeKey(keyID string) {
+	keys := s.keys
+	for i := range keys {
+		if keys[i].keyID == keyID {
+			s.keys = append(keys[:i], keys[i+1:]...)
+			return
+		}
+	}
+}
+
+// RefreshKey 让单个 Key 的活跃池归属与其库中现状对齐，不触发全量 Reload。
+//
+// 这是 KI-034 的修复点。活跃池 s.keys 只在 Reload 时按「库状态 = active」
+// 整体重建，而周期 key_reload 有最长数分钟的滞后。管理面 PATCH 改了某 Key
+// 的库状态后若干等下一个周期，行为是错的:
+//
+//	一个「重启前就被 ban」的 Key 根本不在 s.keys 里（Reload 只装 active）。
+//	对它做 force 复活时，SetKeyStatus 只把 health 置回 active，却无法让它
+//	进入 s.keys —— Select 遍历的是 s.keys，遍历不到它就永远不会选中它。
+//	于是这个 Key 在库里是 active、health 是 active，却空转到下一次 Reload。
+//
+// 语义:
+//
+//   - 库中 active: 该 Key 必须在活跃池（插入或就地刷新元数据），并顺带
+//     把它昨日归档补进 s.history，免得 S_history 在下一个 Reload 前退化为
+//     中性分。
+//   - 库中已删除（ErrNotFound）: 从活跃池剔除。
+//   - 库中非 active（banned/cooldown/invalid）: 不动活跃池归属。封禁方向
+//     由 health.available 把关（banned/invalid 返回不可用、cooldown 到期
+//     自动恢复），与 PATCH 封禁后 Key 仍留在池里的既有行为一致 —— 复活后
+//     要回到原档位与出口，不必在这里重建归属。
+//
+// 健康表只 seed 不覆盖: healthTable.seed 对已有实时观测值的 Key 不动，运行
+// 期累积的健康分/连续 429 计数不会被一次库读回滚。
+func (s *Scheduler) RefreshKey(ctx context.Context, keyID string) error {
+	r, err := s.st.GetUpstreamKey(ctx, keyID)
+	if errors.Is(err, store.ErrNotFound) {
+		s.mu.Lock()
+		s.removeKey(keyID)
+		s.mu.Unlock()
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("scheduler: 刷新 Key %s: %w", keyID, err)
+	}
+
+	s.health.seed(r.KeyID, r.HealthScore, KeyStatus(r.Status))
+	if r.Status != store.KeyStatusActive {
+		return nil
+	}
+
+	entry := s.buildEntry(*r)
+
+	// 补昨日归档，失败只降级为中性分，不阻塞归属同步。
+	yesterday := quota.QuotaDayTime(s.now().AddDate(0, 0, -1))
+	hist, histErr := s.st.GetKeyHistory(ctx, []string{keyID}, yesterday)
+
+	s.mu.Lock()
+	s.upsertKey(entry)
+	if histErr == nil {
+		for k, v := range hist {
+			s.history[k] = v
+		}
+	}
 	s.mu.Unlock()
 	return nil
 }

@@ -168,6 +168,16 @@ func (s schedStoreStub) GetKeyHistory(ctx context.Context, ids []string, day tim
 	return map[store.HistoryKey]store.KeyDailyHistory{}, nil
 }
 
+func (s schedStoreStub) GetUpstreamKey(ctx context.Context, keyID string) (*store.UpstreamKey, error) {
+	for _, k := range s.keys {
+		if k.KeyID == keyID {
+			cp := k
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
 type quotaReaderStub struct{}
 
 func (quotaReaderStub) GetMany(ctx context.Context, provider string, ids []string, kind quota.Kind) (map[string]quota.Snapshot, error) {

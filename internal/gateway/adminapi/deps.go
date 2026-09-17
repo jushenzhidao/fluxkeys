@@ -84,6 +84,14 @@ type Scheduler interface {
 
 	// Reload 重新从存储装载 Key 池。
 	Reload(ctx context.Context) error
+
+	// RefreshKey 让单个 Key 的活跃池归属与其库中现状对齐，不触发全量 Reload。
+	//
+	// 管理面 PATCH 改完库必须再调它（KI-034）: 活跃池只由 Reload 按「库状态
+	// = active」重建，周期 key_reload 有数分钟滞后。一个重启前就被 ban 的 Key
+	// 不在活跃池里，光用 SetKeyStatus 把 health 置回 active 也进不了选择集 ——
+	// Select 遍历的是活跃池。RefreshKey 把它定向拉进池，复活立即生效。
+	RefreshKey(ctx context.Context, keyID string) error
 }
 
 // Deps 是本包对装配层的全部依赖。

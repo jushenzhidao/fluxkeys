@@ -49,6 +49,11 @@ type fakeSched struct {
 	reloadErr error
 	// statusSets 按调用顺序记录 SetKeyStatus 的参数，形如 "volc_001=banned"。
 	statusSets []string
+	// refreshes 记录 RefreshKey 被调用次数；refreshErr 非 nil 时 RefreshKey 返回它。
+	refreshes int
+	// refreshIDs 按调用顺序记录 RefreshKey 的 key_id。
+	refreshIDs []string
+	refreshErr error
 }
 
 func newFakeSched(keyIDs ...string) *fakeSched {
@@ -156,6 +161,21 @@ func (f *fakeSched) reloadCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.reloads
+}
+
+// RefreshKey 记录管理接口触发的单键池归属同步（KI-034）。
+func (f *fakeSched) RefreshKey(ctx context.Context, keyID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refreshes++
+	f.refreshIDs = append(f.refreshIDs, keyID)
+	return f.refreshErr
+}
+
+func (f *fakeSched) refreshKeyCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.refreshIDs...)
 }
 
 func (f *fakeSched) failuresFor(keyID string) []FailureKind {
