@@ -414,6 +414,21 @@ func (b *background) collectMetrics(ctx context.Context) error {
 				"直接改库不会立刻反映到内存容量，请改用 DELETE /admin/keys/{key_id}（删行与解绑同事务）")
 	}
 
+	// 反向对账: 内存绑定回写库（livetest-ai KI-037）。
+	//
+	// 与 ReleaseBindings 方向相反、语义互补 —— 那条回收「库中已不存在」的
+	// 绑定（库是真相），这条回写「库中存在、但绑定值与内存不一致」的 Key
+	// （内存是真相: 请求已经从这个出口发出去了，此刻改内存等于给账号换 IP）。
+	// 惰性绑定（热路径首次分配 / 原出口被封后的重绑）在 proxy.go 里随请求
+	// 落库，本循环只是它失败时的兜底 —— 不兜底的话，那一笔落库失败会留下
+	// 永久不一致: 重启后 restoreBindings 按库里的空值/旧值恢复，Key 换出口。
+	//
+	// 复用本轮已查出的 Key 列表（零额外查询），15s 一轮把不一致窗口压在
+	// 十几秒。判定本体在 reconcileEgressBindings，可脱离采集循环单独测试。
+	if n := b.reconcileEgressBindings(ctx, keys); n > 0 {
+		b.log.Info("内存出口绑定已回写库", "count", n, "catalog_keys", len(keys))
+	}
+
 	st := b.pool.Stats()
 	byState := make(map[string]int, 4)
 	reputation := make(map[string]int, len(st.PerIP))
@@ -426,6 +441,38 @@ func (b *background) collectMetrics(ctx context.Context) error {
 	b.metrics.SetEgressStats(byState, reputation, bound)
 
 	return nil
+}
+
+// reconcileEgressBindings 把「内存有、库里不一致」的出口绑定回写库，
+// 返回实际回写的条数。
+//
+// 真相方向是内存 → 库，与 ReleaseBindings（库 → 内存）严格互补:
+// 请求已经从内存里的这个出口发出去了，绑定在内存里是既成事实；库只是
+// 它在重启后的存档点。所以这里绝不拿库值去改内存 —— 那等于给账号换 IP。
+//
+// 只回写「内存非空且与库值不同」的 Key:
+//   - 内存为空: 该 Key 尚未绑定（冷 Key 或刚导入未承接请求），无可写。
+//   - 与库值相同: 已一致，跳过 —— 每轮全量重写会无意义地刷 updated_at。
+//
+// 写失败不告警升级: ErrNotFound 说明 Key 在查询之后被删，下一轮
+// ReleaseBindings 会回收内存侧，属正常竞态；其余错误记 WARN 后交给下一轮
+// 重试，15s 一轮的周期本身就是退避。
+func (b *background) reconcileEgressBindings(ctx context.Context, keys []store.UpstreamKey) int {
+	var persisted int
+	for _, k := range keys {
+		bound := b.pool.BoundIP(k.KeyID)
+		if bound == "" || bound == k.EgressIP {
+			continue
+		}
+		if err := b.st.UpdateUpstreamKeyState(ctx, k.KeyID, store.UpstreamKeyState{EgressIP: &bound}); err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				b.log.Warn("出口绑定回写库失败", "key_id", k.KeyID, "egress_ip", bound, "err", err)
+			}
+			continue
+		}
+		persisted++
+	}
+	return persisted
 }
 
 // trackedKeys 记录已上报指标的 Key，用于检测下线的 Key。

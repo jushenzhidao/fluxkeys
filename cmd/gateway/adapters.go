@@ -426,11 +426,23 @@ func (a *storeAdapter) SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP s
 
 // DeleteUpstreamKey 按 key_id 删除上游 Key，委托底层存储。
 //
+// store.ErrNotFound 必须翻译为 gateway.ErrKeyNotFound（= adminapi.ErrKeyNotFound，
+// 对外 404），与 RevokeUserAPIKey / PatchUpstreamKeyState 同一模式。漏掉翻译的
+// 后果（livetest-ai KI-036，v0.1.7 实测）: DELETE /admin/keys/{key_id} 对
+// 「不存在 / 重复删除」落进 500 internal_error，调用方无法区分「已删过」与
+// 「服务端故障」，自动化清理脚本会误判为失败并重试。
+//
 // 出口绑定的回收不在这里做: 它属于「管理面 DELETE 端点」这一调用方的职责，
 // 与删行成同一事务。把解绑塞进存储适配层会让「删行成功但解绑失败」的降级
 // 无处安放 —— 端点层才能决定「已删的行要不要回滚」。
 func (a *storeAdapter) DeleteUpstreamKey(ctx context.Context, keyID string) error {
-	return a.st.DeleteUpstreamKey(ctx, keyID)
+	if err := a.st.DeleteUpstreamKey(ctx, keyID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%w: %w", gateway.ErrKeyNotFound, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // Ping 检查 Postgres 可达性。

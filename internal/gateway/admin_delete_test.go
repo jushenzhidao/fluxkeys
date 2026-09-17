@@ -81,6 +81,11 @@ func TestAdminDelete_不存在的Key返回404(t *testing.T) {
 	if code != http.StatusNotFound {
 		t.Fatalf("状态码 = %d, 期望 404: %v", code, body)
 	}
+	// code 是自动化清理脚本区分「已删过」与「服务端故障」的判据（KI-036）:
+	// 旧版此处是 500 internal_error，脚本会误判为失败并重试。
+	if e, _ := body["error"].(map[string]any); e == nil || e["code"] != "key_not_found" {
+		t.Errorf("404 的 error.code = %v, 期望 key_not_found", body["error"])
+	}
 	// 删行未命中，不应触发解绑或重载（避免对无关 Key 的副作用）。
 	if n := env.sched.reloadCount(); n != before {
 		t.Errorf("404 不应触发重载: before=%d after=%d", before, n)

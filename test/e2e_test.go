@@ -13,6 +13,7 @@ import (
 
 	"github.com/fluxkeys/fluxkeys/internal/config"
 	"github.com/fluxkeys/fluxkeys/internal/egress"
+	"github.com/fluxkeys/fluxkeys/internal/gateway"
 	"github.com/fluxkeys/fluxkeys/internal/quota"
 	"github.com/fluxkeys/fluxkeys/test/mockark"
 )
@@ -1102,5 +1103,81 @@ func TestE2E_未指定档位的Key仍可绑定(t *testing.T) {
 	}
 	if got := env.egress.BoundIP("k1"); got != "127.0.0.1" {
 		t.Errorf("未指定档位的 Key 应能绑定到任意出口，实际 %q", got)
+	}
+}
+
+// ===== 惰性绑定落库（KI-037） =====
+
+// 热路径首次绑定必须落库: 只改内存，重启后 restoreBindings 按库里的空值
+// 重新哈希，Key 大概率换出口 —— 「一 Key 一 IP 终身绑定」名存实亡，
+// 且 /admin/ips（内存权威）与库长期对不上（livetest-ai KI-037，
+// E2E-FLUXKEYS-007 实测: 内存 6 绑定 vs 库 3 把）。
+func TestE2E_热路径首次绑定落库(t *testing.T) {
+	ips := []*egress.IP{
+		egress.NewPooledIP("127.0.0.1", "203.0.113.1", 10, "hot"),
+	}
+	env := newItEnvWithEgress(t, []string{"k0"}, ips)
+	env.sched.pools["k0"] = "hot"
+	// 库里有这把 Key（egress_ip 为空）。没有这一行，落库会因 Key 不存在
+	// 降级为告警 —— 那正是缺陷的隐身形态。
+	if _, err := env.store.UpsertUpstreamKey(context.Background(),
+		gateway.NewUpstreamKey{KeyID: "k0", Secret: "sk-x", Pool: "hot"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		resp, body := env.chat(t, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次请求应成功: %d %s", i+1, resp.StatusCode, body)
+		}
+	}
+
+	if got := env.egress.BoundIP("k0"); got != "127.0.0.1" {
+		t.Fatalf("内存绑定 = %q, 期望 127.0.0.1", got)
+	}
+	if got := env.store.storedEgressIP("k0"); got != "127.0.0.1" {
+		t.Errorf("库中 egress_ip = %q, 期望 127.0.0.1 —— 惰性绑定未落库（KI-037），"+
+			"重启后 restoreBindings 会按空值重新哈希，Key 将换出口", got)
+	}
+	// 绑定未变的第二次请求不得重复落库: 每请求一次写库会让 DB 白白承压。
+	if n := env.store.egressWriteCount(); n != 1 {
+		t.Errorf("落库次数 = %d, 期望 1（仅首次绑定那一次；常规请求不重复写库）", n)
+	}
+}
+
+// 报告的实测形态（E2E-FLUXKEYS-007）: 护栏把原出口判封后，Key 仍绑在
+// banned IP 上（撤离失败）；之后请求到达时 BindInPool 检测「原绑定已封」
+// 删掉旧绑定重新分配 —— 这一步同样必须落库，否则库里永久停在 banned 旧值，
+// 重启后 Adopt 失败、按当时候选集重新哈希，Key 大概率再换一次出口。
+func TestE2E_原出口被封后热路径重绑落库(t *testing.T) {
+	ips := []*egress.IP{
+		egress.NewPooledIP("127.0.0.1", "203.0.113.1", 10, "hot"),
+		egress.NewPooledIP("10.0.0.9", "203.0.113.9", 10, "hot"),
+	}
+	env := newItEnvWithEgress(t, []string{"k0"}, ips)
+	env.sched.pools["k0"] = "hot"
+	// 库里的历史绑定是 10.0.0.9（restoreBindings 据此 Adopt），随后它被护栏判封。
+	if _, err := env.store.UpsertUpstreamKey(context.Background(),
+		gateway.NewUpstreamKey{KeyID: "k0", Secret: "sk-x", Pool: "hot", EgressIP: "10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.egress.Adopt("k0", "10.0.0.9", "hot"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	env.egress.IPForAddr("10.0.0.9").MarkBanned()
+
+	resp, body := env.chat(t, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("原出口被封后重绑应成功: %d %s", resp.StatusCode, body)
+	}
+
+	if got := env.egress.BoundIP("k0"); got != "127.0.0.1" {
+		t.Fatalf("重绑后内存绑定 = %q, 期望 127.0.0.1", got)
+	}
+	if got := env.store.storedEgressIP("k0"); got != "127.0.0.1" {
+		t.Errorf("重绑后库中 egress_ip = %q, 期望 127.0.0.1 —— 仍停在 banned 旧值（KI-037），"+
+			"重启后 Adopt 会失败并重新哈希", got)
 	}
 }

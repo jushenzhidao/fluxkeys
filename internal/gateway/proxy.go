@@ -399,10 +399,29 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	// 「已有绑定直接返回」分支，档位不起作用。但新导入的 Key（尚未经过
 	// 一次 Reload+restore）会在此首次绑定，此时必须落到对应档位的出口上，
 	// 否则它会被分到任意档位的 IP，分层就有了缺口。
+	prevBound := s.egress.BoundIP(cand.KeyID)
 	client, err := s.egress.ClientForPool(cand.KeyID, cand.Pool)
 	if err != nil {
 		s.sched.MarkFailure(cand.KeyID, FailureNetwork)
 		return attemptResult{KeyID: cand.KeyID, Err: adapter.NewNetworkError("获取出口客户端失败: " + err.Error())}
+	}
+
+	// 惰性绑定一旦在本调用中建立或改绑，必须立刻落库（livetest-ai KI-037）:
+	// 两种形态都会走到这 —— ① Key 从未绑定（启动/导入时容量满，恢复失败），
+	// 请求来时首次分配；② 原绑定出口已被封（护栏撤离失败仍留在 banned IP 上，
+	// 或冷却解禁后），BindInPool 删掉旧绑定重新哈希。两种都只改内存:
+	// 重启后 restoreBindings 按库里的空值/旧值恢复，Key 会换到另一个出口，
+	// 与「一 Key 一 IP 终身绑定」的承诺相抵，而 /admin/ips（内存权威）与库
+	// 长期对不上，只读接口给出与事实相反的证据。
+	//
+	// 落库失败不阻断请求: 本次运行内存绑定已生效；后台 15s 一轮的对账
+	// （collectMetrics 的反向回写）会把它补齐，兜底这一笔的失败。
+	// direct 模式下 BoundIP 恒为空串，prevBound 与现值相等，自然不会进来。
+	if addr := s.egress.BoundIP(cand.KeyID); addr != prevBound {
+		if err := s.store.SetVolcKeyEgressIP(ctx, cand.KeyID, addr); err != nil {
+			s.log.WarnContext(ctx, "惰性出口绑定落库失败，将依赖后台对账回写",
+				"key_id", cand.KeyID, "egress_ip", addr, "err", err)
+		}
 	}
 
 	// ===== 4. 发起请求 =====

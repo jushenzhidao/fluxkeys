@@ -181,6 +181,10 @@ type memStore struct {
 	usage  []gateway.UsageRecord
 	audits int
 	keys   map[string]gateway.NewUpstreamKey
+	// egressWrites 记录 SetVolcKeyEgressIP 的调用次数。
+	// 断言「绑定未变的常规请求不重复落库」需要它 —— 只断言落库值正确
+	// 盖不住「每个请求都写一次库」这种回归（功能对、DB 白白承压）。
+	egressWrites int
 }
 
 func newMemStore() *memStore {
@@ -317,7 +321,22 @@ func (s *memStore) SetVolcKeyEgressIP(ctx context.Context, keyID, egressIP strin
 	}
 	cur.EgressIP = egressIP
 	s.keys[keyID] = cur
+	s.egressWrites++
 	return nil
+}
+
+// storedEgressIP 读取该 Key 已落库的出口绑定（KI-037 断言用）。
+func (s *memStore) storedEgressIP(keyID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keys[keyID].EgressIP
+}
+
+// egressWriteCount 返回 SetVolcKeyEgressIP 的累计调用次数。
+func (s *memStore) egressWriteCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.egressWrites
 }
 
 func (s *memStore) Ping(ctx context.Context) error { return nil }

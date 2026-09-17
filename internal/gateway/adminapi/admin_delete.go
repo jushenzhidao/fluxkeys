@@ -34,7 +34,9 @@ func (a *API) handleAdminKeyDelete(w http.ResponseWriter, r *http.Request) {
 
 	if err := a.deps.Store().DeleteUpstreamKey(r.Context(), keyID); err != nil {
 		if errors.Is(err, ErrKeyNotFound) {
-			a.writeError(w, r, http.StatusNotFound, "invalid_request", "Key 不存在: "+keyID)
+			// code 与 revokeUserKey 的 404 对齐（key_not_found）: 自动化清理
+			// 脚本按 code 区分「已删过」与「服务端故障」（livetest-ai KI-036）。
+			a.writeError(w, r, http.StatusNotFound, "key_not_found", "Key 不存在: "+keyID)
 			return
 		}
 		a.deps.Log().ErrorContext(r.Context(), "删除上游 Key 失败",
