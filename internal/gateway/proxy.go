@@ -418,9 +418,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, plan *requestPl
 	// （collectMetrics 的反向回写）会把它补齐，兜底这一笔的失败。
 	// direct 模式下 BoundIP 恒为空串，prevBound 与现值相等，自然不会进来。
 	if addr := s.egress.BoundIP(cand.KeyID); addr != prevBound {
-		if err := s.store.SetVolcKeyEgressIP(ctx, cand.KeyID, addr); err != nil {
+		// pErr 而非 err: 本函数外层（请求构造处）还有一个 err 在使用中，
+		// govet 的 shadow 检查不允许内层同名遮蔽。
+		if pErr := s.store.SetVolcKeyEgressIP(ctx, cand.KeyID, addr); pErr != nil {
 			s.log.WarnContext(ctx, "惰性出口绑定落库失败，将依赖后台对账回写",
-				"key_id", cand.KeyID, "egress_ip", addr, "err", err)
+				"key_id", cand.KeyID, "egress_ip", addr, "err", pErr)
 		}
 	}
 
